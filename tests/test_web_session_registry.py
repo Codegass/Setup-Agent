@@ -11,6 +11,8 @@ from sag.agent.verdict_finalizer import (
     SnapshotTestCounts,
     SnapshotTestStats,
 )
+from test_snapshot_surface_agreement import snapshot_factory  # noqa: F401
+
 from sag.evidence import EvidenceStatus, OperationOutcome
 from sag.web.models import DockerSummary, WorkspaceSummary
 from sag.web.session_registry import (
@@ -33,7 +35,7 @@ def test_evidence_groups_use_actual_refs_and_do_not_fabricate_a_session_record()
             "finish": "2026-08-16T03:51:00",
             "build": {
                 "state": "partial",
-                "note": "Canonical build evidence",
+                "note": "Build evidence from the run",
                 "evidence_refs": ["output_build"],
             },
             "test": {
@@ -47,7 +49,7 @@ def test_evidence_groups_use_actual_refs_and_do_not_fabricate_a_session_record()
 
     assert [group.source for group in groups] == [
         "Build evidence",
-        "Sealed run inputs",
+        "Run evidence",
         "Generated report",
     ]
     assert groups[0].records[0].ref == "output_build"
@@ -787,11 +789,12 @@ def test_container_session_registry_returns_setup_artifact_detail():
     assert detail.context.phases[0].id == "phase_provision"
 
 
-def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
+def test_setup_artifact_detail_surfaces_runtime_metadata_without_a_card():
     """report_metrics.json carries model/iteration counts (the only writer of that
     file), and _setup_artifact_item -> _session_detail must surface them as
-    model/steps/stepBudget AND compose the verdict from the serialized model keys.
-    Locks the dead-wiring + serialization-alias contracts for real (non-demo) runs."""
+    model/steps/stepBudget. This run sealed no verdict record, so there is
+    nothing for the card to copy and the detail offers none — report metrics
+    are diagnostics and never stand in for the record."""
     files = {
         "/workspace/.setup_agent/contexts/trunk_20260618_100000.json": json.dumps(
             {
@@ -854,12 +857,8 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
     assert detail.steps == 6
     assert detail.step_budget == 40
     # A new phase session without verdict.json keeps runtime metadata but does
-    # not reconstruct canonical test counts or verdict from report metrics.
-    assert detail.verdict is not None
-    assert detail.verdict.tone == "attention"
-    assert detail.verdict.headline == (
-        "Build result unavailable. Test result unavailable. Review before promoting"
-    )
+    # not reconstruct test counts or a result from report metrics.
+    assert detail.result_card is None
     assert detail.canonical_verdict == "unknown"
     assert detail.snapshot_status == "missing"
     assert detail.test.total == 0
@@ -1109,3 +1108,164 @@ def test_resolve_logs_root_skips_empty_subdir_logs(tmp_path, monkeypatch):
     monkeypatch.delenv("SAG_LOG_DIR", raising=False)
     monkeypatch.chdir(tmp_path / "webui")
     assert _resolve_logs_root() == tmp_path / "logs"
+
+
+
+def _card_session_dir(tmp_path, run_id, *, ledger: str | None) -> Path:
+    """A host session directory for `run_id`, with or without its control ledger.
+
+    The ledger fixture names no run, so the directory is identified by the run
+    pin beside it — which is also what a run whose ledger never landed leaves
+    behind, and that is the case worth fencing.
+    """
+    from container_evidence_fakes import complete_run_pin
+
+    from sag.agent.control_events import canonical_json
+
+    logs_root = tmp_path / "logs"
+    session_dir = logs_root / "session_20260717_120000_000000_aaaaaaaaaaaa_1"
+    session_dir.mkdir(parents=True)
+    (session_dir / "command_project_tvm.log").write_text("tvm", encoding="utf-8")
+    (session_dir / "run-pin.json").write_text(
+        canonical_json(complete_run_pin(run_id, "a" * 40)), encoding="utf-8"
+    )
+    if ledger is not None:
+        (session_dir / "control_events.jsonl").write_text(ledger, encoding="utf-8")
+    return logs_root
+
+
+def _card_for_session(snapshot, logs_root):
+    """The card `_setup_artifact_item` builds for a run with a sealed record."""
+    from test_snapshot_surface_agreement import (
+        VERDICT_PATH,
+        SnapshotOrchestrator,
+        _phase_trunk,
+    )
+
+    from sag.result_card.models import RunResultCard
+    from sag.web.session_registry import _setup_artifact_item
+
+    item = _setup_artifact_item(
+        SnapshotOrchestrator(
+            {
+                VERDICT_PATH: snapshot.model_dump_json(),
+                "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+            }
+        ),
+        "sag-tvm",
+        logs_root,
+    )
+    assert item is not None and item["snapshot_status"] == "valid"
+    assert isinstance(item["result_card"], dict)
+    return RunResultCard.model_validate(item["result_card"])
+
+
+def test_card_states_the_run_counts_its_own_ledger_recorded(tmp_path, snapshot_factory):
+    """The Workbench reads the same ledger the result block does, and says so.
+
+    Two turns, both carrying a call, one of them answered by a failure: the same
+    three numbers the CLI block prints for the same directory, plus the wall
+    clock and the model the run pin beside it names.
+    """
+    from test_trajectory_reducer import REAL_FAILED_CALL_JSONL, REAL_TRIPLE_JSONL
+
+    ledger = REAL_TRIPLE_JSONL.strip() + "\n" + REAL_FAILED_CALL_JSONL.strip() + "\n"
+    snapshot = snapshot_factory()
+    card = _card_for_session(
+        snapshot, _card_session_dir(tmp_path, snapshot.run_id, ledger=ledger)
+    )
+
+    assert card.stats.turns == 2
+    assert card.stats.tool_calls == 2
+    assert card.stats.tool_failures == 1
+    assert card.stats.wall_clock_seconds == 27.690511
+    assert card.stats.model == "test-action-model"
+    assert card.session_dir is not None and card.session_dir.endswith(
+        "session_20260717_120000_000000_aaaaaaaaaaaa_1"
+    )
+    assert card.row("setup").headline == "2 turns · 2 tool calls · 27.7s"
+
+
+def test_a_session_without_a_ledger_still_gets_a_card_that_says_so(tmp_path, snapshot_factory):
+    """An absent count is stated as absent; it never blanks the card.
+
+    A directory holding no control ledger can answer nothing about turns, and
+    the Setup row says the counts are unavailable rather than printing zeros —
+    every other row still states what the run's own record holds.
+    """
+    snapshot = snapshot_factory()
+    card = _card_for_session(snapshot, _card_session_dir(tmp_path, snapshot.run_id, ledger=None))
+
+    assert card.stats.turns is None
+    assert card.stats.tool_calls is None
+    assert card.stats.tool_failures is None
+    assert card.stats.wall_clock_seconds is None
+    # The run pin sits beside the ledger, not inside it, so it still answers.
+    assert card.stats.model == "test-action-model"
+    assert card.row("setup").headline == "run counts unavailable"
+    # The rest of the card is untouched by the missing ledger.
+    assert card.verdict == snapshot.verdict
+    assert [row.key for row in card.rows] == [
+        "setup",
+        "task",
+        "build",
+        "tests",
+        "coverage",
+        "ci",
+        "report",
+    ]
+    assert card.row("tests").headline.startswith("328 executed")
+
+
+def test_a_broken_card_call_raises_while_a_broken_record_only_costs_the_card(
+    tmp_path, snapshot_factory, monkeypatch
+):
+    """The guard around the card build tells bad data apart from a bad call.
+
+    A record the card cannot read is a fact about the run, and the detail loses
+    only its card. A TypeError in that position is a wrong keyword or a wrong
+    shape — the exact mistake that once served `resultCard: null` for every
+    session with the whole suite green — and it must surface instead.
+    """
+    import pytest
+
+    from test_snapshot_surface_agreement import (
+        VERDICT_PATH,
+        SnapshotOrchestrator,
+        _phase_trunk,
+    )
+
+    import sag.web.session_registry as registry
+
+    snapshot = snapshot_factory()
+    logs_root = _card_session_dir(tmp_path, snapshot.run_id, ledger=None)
+
+    def build(*args, **kwargs):
+        item = registry._setup_artifact_item(
+            SnapshotOrchestrator(
+                {
+                    VERDICT_PATH: snapshot.model_dump_json(),
+                    "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+                }
+            ),
+            "sag-tvm",
+            logs_root,
+        )
+        return item
+
+    def raise_type_error(*args, **kwargs):
+        raise TypeError("build_result_card() got an unexpected keyword argument 'goal'")
+
+    monkeypatch.setattr(registry, "build_result_card", raise_type_error)
+    with pytest.raises(TypeError):
+        build()
+
+    def raise_value_error(*args, **kwargs):
+        raise ValueError("this record states no verdict")
+
+    monkeypatch.setattr(registry, "build_result_card", raise_value_error)
+    item = build()
+    assert item is not None
+    assert item["result_card"] is None
+    # Everything the detail does not read from the card is unaffected.
+    assert item["canonical_verdict"] == snapshot.verdict

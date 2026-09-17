@@ -21,6 +21,7 @@ from sag.evidence import (
     coerce_evidence_status,
 )
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
+from sag.result_card.markdown import render_result_card_markdown
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.tools.module_metrics import (
     MODULE_METRICS_PATH,
@@ -34,7 +35,6 @@ _MODULE_METRICS_UNSET = object()
 _RECEIPT_RECORDS_UNSET = object()
 _OBLIGATION_RECORDS_UNSET = object()
 _REPORT_METRICS_PUBLICATION_LOCK = threading.RLock()
-from sag.ui.events import EventType, UIEventEmitter
 from sag.verdict import (
     ADJUDICATED_CONFLICTS,
     COUNT_DERIVED_CONFLICTS,
@@ -52,6 +52,38 @@ from sag.verdict_rates import (
 )
 
 from .base import BaseTool, ToolResult
+
+#: The evidence-accounting lines, said the way a reader would say them. The
+#: numbers are untouched — only the name in front of each one changes, from
+#: the pipeline's internal term for a layer to what that layer actually counts.
+_ACCOUNTING_LABELS: Dict[str, str] = {
+    "Receipt executions": "Results bound to this run's receipts",
+    "Claimed latest cases": "Tests identified by module and name",
+    "Claimed latest subjects": "Test classes identified by module and name",
+    "Quarantined observations (not verdict-bearing)": "Set aside: not from this run's receipts",
+    "Unattributed observations (not verdict-bearing)": (
+        "Set aside: no module or test name recorded"
+    ),
+    "Stale observations (not verdict-bearing)": "Set aside: from an earlier run",
+    "Evidence transport": "Evidence records",
+}
+
+#: The one reason string the layer formatter states in pipeline terms. The
+#: fact is the same either way: nothing was published for the report to read.
+_ACCOUNTING_VALUES: Dict[str, str] = {
+    "unavailable (metrics-v2 artifact unavailable)": (
+        "unavailable (no evidence record was published)"
+    ),
+}
+
+
+def _accounting_line(line: str) -> str:
+    """Relabel one evidence-accounting line, leaving its measurement alone."""
+
+    label, separator, value = line.partition(": ")
+    if not separator:
+        return line
+    return f"{_ACCOUNTING_LABELS.get(label, label)}: {_ACCOUNTING_VALUES.get(value, value)}"
 
 
 def rate_marker(rate: Optional[float]) -> str:
@@ -240,7 +272,7 @@ REPORT_LEGACY_STATUS_TO_EVIDENCE_STATUS = {
 }
 
 
-class ReportTool(BaseTool, UIEventEmitter):
+class ReportTool(BaseTool):
     """
     Tool for generating comprehensive project setup reports and marking task completion.
 
@@ -272,7 +304,6 @@ class ReportTool(BaseTool, UIEventEmitter):
             "Creates both console output and a Markdown file in /workspace. "
             "Use this tool when all main tasks are finished to summarize the work done.",
         )
-        UIEventEmitter.__init__(self)
         self.docker_orchestrator = docker_orchestrator
         self.execution_history_callback = execution_history_callback
         self.context_manager = context_manager
@@ -530,40 +561,6 @@ class ReportTool(BaseTool, UIEventEmitter):
                         result_test_stats,
                         result_conflicts,
                     )
-
-                if self.workflow_mode == "setup":
-                    snapshot_status = report_snapshot.get("status") or {}
-                    snapshot_phases = report_snapshot.get("phases") or {}
-                    ui_total_tests = int(snapshot_status.get("tests_total") or 0)
-                    ui_passed_tests = int(snapshot_status.get("tests_passed") or 0)
-                    ui_flaky_tests = int(snapshot_status.get("tests_flaky") or 0)
-                    ui_build_success = snapshot_phases.get("build") is True
-                    ui_test_success = snapshot_status.get("test_judgment") == "success"
-                    ui_test_pass_rate = float(snapshot_status.get("pass_pct") or 0)
-                else:
-                    test_analysis = actual_accomplishments.get("physical_validation", {}).get(
-                        "test_analysis", {}
-                    )
-                    ui_build_success = actual_accomplishments.get("build_success", False)
-                    ui_test_success = actual_accomplishments.get("test_success", False)
-                    ui_test_pass_rate = test_analysis.get("pass_rate", 0)
-                    ui_total_tests = test_analysis.get("total_tests", 0)
-                    ui_passed_tests = test_analysis.get("passed_tests", 0)
-                    ui_flaky_tests = test_analysis.get("flaky_count", 0)
-
-                # Emit UI event for report generation
-                self.emit(
-                    EventType.REPORT_GENERATED,
-                    message=f"Report generated: {report_filename}",
-                    report_path=f"/workspace/{report_filename}",
-                    status=verified_status,
-                    build_success=ui_build_success,
-                    test_success=ui_test_success,
-                    test_pass_rate=ui_test_pass_rate,
-                    total_tests=ui_total_tests,
-                    passed_tests=ui_passed_tests,
-                    flaky_count=ui_flaky_tests,
-                )
 
                 return ToolResult.completed_success(
                     output=condensed_output,
@@ -931,6 +928,93 @@ class ReportTool(BaseTool, UIEventEmitter):
         if failed or errors:
             lines[1] += f" — {failed} failed, {errors} errors (project-owned)"
         return lines
+
+    def _read_module_metrics_payload(self) -> Optional[Dict[str, Any]]:
+        """The per-module diagnostic file this tool writes, or nothing.
+
+        The card only reads it to name modules that were never built, so an
+        absent or unreadable file costs the card a detail, never a status.
+        """
+
+        if not self.docker_orchestrator:
+            return None
+        from sag.runtime.container_io import ContainerFileReadError, read_container_text
+
+        try:
+            text = read_container_text(self.docker_orchestrator, MODULE_METRICS_PATH)
+        except (OSError, ValueError, ContainerFileReadError) as exc:
+            # Exactly the three ways a FILE can be unreadable: the host refused
+            # the read, the bytes did not decode, or the container could not be
+            # asked. A broad `except` here also swallows a wrong-arity or
+            # wrong-keyword call to the reader, and the report then loses its
+            # jar count and every failing-test bullet with the whole suite
+            # green — the same silent kill this feature already survived once
+            # in the web registry. A TypeError is a bug, and it surfaces.
+            logger.debug(f"module metrics unavailable for the result card: {exc}")
+            return None
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _result_card(self, snapshot: Optional[Dict[str, Any]]):
+        """The shared result card, or None when this report has no verdict payload.
+
+        The report holds the run's verdict payload under ``canonical_snapshot``
+        (written by ``_build_report_snapshot``); a report built from anything
+        older carries no payload the card can read, and gets None.
+        """
+
+        from sag.agent.verdict_finalizer import (
+            ReportDeliveryStatus,
+            RunTermination,
+            RunTerminationStatus,
+        )
+        from sag.config import get_session_logger
+        from sag.result_card.build import build_result_card
+        from sag.result_card.run_evidence import read_run_counts
+
+        payload = (snapshot or {}).get("canonical_snapshot")
+        if not isinstance(payload, dict):
+            return None
+        project = ((snapshot or {}).get("project_info") or {}).get("name")
+        # Delivery is not asserted ahead of the fact here. `_generate_snapshot_report`
+        # raises OSError when `_save_markdown_report` fails, so this document only
+        # ever reaches a reader if the save succeeded: holding it is the proof. The
+        # Report row would otherwise tell that reader no report was written.
+        delivered = RunTermination(
+            termination=RunTerminationStatus.COMPLETED,
+            report_delivery_status=ReportDeliveryStatus.DELIVERED,
+        )
+        # Read outside the guard below: that guard is for a record the card
+        # cannot read, and it catches TypeError. Leaving the reader inside it
+        # would put the narrowing above straight back — a wrong-arity call
+        # would raise into this `except` and cost the report its whole Result
+        # section instead of raising.
+        module_metrics = self._read_module_metrics_payload()
+        # The run's own ledger, through the one reader every surface uses. The
+        # report used to state no turns and no tokens for a run whose terminal
+        # block stated both, which is one run described two ways by two
+        # documents a reader holds side by side.
+        session_logger = get_session_logger()
+        run_counts = read_run_counts(
+            getattr(session_logger, "session_log_dir", None) if session_logger else None
+        )
+        try:
+            return build_result_card(
+                payload,
+                module_metrics=module_metrics,
+                report_metrics=(snapshot or {}).get("metrics_v2"),
+                **run_counts,
+                termination=delivered,
+                project=project,
+                report_path=(snapshot or {}).get("report_path"),
+            )
+        except (TypeError, ValueError):
+            return None
 
     def _render_markdown_evidence_details(
         self, evidence: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None
@@ -3599,6 +3683,12 @@ class ReportTool(BaseTool, UIEventEmitter):
         if next_steps_section:
             report_lines.extend(next_steps_section)
 
+        # Bookkeeping closes the report. It explains the counts the Result
+        # table opened with; a reader who only wants the result never has to
+        # scroll past it, and a reader auditing the counts knows where it is.
+        if report_snapshot:
+            report_lines.extend(self._render_evidence_accounting(report_snapshot))
+
         report_lines.extend(
             [
                 "---",
@@ -5017,6 +5107,18 @@ with open(lock_path,"a+b") as lock:
         lines.append(f"**Generated:** {timestamp}")
 
         evidence_result = (snapshot or {}).get("evidence_result") or {}
+        # One result card, three surfaces: the report opens with the same rows
+        # and the same words the terminal block prints, so a reader who saw the
+        # run finish does not have to re-learn the outcome in report dialect.
+        card = self._result_card(snapshot)
+        if card is not None:
+            lines.append("")
+            lines.extend(render_result_card_markdown(card))
+            refs = evidence_result.get("evidence_refs") or []
+            if refs:
+                lines.append(f"**Evidence refs:** {'; '.join(refs)}")
+                lines.append("")
+            return lines
         rate_lines = self._snapshot_rate_lines(snapshot)
         if rate_lines is not None:
             lines.extend(f"**{line}**" for line in rate_lines)
@@ -5080,15 +5182,10 @@ with open(lock_path,"a+b") as lock:
         evidence = snapshot.get("physical_evidence", {})
 
         if snapshot.get("mode") == "setup":
-            clone_status = "✅ SUCCESS" if phases.get("clone") else "❌ FAILED"
-            lines.extend(
-                [
-                    f"- Repository: {clone_status}",
-                    *[f"- {line}" for line in (self._snapshot_rate_lines(snapshot) or ())],
-                    "",
-                ]
-            )
-            return lines
+            # The Result table at the top of the report already states every
+            # measurement this dashboard used to repeat, in the same words the
+            # terminal used. A second telling only invites the two to disagree.
+            return []
 
         # Prepare values
         clone_status = "✅ Cloned successfully" if phases.get("clone") else "❌ Clone failed"
@@ -5179,22 +5276,33 @@ with open(lock_path,"a+b") as lock:
 
         return lines
 
-    def _render_detailed_test_analysis(self, snapshot: Dict[str, Any]) -> List[str]:
-        """Render detailed test analysis with all metrics clearly displayed."""
-        status = snapshot.get("status", {})
+    def _render_evidence_accounting(self, snapshot: Dict[str, Any]) -> List[str]:
+        """How every test observation was accounted for, said in plain English.
+
+        This is bookkeeping, not the result: it explains which observations the
+        run counted and which it set aside, and why. It closes the report for
+        the reader who wants to audit the counts the Result table states.
+        """
+
         from sag.tools.report_metrics import format_evidence_layer_lines
 
-        lines = [
-            "## 🧾 Metrics-v2 Evidence Layers",
+        return [
+            "## Evidence accounting",
             "",
             *[
-                f"- {line}"
+                f"- {_accounting_line(line)}"
                 for line in format_evidence_layer_lines(
                     snapshot.get("metrics_v2") or snapshot.get("evidence_layer_projection")
                 )
             ],
             "",
         ]
+
+    def _render_detailed_test_analysis(self, snapshot: Dict[str, Any]) -> List[str]:
+        """Render detailed test analysis with all metrics clearly displayed."""
+        status = snapshot.get("status", {})
+
+        lines: List[str] = []
 
         # A run whose pytest attempts produced only COLLECTION nodes executed
         # nothing, so the old gate ("skip unless tests_total") deleted the one
@@ -5212,8 +5320,9 @@ with open(lock_path,"a+b") as lock:
             [
                 "## 🧪 Snapshot Test Diagnostics",
                 "",
-                "> These aggregates are diagnostic. Metrics-v2 claimed subjects, cases, and "
-                "receipt executions are listed separately above.",
+                "> These aggregates are diagnostic. How every test observation was "
+                "accounted for is listed under Evidence accounting at the end of this "
+                "report.",
                 "",
             ]
         )

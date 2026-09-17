@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest"
 
-import type { ContextTrace, ExecutionSessionDetail } from "@/api/types"
+import type { CIComparison, ContextTrace, ExecutionSessionDetail } from "@/api/types"
 
-import { buildDetailFacets, buildDetailTabs } from "./facets"
+import { buildDetailTabs } from "./facets"
 
 function detail(overrides: Partial<ExecutionSessionDetail> = {}): ExecutionSessionDetail {
   return {
@@ -23,74 +23,122 @@ function detail(overrides: Partial<ExecutionSessionDetail> = {}): ExecutionSessi
   }
 }
 
+const comparison: CIComparison = {
+  schema_version: 1,
+  status: "evaluated",
+  run_id: "CC-1",
+  attainment: null,
+  receipt_ids: [],
+  commands: [],
+  reasons: [],
+}
+
+/** A run that produced every panel this pane can offer. */
+function detailWithEverything(
+  overrides: Partial<ExecutionSessionDetail> = {},
+): ExecutionSessionDetail {
+  return detail({
+    ciComparison: comparison,
+    evidence: [
+      { source: "maven", summary: "", counts: "", time: "", status: "pass", records: [] },
+    ],
+    logs: ["BUILD SUCCESS"],
+    reportDoc: { title: "r", generated: "now", blocks: [] },
+    ...overrides,
+  })
+}
+
 const ctx: ContextTrace = {
   trunk: { goal: "Set up acme", state: "completed", progress: {}, summary: "" },
   phases: [],
   debug: {},
 }
 
-describe("buildDetailFacets", () => {
-  it("returns the seven facets in order", () => {
-    const ids = buildDetailFacets(detail()).map((f) => f.id)
-    expect(ids).toEqual(["build", "test", "flow", "evidence", "files", "report", "logs"])
+describe("buildDetailTabs", () => {
+  it("offers the tabs in reading order", () => {
+    expect(buildDetailTabs(detailWithEverything()).map((tab) => tab.id)).toEqual([
+      "overview",
+      "turns",
+      "tests",
+      "build",
+      "ci",
+      "evidence",
+      "logs",
+      "report",
+    ])
   })
 
-  it("surfaces a red test-fail count and evidence/files counts, omitting zero counts", () => {
-    const facets = buildDetailFacets(
-      detail({
-        test: { state: "partial", pass: 8, fail: 2, skip: 0, total: 10 },
-        evidence: [{ source: "maven", summary: "", counts: "", time: "", status: "pass", records: [] }],
-        files: {
-          snapshot: { base: "", head: "", mode: "" },
-          counts: { modified: 1, added: 0, deleted: 0, renamed: 0 },
-          items: [{ path: "a.java", change: "modified", type: "file", size: "", mtime: "", note: "" }],
-        },
+  it("names each tab in words a first-time reader can follow", () => {
+    expect(buildDetailTabs(detailWithEverything()).map((tab) => tab.label)).toEqual([
+      "Overview",
+      "Turns",
+      "Tests",
+      "Build",
+      "Official CI",
+      "Evidence",
+      "Logs",
+      "Report",
+    ])
+  })
+
+  it("hides the official CI tab only when the run served no comparison at all", () => {
+    expect(
+      buildDetailTabs(detailWithEverything({ ciComparison: null })).map((tab) => tab.id),
+    ).not.toContain("ci")
+  })
+
+  it("keeps the official CI tab for a comparison that matched no cell", () => {
+    // 47 of the recorded runs served exactly this: a comparison whose status
+    // says nothing was measured. The tab is where that sentence is said, so
+    // hiding it would leave the result band's CI row pointing nowhere.
+    const tabs = buildDetailTabs(
+      detailWithEverything({
+        ciComparison: { ...comparison, status: "no_matched_cell", attainment: null },
       }),
-    )
-    const byId = Object.fromEntries(facets.map((f) => [f.id, f]))
-    expect(byId.test.count).toBe(2)
-    expect(byId.test.countTone).toBe("red")
-    expect(byId.evidence.count).toBe(1)
-    expect(byId.files.count).toBe(1)
-    expect(byId.build.count).toBeNull()
+    ).map((tab) => tab.id)
+    expect(tabs).toContain("ci")
   })
 
-  it("includes test errors in attention counts", () => {
-    const facets = buildDetailFacets(
-      detail({ test: { state: "partial", pass: 10, fail: 2, errors: 3, skip: 0, total: 15 } }),
-    )
+  it("counts test errors as well as failures on the tests badge", () => {
     const tabs = buildDetailTabs(
       detail({ test: { state: "partial", pass: 10, fail: 2, errors: 3, skip: 0, total: 15 } }),
     )
-
-    expect(facets.find((facet) => facet.id === "test")?.count).toBe(5)
     expect(tabs.find((tab) => tab.id === "tests")?.count).toBe(5)
   })
-})
 
-describe("buildDetailTabs", () => {
-  it("puts overview first and includes flow when context is present", () => {
-    const tabs = buildDetailTabs(detail({ context: ctx }))
+  it("counts the receipts on the evidence tab when no evidence group was built", () => {
+    const tabs = buildDetailTabs(
+      detailWithEverything({
+        evidence: [],
+        receipts: [
+          { receiptId: "r1", tool: "maven", argv: "mvn -q verify", outcome: "ok", reportsNew: 0, reportsChanged: 0 },
+          { receiptId: "r2", tool: "maven", argv: "mvn -q test", outcome: "ok", reportsNew: 0, reportsChanged: 0 },
+        ],
+      }),
+    )
+    const evidence = tabs.find((tab) => tab.id === "evidence")
+    expect(evidence?.count).toBe(2)
+    expect(evidence?.tone).toBe("neutral")
+  })
+
+  it("puts overview first, then the run itself", () => {
+    const tabs = buildDetailTabs(detail())
     expect(tabs[0].id).toBe("overview")
-    expect(tabs.map((t) => t.id)).toContain("flow")
+    expect(tabs.map((t) => t.id).slice(0, 2)).toEqual(["overview", "turns"])
   })
 
-  it("puts the timeline right after overview, for every session that ran", () => {
-    expect(buildDetailTabs(detail()).map((t) => t.id).slice(0, 2)).toEqual([
-      "overview",
-      "timeline",
-    ])
-    // Unlike flow, it does not wait on a context trace: the timeline is derived
-    // from the control ledger, which every run writes.
-    expect(buildDetailTabs(detail({ context: ctx })).map((t) => t.id)).toContain("timeline")
+  it("keeps the turns tab for every session that ran", () => {
+    // It does not wait on a context trace: the turns are derived from the
+    // control ledger, which every run writes.
+    expect(buildDetailTabs(detail({ context: ctx })).map((t) => t.id)).toContain("turns")
   })
 
-  it("omits the timeline for a demo session, which never ran and wrote no ledger", () => {
+  it("omits the turns for a demo session, which never ran and wrote no ledger", () => {
     // `sag ui --demo` fabricates every read model; there is no session
     // directory behind one, which is why the builder refuses to name one. The
     // tab offered a reader a panel that could only ever say "unavailable".
     const tabs = buildDetailTabs(detail({ demo: true })).map((t) => t.id)
-    expect(tabs).not.toContain("timeline")
+    expect(tabs).not.toContain("turns")
     expect(tabs[0]).toBe("overview")
   })
 
@@ -108,27 +156,20 @@ describe("buildDetailTabs", () => {
 
   it("omits tabs whose data is absent", () => {
     const tabs = buildDetailTabs(detail()).map((t) => t.id)
-    expect(tabs).not.toContain("flow")
-    expect(tabs).not.toContain("files")
+    expect(tabs).not.toContain("ci")
     expect(tabs).not.toContain("evidence")
     expect(tabs).not.toContain("logs")
     expect(tabs).not.toContain("report")
   })
 
-  it("includes files / evidence / logs / report tabs when their data is present", () => {
+  it("includes evidence / logs / report tabs when their data is present", () => {
     const tabs = buildDetailTabs(
       detail({
         evidence: [{ source: "maven", summary: "", counts: "", time: "", status: "pass", records: [] }],
-        files: {
-          snapshot: { base: "", head: "", mode: "" },
-          counts: { modified: 1, added: 0, deleted: 0, renamed: 0 },
-          items: [{ path: "a.java", change: "modified", type: "file", size: "", mtime: "", note: "" }],
-        },
         logs: ["line"],
         reportDoc: { title: "r", generated: "now", blocks: [] },
       }),
     ).map((t) => t.id)
-    expect(tabs).toContain("files")
     expect(tabs).toContain("evidence")
     expect(tabs).toContain("logs")
     expect(tabs).toContain("report")

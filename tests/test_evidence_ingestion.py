@@ -1454,7 +1454,7 @@ def test_setup_agent_injects_one_session_owned_state_and_finalizer(monkeypatch):
     )
 
     agent = object.__new__(SetupAgent)
-    agent.config = SimpleNamespace(workspace_path="/workspace", ui_mode=False)
+    agent.config = SimpleNamespace(workspace_path="/workspace")
     agent.orchestrator = FakeVerdictOrchestrator()
     agent.context_manager = None
     agent.tools = None
@@ -1465,7 +1465,6 @@ def test_setup_agent_injects_one_session_owned_state_and_finalizer(monkeypatch):
     agent.verdict_finalizer = VerdictFinalizer(agent.orchestrator)
     agent.control_event_sink = None
     agent._run_pin_host_path = None
-    agent.ui_manager = None
     agent.agent_logger = SimpleNamespace(
         info=lambda *args, **kwargs: None,
         warning=lambda *args, **kwargs: None,

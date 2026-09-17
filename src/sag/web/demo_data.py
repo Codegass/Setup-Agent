@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+from sag.agent.verdict_finalizer import (
+    ReportDeliveryStatus,
+    RunTermination,
+    RunTerminationStatus,
+)
+from sag.result_card.build import build_result_card
+from sag.result_card.models import RunResultCard
 from sag.web.models import (
     BuildSummary,
     ClaimedTestLayers,
@@ -18,24 +27,22 @@ from sag.web.models import (
     EvidenceLayerProjectionSummary,
     EvidenceRecord,
     ExecutionSessionDetail,
-    FileChangeCounts,
-    FileChangeDigest,
-    FileChangeItem,
-    FileSnapshotRef,
     MetricsV2EvidenceSummary,
     ModuleRollup,
     ModuleSummary,
     ObservationCountSummary,
+    ReceiptSummary,
     ReportDocument,
     TerminalConnectionState,
     TestEvidenceLayers,
     TestSummary,
-    VerdictSummary,
+    WorkspaceResult,
     WorkspaceSummary,
 )
 
 _COMMONS_WORKSPACE_ID = "sag-commons-cli"
 _COMMONS_SESSION_ID = "CC-3"
+_COMMONS_RUN_ID = "20260606_021408_000000_sag-commons-cli_1-1-demo-commons-cli"
 
 
 def _commons_test_evidence_layers() -> EvidenceLayerProjectionSummary:
@@ -210,16 +217,22 @@ def _commons_modules() -> list[ModuleSummary]:
             class_count=261,
             jar_count=1,
             tests_total=1240,
-            tests_passed=1238,
-            tests_failed=2,
+            tests_passed=1232,
+            tests_failed=8,
             tests_errors=0,
             tests_skipped=0,
             test_source="runner_xml",
             failing_names=[
-                "org.apache.commons.cli.DefaultParserTest.testLongOptionWithEqualsSign",
                 "org.apache.commons.cli.HelpFormatterTest.testWrappedColumns",
+                "org.apache.commons.cli.HelpFormatterTest.testPrintWrapped",
+                "org.apache.commons.cli.HelpFormatterTest.testRenderWrappedTextWordCut",
+                "org.apache.commons.cli.HelpFormatterTest.testPrintHelpWithEmptySyntax",
+                "org.apache.commons.cli.HelpFormatterTest.testIndentedHeaderAndFooter",
+                "org.apache.commons.cli.HelpFormatterTest.testDefaultArgName",
+                "org.apache.commons.cli.HelpFormatterTest.testRtrim",
+                "org.apache.commons.cli.HelpFormatterTest.testAutomaticUsage",
             ],
-            failing_count=2,
+            failing_count=8,
             line_covered=2040,
             line_total=2480,
             line_rate=82.3,
@@ -356,30 +369,175 @@ def _commons_context() -> ContextTrace:
     )
 
 
-def _commons_files() -> FileChangeDigest:
-    return FileChangeDigest(
-        snapshot=FileSnapshotRef(
-            base="HEAD",
-            head="workspace-scan-2026-06-06T0216",
-            mode="demo",
+def _commons_module_metrics() -> dict[str, Any]:
+    """The demo's per-module diagnostics, in the shape the card reads them."""
+
+    return {
+        "version": 1,
+        "generated_at": "2026-06-06T02:16:40Z",
+        "module_summary": _commons_module_summary().model_dump(mode="json"),
+        "modules": [module.model_dump(mode="json") for module in _commons_modules()],
+    }
+
+
+def _commons_run_record() -> dict[str, Any]:
+    """The verdict record a run like this one would have written.
+
+    The demo detail shows a Maven reactor that compiled all three modules while
+    eight HelpFormatter tests kept failing, so this record states exactly those
+    numbers: the card is derived from it the same way a real run's card is, and
+    a demo card that disagreed with the panels beside it would be worse than no
+    demo card at all.
+    """
+
+    counts = {"executed": 320, "passed": 312, "failed": 8, "errors": 0, "skipped": 0}
+    return {
+        "schema_version": 5,
+        "run_id": _COMMONS_RUN_ID,
+        "finalized_at": "2026-06-06T02:16:44Z",
+        "input_refs": [],
+        "verdict": "partial",
+        "build_evidence": {
+            "observed": True,
+            "green": True,
+            "judgment": "success",
+            "source": "physical",
+            "outcome": "success",
+            "evidence_status": "verified",
+            "refs": ["output_demo_build"],
+            "compiled_classes": 180,
+            "source_files": 96,
+            "reactor_modules_succeeded": 3,
+            "reactor_modules_total": 3,
+        },
+        "test_stats": {
+            "discovered": 320,
+            "denominator_basis": "complete",
+            "unique": dict(counts),
+            "raw": dict(counts),
+            "flaky_count": 0,
+            "judgment": "success",
+            "collection_errors": 0,
+            "receipt_scoped": True,
+        },
+        "rates": {
+            "build": {
+                "modules": {
+                    "numerator": 3,
+                    "denominator": 3,
+                    "rate": 100.0,
+                    "band": "fully",
+                },
+                "classes": {
+                    "band": "unavailable",
+                    "reason": "demo fixture keeps no class census",
+                },
+            },
+            "test": {
+                "cases": {
+                    "numerator": 312,
+                    "denominator": 320,
+                    "rate": 97.5,
+                    "band": "mostly",
+                },
+                "modules": {
+                    "numerator": 2,
+                    "denominator": 3,
+                    "rate": 66.7,
+                    "band": "mostly",
+                },
+            },
+            "coverage": {
+                "status": "collected",
+                "line_rate": 81.7,
+                "source": "jacoco-injected",
+            },
+        },
+        "conflicts": [],
+        "phase_records": [],
+    }
+
+
+def _commons_receipts() -> list[ReceiptSummary]:
+    """The two commands this demo run would have recorded receipts for.
+
+    Kept in step with the demo record beside it: the same three modules the
+    build row counts, and the same 320 executions the tests row states.
+    """
+
+    return [
+        ReceiptSummary(
+            receipt_id="inv-maven-1-demo0commonscli-0001",
+            tool="maven",
+            argv="/opt/apache-maven-3.9.9/bin/mvn -B clean install -DskipTests",
+            working_directory="/workspace/commons-cli",
+            actual_cwd="/workspace/commons-cli",
+            exit_code=0,
+            outcome="completed",
+            lifecycle_state="finished",
+            toolchain={
+                "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+                "version": "Apache Maven 3.9.9",
+            },
+            jdk_major="17",
+            jdk_version="17.0.20",
         ),
-        counts=FileChangeCounts(modified=1, added=1, deleted=0, renamed=0),
-        items=[
-            FileChangeItem(
-                path="pom.xml",
-                change="modified",
-                size="18 KB",
-                mtime="02:15:02",
-                note="commons-cli 1.6.0 dependency and plugin metadata inspected for setup.",
-            ),
-            FileChangeItem(
-                path=".setup_agent/env_overlay.json",
-                change="added",
-                size="2 KB",
-                mtime="02:15:36",
-                note="Container environment overlay generated for reproducible commands.",
-            ),
-        ],
+        ReceiptSummary(
+            receipt_id="inv-maven-1-demo0commonscli-0002",
+            tool="maven",
+            argv="/opt/apache-maven-3.9.9/bin/mvn -B test",
+            working_directory="/workspace/commons-cli",
+            actual_cwd="/workspace/commons-cli",
+            exit_code=1,
+            outcome="completed",
+            lifecycle_state="finished",
+            toolchain={
+                "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+                "version": "Apache Maven 3.9.9",
+            },
+            jdk_major="17",
+            jdk_version="17.0.20",
+            reports_new=3,
+            tests_reported=320,
+        ),
+    ]
+
+
+def _commons_workspace_result() -> WorkspaceResult:
+    """The rail's cells, built by the same function the live rail uses."""
+
+    from sag.agent.verdict_finalizer import RunVerdictSnapshot
+    from sag.web.session_registry import _workspace_result
+
+    result = _workspace_result(
+        _commons_result_card().model_dump(mode="json"),
+        RunVerdictSnapshot.model_validate(_commons_run_record()),
+    )
+    assert result is not None  # the demo record always builds a card
+    return result
+
+
+def _commons_result_card() -> RunResultCard:
+    """The one result card — the CLI block and the report table print this shape."""
+
+    report = _commons_report()
+    return build_result_card(
+        _commons_run_record(),
+        module_metrics=_commons_module_metrics(),
+        termination=RunTermination(
+            termination=RunTerminationStatus.COMPLETED,
+            report_delivery_status=ReportDeliveryStatus.DELIVERED,
+        ),
+        # The demo detail already states the model, the step count and the
+        # wall clock; the card states those three rather than reporting the
+        # run's counts unavailable beside panels that show them.
+        run_pin={"action_model": "claude-sonnet-4.5"},
+        trajectory_session={"wall_clock_seconds": 156.0},
+        turn_count=6,
+        project="apache/commons-cli",
+        goal="Run full test suite and summarize HelpFormatter failures",
+        container=_COMMONS_WORKSPACE_ID,
+        report_path=report.path,
     )
 
 
@@ -433,6 +591,7 @@ def build_demo_dashboard() -> DashboardResponse:
         changed=2,
         active_session=_COMMONS_SESSION_ID,
         latest_session=_COMMONS_SESSION_ID,
+        result=_commons_workspace_result(),
         updated="2026-06-06 02:16",
     )
     return DashboardResponse(docker=docker, workspaces=[workspace])
@@ -459,7 +618,6 @@ def get_demo_session(session_id: str) -> ExecutionSessionDetail:
         report="ready",
         report_doc=_commons_report(),
         evidence=_commons_evidence(),
-        files=_commons_files(),
         context=_commons_context(),
         logs=[
             "02:14:08 workspace sag-commons-cli attached",
@@ -471,14 +629,8 @@ def get_demo_session(session_id: str) -> ExecutionSessionDetail:
         # trajectory can be derived. The detail says so rather than letting the
         # timeline offer a panel that could only answer "unavailable".
         demo=True,
-        verdict=VerdictSummary(
-            tone="attention",
-            headline=(
-                "Build passed on 3 of 3 modules. 8 of 320 tests failing — "
-                "review before promoting"
-            ),
-            detail=None,
-        ),
+        result_card=_commons_result_card(),
+        receipts=_commons_receipts(),
         rates={
             "build": {
                 "modules": {

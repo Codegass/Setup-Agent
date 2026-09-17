@@ -26,6 +26,19 @@ from sag.agent.verdict_finalizer import RunVerdictSnapshot, validate_verdict_sna
 from sag.web.session_registry import _session_detail, _setup_artifact_item
 
 
+def _block_task_fragments(completion):
+    """What the result block must state about a sealed required task."""
+
+    steps = tuple(completion.steps or ())
+    if not steps:
+        return [str(completion.status), *completion.reasons]
+    complete = sum(1 for step in steps if step.status == "complete")
+    return [
+        f"{completion.status} {complete}/{len(steps)} steps",
+        *[f"{step.id}: {step.status} \u2014 {step.command}" for step in steps],
+    ]
+
+
 def input_task():
     return AcceptanceTask.model_validate(
         {
@@ -120,9 +133,14 @@ def test_required_task_result_is_identical_across_sealed_surfaces(snapshot_facto
     assert snapshot.test_stats == base.test_stats and snapshot.rates == base.rates
     expected = render_task_completion_lines(completion)
     surfaces = SurfaceHarness().render_all(snapshot)
-    for surface in (surfaces.cli, surfaces.markdown, surfaces.condensed):
+    assert surfaces.condensed.verdict == snapshot.verdict
+    assert all(line in surfaces.condensed.text for line in expected)
+    # The report and the block print the same result card, so both say the same
+    # result in its words; the agreement is checked against the sealed task
+    # itself rather than against the condensed log's phrasing.
+    for surface in (surfaces.markdown, surfaces.cli):
         assert surface.verdict == snapshot.verdict
-        assert all(line in surface.text for line in expected)
+        assert all(fragment in surface.text for fragment in _block_task_fragments(completion))
     orch = SnapshotOrchestrator(
         {
             VERDICT_PATH: snapshot.model_dump_json(),
@@ -132,7 +150,26 @@ def test_required_task_result_is_identical_across_sealed_surfaces(snapshot_facto
     item = _setup_artifact_item(orch, "sag-tvm")
     detail = _session_detail(item, "sag-tvm", None).model_dump(mode="json", by_alias=True)
     assert detail["taskCompletion"] == completion.model_dump(mode="json")
-    assert detail["taskCompletionLines"] == expected
+    # The Workbench serves the card rather than rendering it, so the same
+    # fragments the block and the report print are read out of the task row —
+    # each from the field that is supposed to carry it. Joining the five fields
+    # into one string and matching substrings passed a fragment that had landed
+    # in the wrong field, which is most of what this fence is for.
+    task = next(row for row in detail["resultCard"]["rows"] if row["key"] == "task")
+    steps = tuple(completion.steps or ())
+    assert task["status"] == str(completion.status)
+    if steps:
+        complete = sum(1 for step in steps if step.status == "complete")
+        assert task["headline"] == f"{completion.status} {complete}/{len(steps)} steps"
+    else:
+        assert task["headline"] == "step definition unavailable"
+        # The row explains the code rather than restating it bare.
+        for reason in completion.reasons[:1]:
+            assert task["reason"] and reason in task["reason"]
+    # The step lines the block prints, in the row's own `items`, one for one.
+    assert [item.split(" \u2192 exit ")[0].split(";")[0] for item in task["items"]] == [
+        f"{step.id}: {step.status} \u2014 {step.command}" for step in steps
+    ]
     authority = evidence_publication_authority_for(orch)
     head = authority.latest_head(VERDICT_LOGICAL_ARTIFACT_ID)
     authority.revoke_latest(

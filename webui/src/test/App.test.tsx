@@ -1,7 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import type { ExecutionSessionDetail } from "@/api/types"
+import type { ExecutionSessionDetail, ResultCard } from "@/api/types"
 
 import { App } from "../App"
 
@@ -38,6 +38,43 @@ const jsonResponse = (payload: unknown) =>
     status: 200,
   })
 
+/** A result card the way `build_result_card` emits one: the seven rows, in
+ *  order, each stating the run's own words. The tests that follow a refetch key
+ *  off the setup row's headline, which is the band's first line. */
+const resultCard = (
+  setupHeadline: string,
+  testsHeadline = "320 executed · 312 passed · 8 failed · 0 errors · 0 skipped",
+): ResultCard => ({
+  schemaVersion: 1,
+  runId: "CC-3",
+  verdict: "partial",
+  verdictSource: "snapshot",
+  rows: [
+    { key: "setup", label: "Setup", status: "partial", tone: "attention", headline: setupHeadline },
+    {
+      key: "task",
+      label: "Required task",
+      status: "not supplied",
+      tone: "neutral",
+      headline: "no required task was supplied",
+    },
+    { key: "build", label: "Build", status: "success", tone: "success", headline: "1/1 modules built" },
+    {
+      key: "tests",
+      label: "Tests",
+      status: "executed",
+      tone: "attention",
+      headline: testsHeadline,
+    },
+    { key: "coverage", label: "Coverage", status: "not collected", tone: "neutral", headline: "not collected" },
+    { key: "ci", label: "Official CI", status: "not compared", tone: "neutral", headline: "not compared" },
+    { key: "report", label: "Report", status: "delivered", tone: "neutral", headline: "setup-report.md" },
+  ],
+  stats: {},
+  attention: [],
+  notes: [],
+})
+
 const sessionDetail: ExecutionSessionDetail = {
   id: "CC-3",
   workspace: "sag-commons-cli",
@@ -47,6 +84,7 @@ const sessionDetail: ExecutionSessionDetail = {
   start: "02:14:08",
   duration: "running · 2m 11s",
   outcome: "Build succeeds and tests are partial.",
+  resultCard: resultCard("3/5 phases · 21 turns"),
   build: { state: "success", tool: "Maven", time: "47.2s", note: "clean package" },
   test: { state: "partial", pass: 312, fail: 8, skip: 0, total: 320 },
   report: "ready",
@@ -65,7 +103,6 @@ const sessionDetail: ExecutionSessionDetail = {
       records: [],
     },
   ],
-  files: null,
   context: null,
   logs: ["BUILD SUCCESS"],
 }
@@ -212,11 +249,18 @@ describe("App", () => {
       }))[0],
     )
 
-    // Master-detail: header heading + verdict band + tab nav.
+    // Master-detail: header heading + result band + tab nav.
     expect(await screen.findByRole("heading", { name: "apache/commons-cli" })).toBeInTheDocument()
     expect(screen.getByRole("navigation", { name: /detail tabs/i })).toBeInTheDocument()
-    // VerdictBand falls back to the raw outcome when no verdict is composed.
-    expect(screen.getByText("Build succeeds and tests are partial.")).toBeInTheDocument()
+    // The result band states every row of the card the API served. The tests row
+    // is read inside the band, because the Overview below restates it word for
+    // word and an unscoped query would not say which surface it found.
+    expect(screen.getByText("3/5 phases · 21 turns")).toBeInTheDocument()
+    const bandTests = document.querySelector('[data-row="tests"]') as HTMLElement
+    expect(bandTests).not.toBeNull()
+    expect(
+      within(bandTests).getByText("320 executed · 312 passed · 8 failed · 0 errors · 0 skipped"),
+    ).toBeInTheDocument()
     // The Report tab swaps in the report document body.
     fireEvent.click(screen.getByRole("button", { name: /^Report/ }))
     expect(screen.getByText("Project builds.")).toBeInTheDocument()
@@ -273,6 +317,7 @@ describe("App", () => {
       status: "running",
       entry: "Web UI",
       outcome: "Task is running.",
+      resultCard: resultCard("1/5 phases · 4 turns"),
     }
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
       const url = String(input)
@@ -335,8 +380,8 @@ describe("App", () => {
     })
 
     // The refreshed dashboard moves the latest session to UI-12345678; the
-    // detail pane follows the workspace's latest session and renders its outcome.
-    expect(await screen.findByText("Task is running.")).toBeInTheDocument()
+    // detail pane follows the workspace's latest session and renders its result.
+    expect(await screen.findByText("1/5 phases · 4 turns")).toBeInTheDocument()
   })
 
   it("lists completed setup sessions alongside active workspace tasks", async () => {
@@ -390,6 +435,7 @@ describe("App", () => {
       status: "running",
       entry: "Web UI",
       outcome: "Task is running.",
+      resultCard: resultCard("1/5 phases · 4 turns"),
     }
 
     vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
@@ -428,6 +474,10 @@ describe("App", () => {
       status: "completed",
       duration: "2m 45s",
       outcome: "Setup completed after polling.",
+      resultCard: resultCard(
+        "5/5 phases · 33 turns",
+        "430 executed · 430 passed · 0 failed · 0 errors · 0 skipped",
+      ),
       test: { state: "success", pass: 430, fail: 0, skip: 0, total: 430 },
     }
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
@@ -460,14 +510,17 @@ describe("App", () => {
       }))[0],
     )
 
-    expect(await screen.findByText("Build succeeds and tests are partial.")).toBeInTheDocument()
+    expect(await screen.findByText("3/5 phases · 21 turns")).toBeInTheDocument()
 
     await new Promise((resolve) => setTimeout(resolve, 3200))
 
-    expect(await screen.findByText("Setup completed after polling.")).toBeInTheDocument()
-    // The Tests tab's sealed-run summary reflects the freshly polled totals.
+    expect(await screen.findByText("5/5 phases · 33 turns")).toBeInTheDocument()
+    // The Tests tab states the freshly polled card's own tests row — the same
+    // string the band above it states, not a second reading of the counts.
     fireEvent.click(screen.getByRole("button", { name: /^Tests/ }))
-    expect(screen.getByText(/test results: 430 passed/i)).toBeInTheDocument()
+    expect(
+      screen.getAllByText("430 executed · 430 passed · 0 failed · 0 errors · 0 skipped").length,
+    ).toBe(2)
   }, 8000)
 
   it("refreshes completed session details when late metrics arrive", async () => {
@@ -475,11 +528,13 @@ describe("App", () => {
       ...sessionDetail,
       status: "completed",
       outcome: "Metrics are still being mirrored.",
+      resultCard: resultCard("4/5 phases · 28 turns"),
       test: { state: "success", pass: 4722, fail: 0, errors: 0, skip: 0, total: 4722 },
     }
     const refreshed = {
       ...completed,
       outcome: "Late report metrics are now available.",
+      resultCard: resultCard("5/5 phases · 30 turns"),
     }
     let sessionFetches = 0
     vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
@@ -496,11 +551,11 @@ describe("App", () => {
 
     render(<App />)
     fireEvent.click((await screen.findAllByRole("button", { name: /open workspace apache\/commons-cli/i }))[0])
-    expect(await screen.findByText("Metrics are still being mirrored.")).toBeInTheDocument()
+    expect(await screen.findByText("4/5 phases · 28 turns")).toBeInTheDocument()
 
     await new Promise((resolve) => setTimeout(resolve, 5200))
 
-    expect(await screen.findByText("Late report metrics are now available.")).toBeInTheDocument()
+    expect(await screen.findByText("5/5 phases · 30 turns")).toBeInTheDocument()
   }, 9000)
 
   it("does not mount the terminal panel when the workspace container is not running", async () => {

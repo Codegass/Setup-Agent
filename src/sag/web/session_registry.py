@@ -9,6 +9,7 @@ import shlex
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,12 +27,17 @@ from sag.agent.evidence_publications import (
     reset_evidence_publication_authority,
 )
 from sag.agent.verdict_finalizer import (
+    VERDICT_SCHEMA_VERSION,
     VERDICT_SNAPSHOT_PATH,
+    ReportDeliveryStatus,
     RunVerdictSnapshot,
     read_live_verdict_snapshot,
 )
+from sag.result_card.build import _verdict_source, build_result_card
+from sag.result_card.run_evidence import ReportDeliveryOnly, read_run_counts
+from sag.result_card.models import RunResultCard
 from sag.runtime.container_io import resolve_control_execute
-from sag.trajectory.builder import CONTROL_EVENTS_NAME
+from sag.trajectory.builder import CONTROL_EVENTS_NAME, build_trajectory
 from sag.web.context_trace import ContextTraceBuilder
 from sag.web.models import (
     BuildSummary,
@@ -42,12 +48,15 @@ from sag.web.models import (
     ExecutionSessionSummary,
     ModuleRollup,
     ModuleSummary,
+    ReceiptSummary,
     ReportDocument,
     TestSummary,
-    VerdictSummary,
+    WorkspaceCIResult,
+    WorkspaceResult,
     WorkspaceSummary,
+    WorkspaceTaskResult,
+    WorkspaceTestResult,
 )
-from sag.web.verdict import compose_verdict
 
 SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
 #: The run-pin the agent publishes at startup, inside the container. It is the
@@ -228,7 +237,7 @@ class ContainerSessionRegistry:
                 return None
 
         context = _read_context_trace(orchestrator)
-        return _session_detail(item, workspace.id, context)
+        return _session_detail(item, workspace.id, context, _read_receipts(orchestrator))
 
     def get_session_dir(self, session_id: str) -> Path | None:
         """The directory a session's trajectory is derived from, or None.
@@ -546,6 +555,11 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
         snapshot_status=_text(item.get("snapshot_status"), default="unavailable"),
         legacy=item.get("legacy") is True,
         report_delivery_status=_optional_text(item.get("report_delivery_status")),
+        result=(
+            WorkspaceResult.model_validate(item["result"])
+            if isinstance(item.get("result"), dict)
+            else None
+        ),
     )
 
 
@@ -574,30 +588,140 @@ def _module_rollup(value: Any) -> ModuleRollup | None:
         return None
 
 
+def _receipt_summary(payload: Any) -> ReceiptSummary | None:
+    """One receipt's presentable surface, or None when it is not a receipt."""
+
+    if not isinstance(payload, dict):
+        return None
+    required = ("receipt_id", "tool", "argv", "outcome")
+    if any(not payload.get(field) for field in required):
+        return None
+    toolchain = payload.get("toolchain_fingerprint")
+    jdk = payload.get("effective_jdk") if isinstance(payload.get("effective_jdk"), dict) else {}
+    runtime = ((jdk.get("provenance") or {}).get("dispatch_runtime") or {}) if jdk else {}
+    delta = payload.get("report_delta") if isinstance(payload.get("report_delta"), dict) else {}
+    totals = payload.get("testcase_execution_totals")
+    return ReceiptSummary(
+        receipt_id=str(payload["receipt_id"]),
+        tool=str(payload["tool"]),
+        argv=str(payload["argv"]),
+        working_directory=_optional_text(payload.get("working_directory")),
+        actual_cwd=_optional_text(payload.get("actual_cwd")),
+        exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
+        outcome=str(payload["outcome"]),
+        lifecycle_state=_optional_text(payload.get("lifecycle_state")),
+        toolchain=(
+            {
+                "executable": _optional_text(toolchain.get("executable")),
+                "version": _optional_text(toolchain.get("version")),
+            }
+            if isinstance(toolchain, dict)
+            else None
+        ),
+        jdk_major=_optional_text(jdk.get("major")) if jdk else None,
+        jdk_version=_optional_text(runtime.get("version")) if runtime else None,
+        reports_new=len(delta.get("new") or ()),
+        reports_changed=len(delta.get("changed") or ()),
+        tests_reported=(
+            totals.get("reported")
+            if isinstance(totals, dict) and isinstance(totals.get("reported"), int)
+            else None
+        ),
+    )
+
+
+def _read_receipts(orchestrator: Any) -> list[ReceiptSummary] | None:
+    """The run's recorded invocations, newest last, or None if unreadable.
+
+    `[]` is a statement — this run recorded no commands — so a read that could
+    not complete must not borrow it. A stream the transport refused, or one the
+    decoder found short, answers None and lets the surface say it could not
+    look.
+    """
+
+    from sag.agent.evidence_records import (
+        decode_named_json_record_stream,
+        execute_named_json_record_stream,
+    )
+    from sag.agent.invocation_receipts import RECEIPT_DIR
+
+    try:
+        decoded = decode_named_json_record_stream(
+            execute_named_json_record_stream(orchestrator, RECEIPT_DIR)
+        )
+    except Exception:
+        return None
+    if not decoded.complete or decoded.conflict is not None:
+        return None
+    summaries = [_receipt_summary(record.payload) for record in decoded.records]
+    return [summary for summary in summaries if summary is not None]
+
+
+def _task_cell(snapshot: Any) -> WorkspaceTaskResult | None:
+    """How many of the task's steps completed, when the record counted any.
+
+    A record that named no step stated no denominator, so no fraction is shown
+    for it — `0/0` would read as a measurement nothing measured.
+    """
+
+    completion = getattr(snapshot, "task_completion", None)
+    if completion is None:
+        return None
+    steps = tuple(completion.steps or ())
+    if not steps:
+        return None
+    return WorkspaceTaskResult(
+        status=completion.status,
+        completed=sum(1 for step in steps if step.status == "complete"),
+        required=len(steps),
+    )
+
+
+def _tests_cell(snapshot: Any) -> WorkspaceTestResult | None:
+    stats = getattr(snapshot, "test_stats", None)
+    if stats is None or stats.unique.executed <= 0:
+        return None
+    unique = stats.unique
+    return WorkspaceTestResult(
+        executed=unique.executed,
+        passed=unique.passed,
+        failed=unique.failed,
+        errors=unique.errors,
+        skipped=unique.skipped,
+    )
+
+
+def _workspace_result(card: Any, snapshot: Any) -> WorkspaceResult | None:
+    """The rail's cells: the words off the card, the counts off the record.
+
+    The verdict and the Official CI word are the card's own, already spelled
+    the way the terminal block and the report print them, so the rail cannot
+    read differently from the card it sits above.
+    """
+
+    if not isinstance(card, dict):
+        return None
+    rows = {row.get("key"): row for row in card.get("rows") or () if isinstance(row, dict)}
+    ci_status = _optional_text((rows.get("ci") or {}).get("status"))
+    return WorkspaceResult(
+        verdict=_text(card.get("verdict"), default="unknown"),
+        task=_task_cell(snapshot),
+        tests=_tests_cell(snapshot),
+        ci=WorkspaceCIResult(status=ci_status) if ci_status is not None else None,
+    )
+
+
 def _session_detail(
     item: dict[str, Any],
     workspace_id: str,
     context: ContextTrace | None,
+    receipts: list[ReceiptSummary] | None = None,
 ) -> ExecutionSessionDetail:
     summary = _session_summary(item, workspace_id)
     outcome = _text(item.get("outcome"), default=summary.title)
     build = _build_summary(item.get("build"))
     module_summary = _module_rollup(item.get("module_summary"))
     report_doc = _report_document(item)
-
-    verdict = compose_verdict(
-        build=build.model_dump(mode="json", by_alias=True),
-        test=summary.test.model_dump(mode="json", by_alias=True),
-        module_summary=(
-            module_summary.model_dump(mode="json", by_alias=True)
-            if module_summary is not None
-            else None
-        ),
-        outcome=outcome,
-        blocker=item.get("blocker"),
-        canonical_verdict=(summary.canonical_verdict if "canonical_verdict" in item else None),
-        verdict_source=_text(item.get("verdict_source"), default="derived"),
-    )
 
     return ExecutionSessionDetail(
         id=summary.id,
@@ -618,23 +742,25 @@ def _session_detail(
         report_doc=report_doc,
         blocker=item.get("blocker"),
         evidence=_evidence(item, outcome),
-        files=None,
         context=context,
         logs=_log_lines(item.get("logs")),
         partial=False,
-        verdict=VerdictSummary.model_validate(verdict) if verdict else None,
+        result_card=(
+            RunResultCard.model_validate(item["result_card"])
+            if isinstance(item.get("result_card"), dict)
+            else None
+        ),
         model=_optional_text(item.get("model")),
         steps=_optional_int(item.get("steps")),
         step_budget=_optional_int(item.get("step_budget")),
         canonical_verdict=summary.canonical_verdict,
         rates=item.get("rates") if isinstance(item.get("rates"), dict) else None,
         ci_comparison=item.get("ci_comparison"),
-        ci_comparison_lines=item.get("ci_comparison_lines") or [],
         task_completion=item.get("task_completion"),
-        task_completion_lines=item.get("task_completion_lines") or [],
         snapshot_status=summary.snapshot_status,
         legacy=summary.legacy,
         report_delivery_status=summary.report_delivery_status,
+        receipts=receipts,
     )
 
 
@@ -825,6 +951,18 @@ def _read_setup_verdict_snapshot(
                     and live.model_dump_json() == forensic.model_dump_json()
                 ):
                     return live, "valid"
+
+    # A seal written under an older schema can never reach "valid", whatever
+    # its state: `read_live_verdict_snapshot` answers `unknown` for any version
+    # but the current one, so the re-read never matches the bytes on disk.
+    # Refusing it made this layer serve no card at all for 184 of the 681
+    # archived records, and the Workbench then said the run had recorded no
+    # result while `sag result` printed all seven rows from the same file.
+    # The record is served, and the card says it is a reconstruction — which is
+    # the lower trust label `verdict_source == "legacy"` already means, on
+    # every surface, from one derivation in `build_result_card`.
+    if forensic.schema_version < VERDICT_SCHEMA_VERSION:
+        return forensic, "legacy"
     return None, "untrusted"
 
 
@@ -876,8 +1014,8 @@ def _snapshot_build_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
         }
     return {
         "state": build.outcome.value,
-        "tool": "sealed snapshot",
-        "note": "Canonical build evidence from verdict.json",
+        "tool": "not recorded",
+        "note": "Build result read back from the run's verdict.json",
         "class_count": build.compiled_classes,
         "evidence_refs": list(build.refs),
     }
@@ -888,6 +1026,54 @@ def _snapshot_phase_reached(snapshot: RunVerdictSnapshot, phase: str) -> bool | 
     if not records:
         return None
     return any(record.phase == phase and record.termination != "skipped" for record in records)
+
+
+def _host_run_pin(session_dir: Path | None) -> dict[str, Any] | None:
+    """The run pin this session directory holds, or nothing when it holds none."""
+
+    if session_dir is None:
+        return None
+    try:
+        parsed = json.loads((session_dir / "run-pin.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.debug("Run pin unavailable in {}: {}", session_dir, exc)
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _report_path_for_card(session_dir: Path | None, container_path: str | None) -> str | None:
+    """Name the report where the reader of this page can reach it, if anywhere.
+
+    The registry resolves the report inside the container; a run that mirrored
+    its report out also left a copy beside its ledger, and that is the one a
+    Workbench reader can open. Neither path is constructed out of the knowledge
+    that a report exists — without a resolved path this names nothing, and the
+    row says the report was written without pointing anywhere.
+    """
+
+    if not container_path:
+        return None
+    if session_dir is not None:
+        mirrored = session_dir / Path(container_path).name
+        try:
+            if mirrored.is_file():
+                return str(mirrored)
+        except OSError:
+            pass
+    return container_path
+
+
+def _observed_report_delivery(
+    trunk_data: dict[str, Any], report_raw: str | None
+) -> ReportDeliveryOnly | None:
+    """The run's own word on delivery, or the document this reader is holding."""
+
+    stated = _durable_report_delivery_status(trunk_data)
+    if stated is None and report_raw is not None:
+        stated = "delivered"
+    if stated is None:
+        return None
+    return ReportDeliveryOnly(report_delivery_status=ReportDeliveryStatus(stated))
 
 
 def _durable_report_delivery_status(trunk_data: dict[str, Any]) -> str | None:
@@ -944,7 +1130,9 @@ def _setup_artifact_item(
         canonical_verdict = snapshot.verdict
         evidence_status = snapshot.verdict
         outcome = snapshot.verdict.upper()
-        verdict_source = "snapshot"
+        # One derivation, shared with the terminal and the report: a seal this
+        # system can no longer re-read is a reconstruction, not a reading.
+        verdict_source = _verdict_source(snapshot.schema_version)
         rates = snapshot.rates
     elif legacy:
         test = _test_payload_from_metrics(metrics) or _test_payload_from_report(report_raw)
@@ -973,11 +1161,54 @@ def _setup_artifact_item(
         verdict_source = "snapshot"
         rates = None
 
-    from sag.agent.ci_comparison import render_ci_comparison_lines
-    from sag.agent.acceptance_task import render_task_completion_lines
-
     comparison = snapshot.ci_comparison if snapshot is not None else None
     task_completion = snapshot.task_completion if snapshot is not None else None
+    result_card = None
+    if snapshot is not None:
+        # Named by the run it belongs to, never by "the newest directory of
+        # this project": pointing a reader at another run's evidence is worse
+        # than not pointing at any.
+        run_dir = _pick_log_session_dir(
+            _log_session_dirs(logs_root or Path("logs"), project_name),
+            run_id=snapshot.run_id,
+        )
+        # Every argument is built out here on purpose. Inside the `try`, one
+        # mistake in building one of them is indistinguishable from a record the
+        # card cannot read, and the detail would serve no card at all while every
+        # test still passed.
+        card_inputs = {
+            "module_metrics": module_metrics,
+            "report_metrics": metrics if isinstance(metrics, dict) else None,
+            "run_pin": _host_run_pin(run_dir),
+            # Whole, never key by key: this surface and the terminal read one
+            # run with one reader, so they cannot state different numbers for it.
+            **read_run_counts(run_dir),
+            "termination": _observed_report_delivery(trunk_data, report_raw),
+            "project": project_name or None,
+            "goal": _text(trunk_data.get("goal"), default="") or None,
+            "container": workspace_id,
+            "session_dir": str(run_dir) if run_dir is not None else None,
+            "report_path": _report_path_for_card(run_dir, report_path),
+        }
+        # ValueError only. The guard exists for a record the card cannot read,
+        # and `RunVerdictSnapshot.model_validate` reports that as pydantic's
+        # ValidationError, which IS a ValueError — so bad data still degrades to
+        # no card instead of reaching the API as a 500. A TypeError here is a
+        # wrong keyword or a wrong shape, and this plan already came within one
+        # commit of shipping a card-less Workbench because such a mistake was
+        # caught and blanked. It raises now.
+        try:
+            result_card = build_result_card(snapshot, **card_inputs).model_dump(mode="json")
+        except ValueError as exc:
+            logger.warning("Result card unavailable for {}: {}", session_id, exc)
+            result_card = None
+
+    # Built here because this is the one place that holds both the card and the
+    # record it was built from: the rail states the card's words and the
+    # record's counts, and re-deriving either downstream is how two surfaces
+    # start disagreeing.
+    workspace_result = _workspace_result(result_card, snapshot)
+
     return {
         "id": session_id,
         "workspace": workspace_id,
@@ -987,9 +1218,11 @@ def _setup_artifact_item(
         "canonical_verdict": canonical_verdict,
         "rates": rates,
         "ci_comparison": comparison.model_dump(mode="json") if comparison else None,
-        "ci_comparison_lines": render_ci_comparison_lines(comparison),
         "task_completion": task_completion.model_dump(mode="json") if task_completion else None,
-        "task_completion_lines": render_task_completion_lines(task_completion),
+        "result_card": result_card,
+        "result": (
+            workspace_result.model_dump(mode="json") if workspace_result is not None else None
+        ),
         "snapshot_status": snapshot_status,
         "legacy": legacy,
         "verdict_source": verdict_source,
@@ -1991,16 +2224,16 @@ def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
         source="Build evidence",
         title="Build evidence reference",
         status_value=build.get("state"),
-        detail=_text(build.get("note"), default="Evidence used for the sealed build result."),
+        detail=_text(build.get("note"), default="Evidence behind the recorded build result."),
         refs_value=build.get("evidence_refs"),
     )
 
     test = item.get("test") if isinstance(item.get("test"), dict) else {}
     add_refs(
-        source="Sealed run inputs",
+        source="Run evidence",
         title="Run evidence reference",
         status_value=test.get("state"),
-        detail="Evidence inputs used to produce the sealed run summary.",
+        detail="Evidence behind the recorded test results.",
         refs_value=test.get("evidence_refs"),
     )
 
@@ -2012,7 +2245,7 @@ def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
                 status="info",
                 counts="1 artifact",
                 time=time,
-                summary="Generated narrative report; the sealed summary remains authoritative.",
+                summary="A narrative report written during the run. The recorded result is what the run is judged on.",
                 records=[
                     EvidenceRecord(
                         time=time,

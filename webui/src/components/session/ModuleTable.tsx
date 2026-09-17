@@ -244,7 +244,7 @@ export function ModuleTable({
                       {(m.buildStatus ?? "unknown").toUpperCase()}
                     </span>
                     {m.buildSource === "partial" ? (
-                      <span className="ml-1.5 rounded bg-status-attention-soft px-1 py-0.5 text-[9px] text-status-attention">
+                      <span className="ml-1.5 rounded bg-status-attention-soft px-1 py-0.5 text-[11px] text-status-attention">
                         partial
                       </span>
                     ) : null}

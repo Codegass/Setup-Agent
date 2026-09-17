@@ -132,6 +132,7 @@ from typing import Any
 
 from sag.agent.control_events import CANCELLED_CALL_REFUSAL_CODE, CONTROL_EVENT_KINDS
 from sag.trajectory.schema import (
+    KEY_RESULTS_MAX_CHARS,
     Annotation,
     CallInfo,
     GateInfo,
@@ -144,6 +145,12 @@ from sag.trajectory.schema import (
     Turn,
     Warning,
     warning_order,
+)
+from sag.trajectory.summaries import (
+    call_summary,
+    observation_outcome,
+    observation_summary,
+    refusal_summary,
 )
 
 #: The engine's own event vocabulary is the definition of "known". Anything
@@ -261,9 +268,23 @@ class _PhaseState:
     name: str
     termination: str | None = None
     gates: list[GateInfo] = field(default_factory=list)
+    #: What the gate that last STATED each of them read, in the gate's own
+    #: words. The three merge independently (`_band_reading`): a later gate
+    #: replaces a field it states and leaves alone a field it does not, so a
+    #: band graded ten times keeps every reading any gate actually gave it.
+    validator_state: str | None = None
+    reason: str | None = None
+    key_results: str | None = None
 
     def render(self) -> PhaseInfo:
-        return PhaseInfo(name=self.name, termination=self.termination, gates=list(self.gates))
+        return PhaseInfo(
+            name=self.name,
+            termination=self.termination,
+            gates=list(self.gates),
+            validator_state=self.validator_state,
+            reason=self.reason,
+            key_results=self.key_results,
+        )
 
 
 class TrajectoryReducer:
@@ -705,7 +726,11 @@ class TrajectoryReducer:
         # seq 124→125 and 138→139; the slice corpus pins the holes at the
         # refusals, seq 124/138/216, not at the retries).
         turn = self._open(collector, actor=actor, phase=None)
-        turn.call = CallInfo(tool=tool, params_ref=envelope_id)
+        turn.call = CallInfo(
+            tool=tool,
+            params_ref=envelope_id,
+            summary=call_summary(tool, payload.get("exact_params")),
+        )
         turn.envelope_id = envelope_id
         turn.t0 = timestamp
         turn.touch(sequence)
@@ -725,7 +750,11 @@ class TrajectoryReducer:
         turn = self._open(
             collector, actor="controller", phase=phase if isinstance(phase, str) else None
         )
-        turn.call = CallInfo(tool=tool, params_ref=envelope_id)
+        turn.call = CallInfo(
+            tool=tool,
+            params_ref=envelope_id,
+            summary=call_summary(tool, payload.get("exact_params")),
+        )
         turn.envelope_id = envelope_id
         turn.t0 = timestamp
         turn.touch(sequence)
@@ -853,6 +882,10 @@ class TrajectoryReducer:
         refusal_code = _text(payload.get("refusal_code"))
         turn = self._open(collector, actor="model", phase=None)
         turn.call = CallInfo(tool=tool, params_ref=None)
+        outcome, summary = refusal_summary(payload)
+        turn.observation = (turn.observation or ObservationInfo()).model_copy(
+            update={"outcome": outcome, "summary": summary}
+        )
         turn.t0 = timestamp
         turn.t1 = timestamp
         turn.has_result = True
@@ -894,6 +927,18 @@ class TrajectoryReducer:
             ref=_text(result.get("output_ref")),
             error_code=_text(result.get("error_code")),
             failure_signature=_text(result.get("failure_signature")),
+        )
+        # The result is the only event that carries the projected payload the
+        # summarisers read, so it is the only one that derives [C]'s line. A
+        # result that stated no outcome is not a failure and a line nobody could
+        # derive is not "" — so `None` is never invented into a value, and (via
+        # `_stated`) never written over one an earlier result did state.
+        tool_name = turn.call.tool if turn.call else (_text(payload.get("tool")) or "")
+        turn.observation = turn.observation.model_copy(
+            update=_stated(
+                outcome=observation_outcome(result),
+                summary=observation_summary(tool_name, result),
+            )
         )
         turn.has_result = True
         turn.t1 = timestamp
@@ -979,7 +1024,7 @@ class TrajectoryReducer:
             decision_id=_text(payload.get("decision_id")),
             supersedes=_text(payload.get("supersedes")),
         )
-        self._attach_gate(collector, gate, sequence, payload.get("phase"))
+        self._attach_gate(collector, gate, sequence, payload.get("phase"), payload)
 
     def _on_gate_outcome_revised(
         self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
@@ -1012,19 +1057,21 @@ class TrajectoryReducer:
         )
         owner = self._by_decision.get(delivered) if delivered else None
         if owner is None:
-            self._band_gate(gate, payload.get("phase"))
+            self._band_gate(gate, payload.get("phase"), payload)
             collector.warn(
                 "orphan_gate_revision",
                 f"a revision replaces {delivered!r}, which no gate in this run delivered",
                 sequence,
             )
             return
-        self._attach_gate(collector, gate, sequence, payload.get("phase"), owner=owner)
+        self._attach_gate(collector, gate, sequence, payload.get("phase"), payload, owner=owner)
 
-    def _band_gate(self, gate: GateInfo, phase: Any) -> None:
-        """Record the word in its phase's band — every grading the run made."""
+    def _band_gate(self, gate: GateInfo, phase: Any, payload: dict) -> None:
+        """Record in the phase's band the word the gate delivered, and what it read."""
         if isinstance(phase, str) and phase:
-            self._phase_band(phase).gates.append(gate)
+            band = self._phase_band(phase)
+            band.gates.append(gate)
+            _band_reading(band, payload)
 
     def _attach_gate(
         self,
@@ -1032,10 +1079,11 @@ class TrajectoryReducer:
         gate: GateInfo,
         sequence: int | None,
         phase: Any,
+        payload: dict,
         *,
         owner: _TurnState | None = None,
     ) -> None:
-        self._band_gate(gate, phase)
+        self._band_gate(gate, phase, payload)
         turn = owner or self._open_turn
         if turn is None:
             collector.warn(
@@ -1380,6 +1428,12 @@ def _merge_observation(
         evidence_ref=displaced,
         error_code=existing.error_code or error_code,
         failure_signature=existing.failure_signature or failure_signature,
+        # Derived by the result, which is the only event holding the payload
+        # they were read off. The decision that follows it describes the same
+        # observation from four fields and could not re-derive them, so it
+        # carries them forward rather than rebuilding [C] without them.
+        outcome=existing.outcome,
+        summary=existing.summary,
     )
 
 
@@ -1412,6 +1466,8 @@ def _delivered_observation(
             evidence_ref=evidence,
             error_code=existing.error_code,
             failure_signature=existing.failure_signature,
+            outcome=existing.outcome,
+            summary=existing.summary,
         ),
         displaced,
     )
@@ -1422,6 +1478,51 @@ def _text(value: Any) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _stated(**values: Any) -> dict[str, Any]:
+    """The fields the event actually stated, for a `model_copy` update.
+
+    One rule, applied wherever a later event describes something an earlier one
+    already answered: **a blank never erases a stated value.** Writing `None`
+    over a real answer asserts an absence nobody declared, which is the mirror
+    image of inventing a value — and this layer is not allowed to do either.
+    The first event to state a field still writes it, because there is nothing
+    to erase.
+    """
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _band_reading(band: _PhaseState, payload: dict) -> None:
+    """Record on the band what the gate read, field by field and stated only.
+
+    Three independent fields, not one block: a gate may restate the validator's
+    word without restating the paragraph of results, and it routinely does. Each
+    is replaced only by a gate that states it — a gate saying nothing about
+    `key_results` does not un-say what an earlier gate wrote.
+
+    camel-quarkus-d2r3's `test` band is why this is a rule and not a nicety: ten
+    gates grade that band, nine state `key_results` (the last of them 769
+    characters) and the tenth, seq 250, states `""`. Under last-writer-wins the
+    band rendered `key_results: null` — a phase that reported nine paragraphs of
+    what it achieved, claiming nothing was ever stated.
+
+    Every string goes through `_text` because the engine defaults `reason` and
+    `key_results` to `""` and this schema rejects a blank cell: `""` in the
+    ledger means "this gate did not state it", which is exactly the case this
+    function leaves the standing value alone for.
+    """
+    validator_state = _text(payload.get("validator_state"))
+    if validator_state is not None:
+        band.validator_state = validator_state
+    reason = _text(payload.get("reason"))
+    if reason is not None:
+        band.reason = reason
+    key_results = _text(payload.get("key_results"))
+    if key_results is not None:
+        if len(key_results) > KEY_RESULTS_MAX_CHARS:
+            key_results = key_results[: KEY_RESULTS_MAX_CHARS - 1] + "…"
+        band.key_results = key_results
 
 
 def _job_key(value: Any) -> str | None:
@@ -1485,10 +1586,19 @@ def _as_utc(timestamp: str) -> datetime:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
 
 
+#: The public name for turn timing. A consumer that wants to say how long a
+#: turn took reads it from here rather than re-deriving it: two implementations
+#: of "seconds between two ledger stamps" is two chances to disagree about the
+#: same turn, and the mixed aware/naive handling above is the whole reason one
+#: of them would be wrong.
+elapsed = _elapsed
+
+
 __all__ = [
     "KNOWN_EVENT_KINDS",
     "UNKNOWN_PHASE",
     "DeltaAccumulator",
     "TrajectoryReducer",
+    "elapsed",
     "order_warnings",
 ]

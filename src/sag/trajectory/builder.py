@@ -74,7 +74,7 @@ import io
 import json
 import time
 from collections import Counter
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +118,73 @@ def build_trajectory(session_dir: Path | str, *, detail: str = "summary") -> Tra
     return sources.finish(reducer.snapshot(), extra=unread)
 
 
+#: A campaign archive keeps the container's copy of a run in a subdirectory
+#: beside it, named after the container directory. `container-evidence` is what
+#: every archive on disk calls it; the glob covers the ones that call it
+#: something else rather than guessing.
+_ARCHIVE_ROOT = "container-evidence"
+
+
+def resolve_session_dir(session_dir: Path | str) -> Path:
+    """The directory a run's artifacts actually sit in, given what a reader named.
+
+    A session directory is its own answer. A campaign archive keeps the run one
+    level down, so naming the archive means the run inside it.
+
+    Every reader comes here, which is the point: `sag result` used to find a run
+    one level down and then print a `sag trajectory` command for the same
+    directory that found nothing there. Two commands cannot recommend each
+    other while disagreeing about where a run lives.
+
+    A directory that holds no run at all is handed back unchanged, so the
+    caller states the absence of the thing the reader actually named.
+    """
+
+    directory = Path(session_dir)
+    for base in _session_bases(directory):
+        if _holds_a_run(base):
+            return base
+    return directory
+
+
+def _session_bases(directory: Path) -> Iterator[Path]:
+    yield directory
+    yield directory / _ARCHIVE_ROOT
+    try:
+        nested = sorted(directory.glob("*/.setup_agent"))
+    except OSError:
+        return
+    for path in nested:
+        yield path.parent
+
+
+def _holds_a_run(base: Path) -> bool:
+    """Whether this directory holds the files a run leaves behind."""
+
+    try:
+        if not base.is_dir():
+            return False
+        return any(
+            (base / root / name).is_file()
+            for root in _ARTIFACT_ROOTS
+            for name in (CONTROL_EVENTS_NAME, VERDICT_NAME)
+        )
+    except OSError:
+        return False
+
+
+def control_events_path(session_dir: Path | str) -> Path | None:
+    """Where this session keeps its control ledger, or nothing when it has none.
+
+    A session writes some artifacts at its root and some under `.setup_agent/`,
+    and a live run mirrors its events into the container's copy — so the one
+    place a reader must not look is a single fixed path. This answers with the
+    same search `build_trajectory` uses, so a renderer and the document it
+    prints a header from always read the same file.
+    """
+    return _SessionSources(session_dir, detail="summary").control_events()
+
+
 def read_call_envelope(session_dir: Path | str, envelope_id: str) -> dict[str, Any] | None:
     """Return one call envelope's exact parameters without changing trajectory-v1.
 
@@ -157,12 +224,32 @@ def read_call_envelope(session_dir: Path | str, envelope_id: str) -> dict[str, A
     return None
 
 
+def read_output_bytes(session_dir: Path | str, refs: Iterable[str]) -> dict[str, str]:
+    """The bytes these refs name, for a reader that wants a few of them.
+
+    `build_trajectory(..., detail="full")` resolves EVERY ref a session holds.
+    That is the right shape for a document and the wrong one for a view of one
+    turn: on a real session it is a hundred lookups, and the store logs a
+    warning for each ref it cannot answer — 56 lines on stderr to print two.
+
+    A ref no store answers is simply absent from the answer; the caller already
+    has a sentence for that, and it is the same sentence either way.
+    """
+    wanted = [ref for ref in refs if ref]
+    if not wanted:
+        return {}
+    sources = _SessionSources(session_dir, detail="full")
+    resolved, _ = sources.outputs.resolve(wanted)
+    return resolved
+
+
 def follow_trajectory(
     session_dir: Path | str,
     *,
     detail: str = "summary",
     poll_seconds: float = DEFAULT_POLL_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
+    on_line: Callable[[str], None] | None = None,
 ) -> "TrajectoryFollow":
     """Tail a session's ledger, yielding deltas as its events land.
 
@@ -176,10 +263,15 @@ def follow_trajectory(
     around the ledger — a verdict written, an output store that finally exists,
     a token row that bills nobody yet — and `close()` carries the one statement
     that only the end of a follow can make.
+
+    `on_line` is handed each raw line before it is folded, for a caller that
+    needs what the event says and the delta does not carry — a phase closing,
+    or a job the run is waiting on. A renderer driven by deltas alone showed
+    strictly less of the same ledger than one driven by the lines.
     """
     sources = _SessionSources(session_dir, detail=detail)
     tail = _FollowTail(sources)
-    return TrajectoryFollow(_following(sources, tail, poll_seconds, sleep), tail)
+    return TrajectoryFollow(_following(sources, tail, poll_seconds, sleep, on_line), tail)
 
 
 def _following(
@@ -187,6 +279,7 @@ def _following(
     tail: "_FollowTail",
     poll_seconds: float,
     sleep: Callable[[float], None],
+    on_line: Callable[[str], None] | None = None,
 ) -> Generator[TrajectoryDelta, None, None]:
     reducer = TrajectoryReducer()
     joiner = _Joiner(sources)
@@ -197,6 +290,8 @@ def _following(
         lines = tail.drain()
         joiner.poll(ledger_missing=not opened, unreadable=tail.unreadable())
         for line in lines:
+            if on_line is not None:
+                on_line(line)
             decorated = joiner.wrap(reducer.feed(line))
             if decorated is not None:
                 yield decorated
@@ -901,8 +996,12 @@ def _text(value: Any) -> str | None:
 
 
 __all__ = [
+    "CONTROL_EVENTS_NAME",
     "DEFAULT_POLL_SECONDS",
     "TrajectoryFollow",
     "build_trajectory",
+    "control_events_path",
     "follow_trajectory",
+    "read_output_bytes",
+    "resolve_session_dir",
 ]

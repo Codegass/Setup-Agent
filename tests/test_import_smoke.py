@@ -13,9 +13,6 @@ def test_import_core_runtime_modules():
         "sag.tools.base",
         "sag.reporting",
         "sag.testcases.catalog",
-        "sag.ui.diagnosis",
-        "sag.ui.events",
-        "sag.ui.state",
     ]
 
     for module_name in module_names:

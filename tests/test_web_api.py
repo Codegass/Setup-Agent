@@ -134,7 +134,21 @@ def test_session_endpoint_returns_session_detail():
     }
     assert payload["moduleSummary"]["modulesBuilt"] == 3
     assert payload["moduleSummary"]["modulesFailed"] == 0
-    assert payload["verdict"]["headline"].startswith("Build passed on 3 of 3 modules.")
+    # The detail serves the card itself under `resultCard`; the server no
+    # longer writes a sentence of its own beside it.
+    assert "verdict" not in payload
+    card = payload["resultCard"]
+    assert [row["key"] for row in card["rows"]] == [
+        "setup",
+        "task",
+        "build",
+        "tests",
+        "coverage",
+        "ci",
+        "report",
+    ]
+    assert card["verdict"] == "partial"
+    assert card["rows"][2]["headline"] == "3/3 modules built"
 
 
 def test_dashboard_stream_emits_sse_snapshot():

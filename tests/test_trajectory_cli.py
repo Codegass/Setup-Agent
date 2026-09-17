@@ -16,11 +16,13 @@ The session bytes below are the archived kafka d2r3 fixture, and the single
 full-output record is that same run's real one for `output_6163859b019d`.
 """
 
+import io
 import json
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from rich.console import Console as RichConsole
 
 import sag.config as config_module
 import sag.config.logger as logger_module
@@ -57,12 +59,20 @@ def _clean_cli_state(monkeypatch, tmp_path):
 
 
 def _run(*args: str):
-    """Invoke the CLI with stdout and stderr kept apart, as a pipe would.
+    """Invoke the JSON format with stdout and stderr kept apart, as a pipe would.
 
-    The streams are separated deliberately: the contract is that STDOUT is
-    JSON. Components the command reads through — the output store's manager,
-    for one — log as they always do, and those lines belong on stderr.
+    The streams are separated deliberately: the contract of `--format json` is
+    that STDOUT is JSON. Components the command reads through — the output
+    store's manager, for one — log as they always do, and those lines belong
+    on stderr. The format is asked for explicitly because the command's own
+    default is the table a person reads; every contract below is about the
+    document a program reads.
     """
+    return CliRunner(mix_stderr=False).invoke(cli, ["trajectory", "--format", "json", *args])
+
+
+def _table(*args: str):
+    """Invoke the command as a person does, with no format asked for."""
     return CliRunner(mix_stderr=False).invoke(cli, ["trajectory", *args])
 
 
@@ -276,3 +286,205 @@ def test_the_command_writes_nothing_into_the_session_it_read(tmp_path):
 
     after = {p: p.stat().st_mtime_ns for p in sorted(session_dir.rglob("*"))}
     assert after == before
+
+
+# -- the table: the same turns, read by a person rather than a program ------
+
+
+def test_table_is_the_default_format():
+    """Asked for nothing, the command answers the way a person reads it."""
+    result = _table(str(KAFKA))
+
+    assert result.exit_code == 0, result.stderr
+    assert not result.stdout.lstrip().startswith("{")
+    assert "▸ provision" in result.stdout
+    first = result.stdout.splitlines()[0]
+    assert "20260814_072758" in first and "24 turns" in first
+
+
+def test_json_format_still_prints_one_document():
+    result = _run(str(KAFKA))
+
+    assert result.exit_code == 0, result.stderr
+    document = json.loads(result.stdout.strip())
+    assert document["schema_version"] == 1
+
+
+def test_detail_with_table_is_a_usage_error():
+    """One table, one detail tier: asking for a second one is a mistake."""
+    result = _table(str(KAFKA), "--detail", "full")
+
+    assert result.exit_code == 2
+    assert "--detail" in result.stderr
+
+
+def test_a_mirrored_session_renders_the_turns_its_ledger_holds(tmp_path):
+    """The ledger is found where the builder finds it, not at one fixed path.
+
+    A live run mirrors its control events into the container's
+    `.setup_agent/`, so a mirrored session keeps its ledger one directory down
+    — and that is the second input this command's own help offers. A table
+    that opened `<session>/control_events.jsonl` and nothing else printed a
+    header claiming 24 turns and then showed none of them.
+    """
+    session_dir = tmp_path / "mirrored"
+    (session_dir / ".setup_agent").mkdir(parents=True)
+    (session_dir / ".setup_agent" / "control_events.jsonl").write_bytes(
+        (KAFKA / "control_events.jsonl").read_bytes()
+    )
+
+    result = _table(str(session_dir))
+
+    assert result.exit_code == 0, result.stderr
+    assert "24 turns" in result.stdout.splitlines()[0]
+    assert "▸ provision" in result.stdout
+    assert result.stdout.count("↳") + result.stdout.count("·") > 0
+
+
+def test_the_table_paints_a_terminal_instead_of_printing_its_markup(monkeypatch):
+    """Styled text reaches a terminal as colour, never as the tags for it.
+
+    The renderer writes Rich markup. A sink that puts those bytes straight on
+    the stream interprets none of it, so a real terminal shows the reader
+    `[bold]▸ provision[/bold]`. Only a console that is actually painting can
+    tell the two sinks apart, which is why this test drives one.
+    """
+    painted = io.StringIO()
+    monkeypatch.setattr(
+        "sag.main.console", RichConsole(file=painted, force_terminal=True, width=100)
+    )
+
+    result = _table(str(KAFKA))
+
+    assert result.exit_code == 0, result.stderr
+    text = painted.getvalue()
+    assert "▸ provision" in text
+    assert "\x1b[" in text
+    for tag in ("[bold]", "[/bold]", "[green]", "[/green]", "[red]", "[yellow]", "[dim]"):
+        assert tag not in text
+
+
+def test_following_the_table_ends_the_stream_once_and_states_its_tail(monkeypatch):
+    """A follow ends by closing both ends, in order, exactly once.
+
+    `follow_trajectory` returns a stream whose `close()` yields the one
+    statement only the end of a follow can make. Dropping it loses the torn
+    tail; closing the renderer before following makes the first live turn
+    raise. Both ends close here, and the tail is rendered before they do.
+    """
+    delta = TrajectoryDelta(
+        warnings=[{"code": "ledger_tail_torn", "detail": "the last line is half written"}]
+    )
+    closed = []
+
+    class _Stream:
+        def __iter__(self):
+            return iter([])
+
+        def close(self):
+            closed.append("stream")
+            return delta
+
+    monkeypatch.setattr("sag.main.follow_trajectory", lambda session_dir, **kwargs: _Stream())
+
+    result = _table(str(KAFKA), "--follow")
+
+    assert result.exit_code == 0, result.stderr
+    assert closed == ["stream"]
+    # Stated as the stream states a hole, not dumped as the document does it.
+    assert "! ledger_tail_torn: the last line is half written" in result.stdout
+    assert not result.stdout.lstrip().startswith("{")
+
+
+def test_a_directory_with_no_ledger_says_so_instead_of_nothing(tmp_path):
+    """Silence is the one answer this surface may not give.
+
+    `--format json` states `missing_control_events` for a directory holding no
+    ledger. The table printed a header and zero bytes at exit 0 for the same
+    input — implying the absence the document states.
+    """
+    empty = tmp_path / "no-ledger"
+    empty.mkdir()
+
+    result = _table(str(empty))
+
+    assert result.exit_code == 0, result.stderr
+    assert "missing_control_events" in result.stdout
+    assert "control_events.jsonl" in result.stdout
+
+
+def test_a_campaign_archive_reads_the_run_inside_it(tmp_path):
+    """`sag result` finds a run one level down, and this command must agree.
+
+    The block `sag result` prints ends with a `Next` line naming this command
+    and the directory it was given. When only one of the two searched the
+    archive, that line named a command that printed nothing.
+    """
+    archive = tmp_path / "runs" / "commons-cli"
+    evidence = archive / "container-evidence" / ".setup_agent"
+    evidence.mkdir(parents=True)
+    (evidence / "control_events.jsonl").write_bytes((KAFKA / "control_events.jsonl").read_bytes())
+
+    result = _table(str(archive))
+
+    assert result.exit_code == 0, result.stderr
+    assert "24 turns" in result.stdout.splitlines()[0]
+    assert "▸ provision" in result.stdout
+
+
+def test_following_states_everything_a_replay_of_the_same_ledger_states(monkeypatch):
+    """One ledger, one answer, whichever way it is read.
+
+    A phase closing lives in the raw event and no delta carries it, so a follow
+    driven by deltas alone dropped every `✓ <phase>` line a replay prints — the
+    same command giving two different answers for one input.
+    """
+    import sag.main as main_module
+
+    replay = _table(str(KAFKA))
+    assert replay.exit_code == 0, replay.stderr
+
+    real_follow = main_module.follow_trajectory
+
+    def _stop(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        main_module,
+        "follow_trajectory",
+        lambda session_dir, **kwargs: real_follow(session_dir, sleep=_stop, **kwargs),
+    )
+    followed = _table(str(KAFKA), "--follow")
+
+    assert followed.exit_code == 0, followed.stderr
+    # Every band close, whichever glyph it carries: this run's test phase was
+    # graded failed, so one of the five closes is `✗ test blocked`.
+    closes = [
+        line
+        for line in replay.stdout.splitlines()
+        if line.startswith("✓ ") or line.startswith("✗ ")
+    ]
+    assert len(closes) == 5
+    missing = [line for line in closes if line not in followed.stdout]
+    assert missing == []
+
+
+def test_both_formats_answer_for_the_same_run(tmp_path):
+    """One directory, one run, whichever format is asked for.
+
+    The table learned to look inside a campaign archive first. A document that
+    kept looking only at the directory named answered for no run at all — an
+    empty run_id and no turns — for the input its own table read whole.
+    """
+    archive = tmp_path / "runs" / "commons-cli"
+    evidence = archive / "container-evidence" / ".setup_agent"
+    evidence.mkdir(parents=True)
+    (evidence / "control_events.jsonl").write_bytes((KAFKA / "control_events.jsonl").read_bytes())
+
+    table = _table(str(archive))
+    document = json.loads(_run(str(archive)).stdout)
+
+    assert table.exit_code == 0, table.stderr
+    assert document["session"]["run_id"]
+    assert document["session"]["run_id"] in table.stdout.splitlines()[0]
+    assert len(document["turns"]) == 24

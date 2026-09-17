@@ -51,19 +51,10 @@ class SessionLogger:
     def _setup_loggers(self):
         """Setup all loggers with session-specific configuration."""
 
-        # Remove default logger
-        logger.remove()
-
-        # Console logger - suppressed in UI mode, respects verbose setting otherwise
-        if not self.config.ui_mode:
-            console_level = "DEBUG" if self.config.verbose else self.config.log_level.value
-            logger.add(
-                sys.stderr,
-                level=console_level,
-                format=self._get_console_format(),
-                colorize=True,
-                filter=self._console_filter,
-            )
+        # One console implementation, shared with the plain-CLI path. It clears
+        # every existing handler first, so it has to run before the file sinks
+        # below or it would wipe them.
+        setup_console_logging(self.config)
 
         # Main session log file - always captures everything
         main_log_file = self.session_log_dir / "main.log"
@@ -124,37 +115,9 @@ class SessionLogger:
                 compression="gz",
             )
 
-    def _get_console_format(self) -> str:
-        """Get console log format based on verbose setting."""
-        if self.config.verbose:
-            return (
-                "<green>{time:HH:mm:ss.SSS}</green> | "
-                "<level>{level: <8}</level> | "
-                "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-                "<level>{message}</level>"
-            )
-        else:
-            return (
-                "<green>{time:HH:mm:ss}</green> | "
-                "<level>{level: <8}</level> | "
-                "<level>{message}</level>"
-            )
-
     def _get_file_format(self) -> str:
         """Get file log format."""
         return "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}"
-
-    def _console_filter(self, record):
-        """Filter console output based on verbose setting."""
-        # Always show INFO and above
-        if record["level"].no >= 20:  # INFO level
-            return True
-
-        # Only show DEBUG and TRACE in verbose mode
-        if self.config.verbose and record["level"].no >= 10:  # DEBUG level
-            return True
-
-        return False
 
     def create_agent_logger(self, context_id: str):
         """Create a specialized logger for agent execution traces."""
@@ -193,8 +156,22 @@ class SessionLogger:
         mirror: Optional[Callable[[str], None]] = None,
         clock: Optional[Callable[[], str]] = None,
         id_factory: Optional[Callable[[int], str]] = None,
+        observers: tuple[Callable[[str], None], ...] = (),
     ):
-        """Return the one append-only control stream owned by this session."""
+        """Return the one append-only control stream owned by this session.
+
+        The sink is built once and cached, so a later caller gets the stream
+        that is already writing rather than a second one. What a later caller
+        BRINGS still has to arrive: the CLI asks for this sink to hang a
+        renderer on it before the agent is constructed, and the agent's
+        container mirror therefore arrives on the second call. Dropping it
+        there left `/workspace/.setup_agent/control_events.jsonl` — the copy
+        `--record` archives — silently unwritten for the whole run.
+
+        `clock` and `id_factory` are construction-only: changing either
+        mid-stream would renumber or re-date a ledger that is already append-
+        only, so a later call's copies are ignored.
+        """
         from sag.agent.control_events import ControlEventSink
 
         if self._control_event_sink is None:
@@ -203,7 +180,20 @@ class SessionLogger:
                 mirror=mirror,
                 clock=clock,
                 id_factory=id_factory,
+                observers=observers,
             )
+            return self._control_event_sink
+
+        if mirror is not None and not self._control_event_sink.attach_mirror(mirror):
+            # Declining in silence is the exact shape of the defect this
+            # method exists to end: a container ledger that is simply never
+            # written, discoverable only once the container is gone.
+            logger.warning(
+                "This session's control stream already has a container mirror; "
+                "the second one was declined and will record nothing."
+            )
+        for observer in observers:
+            self._control_event_sink.add_observer(observer)
         return self._control_event_sink
 
     @property
@@ -253,23 +243,46 @@ def setup_session_logging(config) -> SessionLogger:
         return _session_logger
 
 
-def setup_console_logging(config, *, quiet_default: bool = False) -> None:
-    """Configure console-only logging without opening a session directory."""
+# The console belongs to the turn stream now. Loguru keeps the files; on screen
+# it speaks only when something went wrong, unless the user asked for more.
+DEFAULT_CONSOLE_LEVEL = "WARNING"
+
+
+def console_level(config) -> str:
+    """The one rule for how loud the console is.
+
+    `--verbose` is the way to ask the console for detail. `--log-level DEBUG`
+    and `--log-level INFO` no longer open it; they still set the level the log
+    files are written at.
+    """
+
+    if config.verbose:
+        return "DEBUG"
+    level = str(getattr(config.log_level, "value", config.log_level) or "").upper()
+    if level in {"", "DEBUG", "INFO"}:
+        return DEFAULT_CONSOLE_LEVEL
+    return level
+
+
+def setup_console_logging(config) -> None:
+    """Configure the console sink. One implementation, used by both callers.
+
+    The `logger.remove()` has to stay first: without it loguru's own DEBUG
+    stderr handler survives, every warning prints twice, and the console is
+    never quieted at all.
+    """
+
     logger.remove()
 
-    if config.ui_mode:
-        return
-
-    console_level = "DEBUG" if config.verbose else config.log_level.value
-    if quiet_default and not config.verbose and console_level in {"DEBUG", "INFO"}:
-        console_level = "WARNING"
-
+    # No `filter=`: `level` is the whole rule. `console_level` can only yield
+    # WARNING, ERROR, or DEBUG-when-verbose, so a record that clears the sink's
+    # level is a record the console wants, and a second gate saying the same
+    # thing only reads as though some case still needed it.
     logger.add(
         sys.stderr,
-        level=console_level,
+        level=console_level(config),
         format=_get_console_format(config),
         colorize=True,
-        filter=lambda record: _console_filter(config, record),
     )
 
 
@@ -287,17 +300,6 @@ def _get_console_format(config) -> str:
         "<level>{level: <8}</level> | "
         "<level>{message}</level>"
     )
-
-
-def _console_filter(config, record) -> bool:
-    """Filter console output based on verbose setting."""
-    if record["level"].no >= 20:
-        return True
-
-    if config.verbose and record["level"].no >= 10:
-        return True
-
-    return False
 
 
 def get_session_logger() -> Optional[SessionLogger]:
@@ -327,91 +329,3 @@ def create_command_logger(command: str, project_name: str):
         return _session_logger.create_command_logger(command, project_name)
     else:
         return logger.bind(command=command, project_name=project_name), None
-
-
-def suppress_console_logging():
-    """
-    Suppress console logging for UI mode.
-
-    Removes all stderr/console handlers while keeping file handlers intact.
-    This should be called after --ui flag is detected in subcommands.
-    """
-    global _session_logger
-
-    # Remove all handlers that write to stderr/console
-    # Loguru uses handler IDs, we need to track and remove console handlers
-    import sys
-
-    # Get all current handlers (loguru stores them internally)
-    # We'll remove the handler that outputs to sys.stderr
-    # and re-add it as a null handler
-
-    # Remove the existing console logger by removing all handlers
-    # then re-add only the file handlers
-    logger.remove()  # Remove all handlers
-
-    if _session_logger:
-        # Re-add only file handlers (not console)
-        config = _session_logger.config
-
-        # Main session log file
-        main_log_file = _session_logger.session_log_dir / "main.log"
-        logger.add(
-            str(main_log_file),
-            level="DEBUG",
-            format=_session_logger._get_file_format(),
-            rotation=config.log_rotation,
-            retention=config.log_retention,
-            compression="gz",
-            enqueue=True,
-        )
-
-        # Agent execution log
-        agent_log_file = _session_logger.session_log_dir / "agent_execution.log"
-        logger.add(
-            str(agent_log_file),
-            level="INFO",
-            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {extra[context_id]} | {message}",
-            filter=lambda record: "AGENT_TRACE" in record.get("extra", {}),
-            rotation="100 MB",
-            retention="7 days",
-        )
-
-        # Error log
-        error_log_file = _session_logger.session_log_dir / "errors.log"
-        logger.add(
-            str(error_log_file),
-            level="ERROR",
-            format=_session_logger._get_file_format(),
-            rotation="10 MB",
-            retention="90 days",
-        )
-
-        # Verbose debug log if verbose mode was enabled
-        if config.verbose:
-            debug_log_file = _session_logger.session_log_dir / "debug_verbose.log"
-            logger.add(
-                str(debug_log_file),
-                level="TRACE",
-                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
-                rotation="200 MB",
-                retention="3 days",
-                filter=lambda record: "VERBOSE" in record.get("extra", {})
-                or record["level"].name in ["TRACE", "DEBUG"],
-            )
-
-        # Legacy log file if configured
-        if config.log_file:
-            from pathlib import Path
-
-            legacy_log_path = Path(config.log_file)
-            logger.add(
-                str(legacy_log_path),
-                level="INFO",
-                format=_session_logger._get_file_format(),
-                rotation=config.log_rotation,
-                retention=config.log_retention,
-                compression="gz",
-            )
-
-    logger.info("Console logging suppressed for UI mode")

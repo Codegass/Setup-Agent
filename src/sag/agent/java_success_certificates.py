@@ -130,6 +130,23 @@ BLOCKED_AXIS_REASON_CODES: dict[ProofAxis, str] = {
     "test_outcome": "TEST_OUTCOME_AUTHORITY_BLOCKED",
     "integrity": "INTEGRITY_AUTHORITY_BLOCKED",
 }
+#: The defeater codes `_typed_reason_codes` can raise, named so consumers can
+#: enumerate them. `BLOCKED_AXIS_REASON_CODES` holds the five axis codes.
+TYPED_DEFEATER_CODES: frozenset[str] = frozenset(
+    {
+        "AUTHORITATIVE_BUILD_FAILURE",
+        "TEST_EXECUTION_FAILURE",
+        "TEST_OUTCOME_RED",
+        "MISSING_REQUIRED_IDENTITY",
+        "EMPTY_VERDICT_BEARING_RESULT",
+        "IDENTITY_CONFLICT",
+        "DIAGNOSTIC_ONLY_OBSERVATION",
+        "TEST_RESULTS_UNAVAILABLE",
+        "LINEAGE_UNAVAILABLE",
+        "UNSEALED_DENOMINATOR",
+        "DOCUMENTED_NO_AUTOMATED_TESTS",
+    }
+)
 ASSURANCE_BY_LEVEL: dict[AssuranceLevel, Assurance] = {
     "legacy_projected": "PROJECTED",
     "receipt_bound": "RECEIPT_BOUND",

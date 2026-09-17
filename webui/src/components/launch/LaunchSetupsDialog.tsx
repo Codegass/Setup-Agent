@@ -252,7 +252,7 @@ export function LaunchSetupsDialog({
                 Record
                 <button
                   aria-label="Select all record"
-                  className="text-[9px] normal-case tracking-normal text-status-running underline"
+                  className="text-[11px] normal-case tracking-normal text-status-running underline"
                   onClick={() => setAllFlag("record")}
                   type="button"
                 >
@@ -263,7 +263,7 @@ export function LaunchSetupsDialog({
                 Coverage
                 <button
                   aria-label="Select all coverage"
-                  className="text-[9px] normal-case tracking-normal text-status-running underline"
+                  className="text-[11px] normal-case tracking-normal text-status-running underline"
                   onClick={() => setAllFlag("coverage")}
                   type="button"
                 >

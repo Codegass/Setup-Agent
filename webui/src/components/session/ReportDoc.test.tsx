@@ -6,14 +6,16 @@ import { ReportDoc } from "./ReportDoc"
 afterEach(() => cleanup())
 
 describe("ReportDoc", () => {
-  it("explains the report's relationship to the sealed summary", () => {
+  it("explains the report's relationship to the recorded result", () => {
     render(<ReportDoc doc={{
       title: "Setup report",
       generated: "now",
       blocks: [{ type: "p", text: "Legacy diagnostic totals" }],
     }} />)
 
-    expect(screen.getByText(/when its numbers differ.*use the sealed summary/i)).toBeInTheDocument()
+    expect(
+      screen.getByText(/where its numbers differ.*the band is what the run is judged on/i),
+    ).toBeInTheDocument()
   })
 
   it("renders partial and unknown status blocks as attention rather than failure", () => {

@@ -75,7 +75,7 @@ function withLayers(test: Partial<TestSummary>, testLayers: TestEvidenceLayers):
 }
 
 describe("evidence presentation", () => {
-  it("keeps the sealed runner result visible when verified identities are unavailable", () => {
+  it("keeps the recorded runner result visible when verified identities are unavailable", () => {
     const test = withLayers({ state: "success", pass: 4722, total: 4722 }, layers())
 
     expect(presentTestRun(test)).toMatchObject({
@@ -89,7 +89,9 @@ describe("evidence presentation", () => {
       available: false,
       value: "Unavailable",
     })
-    expect(presentVerifiedIdentities(test).summary).toMatch(/module and test names were not sealed/i)
+    expect(presentVerifiedIdentities(test).summary).toMatch(
+      /module and test names were not recorded/i,
+    )
     expect(presentVerifiedIdentities(test).summary).not.toMatch(/tests ran/i)
   })
 
@@ -369,7 +371,7 @@ describe("evidence presentation", () => {
       "unknown_internal_code",
     ])).toEqual([
       "Build evidence covers only part of the discovered module set.",
-      "The test runner stopped before the declared scope completed; shown counts are the sealed prefix.",
+      "The test runner stopped before the declared scope completed; the counts shown cover only what ran before it stopped.",
       "A rate denominator did not bound the observed count, so no percentage is shown.",
       "An additional evidence consistency issue was recorded.",
     ])

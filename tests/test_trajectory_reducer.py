@@ -42,14 +42,17 @@ import json
 import pytest
 
 from sag.agent.control_events import (
+    ForcedActionPayload,
     GateDecisionPayload,
     GateOutcomeRevisedPayload,
     JobLiveAtClosePayload,
     JobSettledPayload,
+    RefusalRecordPayload,
     ToolResultPayload,
     TurnRecordPayload,
 )
 from sag.trajectory.reducer import DeltaAccumulator, TrajectoryReducer
+from sag.trajectory.schema import KEY_RESULTS_MAX_CHARS
 
 # Sequences 3, 4 and 6 — one clone call: its envelope, its result, its decision.
 # Note the order the engine actually writes: the envelope opens the call, the
@@ -1130,3 +1133,396 @@ def test_the_reducer_has_no_detail_tier():
     """
     with pytest.raises(TypeError):
         TrajectoryReducer(detail="full")
+
+
+# ---------------------------------------------------------------------------
+# The derived one-liners: what a call asked, what it answered, what a gate read.
+# ---------------------------------------------------------------------------
+
+
+def _event(sequence: int, kind: str, payload: dict) -> str:
+    """One control-event LINE, in the envelope the ledger writes."""
+    return json.dumps(
+        {
+            "sequence": sequence,
+            "kind": kind,
+            "payload": payload,
+            "source": None,
+            "timestamp": f"2026-09-15T01:0{sequence % 10}:00Z",
+            "event_id": f"control-{sequence:06d}",
+            "run_id": "run-1",
+        }
+    )
+
+
+#: A real `gate_decision` payload: kafka d2r3 seq 27, verbatim but for the
+#: bounded `gate_result`/`validated_facts`/`claim_sha256` blobs this layer never
+#: reads. Every key below is one that run wrote.
+REAL_GATE_PAYLOAD = {
+    "phase": "provision",
+    "signal": "done",
+    "claimed_outcome": "success",
+    "validator_state": "green",
+    "expected_accepted": True,
+    "expected_outcome": "success",
+    "reason": "workspace /workspace/kafka exists",
+    "key_results": "Checked out apache/kafka.git ref 4.3.1 in /workspace/kafka.",
+    "evidence_refs": ["/workspace/kafka"],
+    "decision_id": "gate-9b1f0f4ef4bcd390c47fa6c892ca4f89",
+    "code": "workspace_present",
+    "blocker_owner": "none",
+    "control_disposition": "terminal_claimable",
+    "source_attempt_id": "provision-1",
+}
+
+#: The ignite d2r3 run's `forced_action`, seq 235, VERBATIM — digest, candidate
+#: resolution and all. `ForcedActionPayload` re-derives `action_sha256` from the
+#: fields, so only the real line validates; a nine-key lookalike does not.
+REAL_IGNITE_FORCED_ACTION_JSONL = '{"event_id":"control-000235","kind":"forced_action","payload":{"action_fingerprint":"act-15d48e74110ea9e73ed5568edc6ee4f0ec1516b679361e058260870831027085","action_sha256":"db2cc51f750282dae76a40c8930db00eccebfee13d1489e7bcaeaa61656412fa","candidate_resolution":{"candidates":[{"root":"/workspace/ignite","system":"maven"}],"primary":{"root":"/workspace/ignite","system":"maven"},"project_root":"/workspace/ignite","status":"available","workspace_root":"/workspace"},"candidate_root":"/workspace/ignite","candidate_system":"maven","envelope_id":"forced-000235","exact_params":{"action":"test","working_directory":"/workspace/ignite"},"intent_id":"intent-700393dbdf18","intent_source":"controller","parent_execution_id":null,"phase":"test","policy":"test_attempt_required","reason_code":"test_receipt_missing","source_attempt_id":"test-1","tool":"build","trigger":"termination_refusal"},"sequence":235,"source":null,"timestamp":"2026-08-14T11:54:03.882923Z"}'
+
+#: The two real `tool_result` shapes this block reads. The build receipt carries
+#: `facts` with `executed`/`failed`/`passed`/`skipped` and no `errors` — the
+#: error count, when one is taken at all, lives in `metadata.analysis.
+#: test_error_count` — and `metadata.exit_code` beside `metadata.analysis.
+#: exit_code` on all 802 archived build receipts, which is the one read first.
+REAL_BUILD_RESULT_PAYLOAD = {
+    "envelope_id": "envelope-000001",
+    "execution_id": "x1",
+    "tool": "build",
+    "params": {"command": "mvn clean verify"},
+    "scope": "test_runtime",
+    "result": {
+        "operation_outcome": "success",
+        "invocation_status": "completed",
+        "facts": {"executed": 994, "failed": 0, "passed": 933, "skipped": 61},
+        "metadata": {
+            "exit_code": 0,
+            "analysis": {"exit_code": 0, "artifacts_created": ["a.jar"]},
+        },
+    },
+}
+
+#: `RefusalRecordPayload` forbids extras: five fields, and no `reason`. All three
+#: codes are real — `CALL_NOT_EXECUTED` (10 in the archive),
+#: `PHASE_ACTION_MISMATCH` (24) and `execution_refused:evidence_closed` (162).
+REAL_CANCELLED_REFUSAL = {
+    "tool": "build",
+    "tool_call_id": "call-1",
+    "refusal_code": "CALL_NOT_EXECUTED",
+    "exact_params_sha256": "a" * 64,
+}
+REAL_REFUSAL_PHASE_MISMATCH = {
+    "tool": "build",
+    "tool_call_id": "call-1",
+    "refusal_code": "PHASE_ACTION_MISMATCH",
+    "exact_params_sha256": "b" * 64,
+}
+REAL_REFUSAL_CLOSED = {
+    "tool": "phase",
+    "tool_call_id": "call-2",
+    "refusal_code": "execution_refused:evidence_closed",
+    "exact_params_sha256": "c" * 64,
+}
+
+
+def test_reducer_summarises_a_build_call_and_its_result():
+    """A `mvn verify` call and its receipt, in the shapes the corpus really has.
+
+    `facts` carries `executed`/`failed`/`passed`/`skipped` and no `errors`; the
+    error count, when one is taken at all, lives in `metadata.analysis.
+    test_error_count`. `metadata.exit_code` sits beside `metadata.analysis.
+    exit_code` on all 802 archived build receipts, and is the one read first.
+    """
+    r = TrajectoryReducer()
+    r.feed(
+        _event(
+            1,
+            "action_envelope",
+            {
+                "envelope_id": "envelope-000001",
+                "tool_call_id": "call-1",
+                "tool": "build",
+                "exact_params": {"command": "mvn clean verify", "action": "verify"},
+                "envelope_sha256": "a" * 64,
+            },
+        )
+    )
+    r.feed(_event(2, "tool_result", REAL_BUILD_RESULT_PAYLOAD))
+    turn = r.snapshot().turns[0]
+    assert turn.call.summary == "verify mvn clean verify"
+    assert turn.observation.outcome == "ok"
+    assert turn.observation.summary == "exit 0 · 994 tests · 0 F · 61 S · 1 artifact"
+
+
+def test_a_result_summary_survives_the_loop_decision_that_follows_it():
+    """The engine writes envelope → result → decision, and the decision is last.
+
+    The decision describes the same observation the result already answered, so
+    it folds into [C] — and folding must not drop what the result derived. Ten
+    of kafka's turns end on a decision; if the fold rebuilt the observation from
+    the decision's four fields alone, every one of them would render blank.
+    """
+    r = TrajectoryReducer()
+    for line in REAL_TRIPLE:
+        r.feed(line)
+    turn = r.snapshot().turns[0]
+    assert turn.call.summary == "clone apache/kafka@4.3.1"
+    assert turn.observation.outcome == "ok"
+    assert turn.observation.summary == "26b251a → /workspace/kafka"
+
+
+def test_a_killed_build_still_says_what_it_ran():
+    """ignite d2r2 seq 156/160/161 — the OOM kill, summarised from its receipt.
+
+    A run that failed still ran what it ran: the counts stay and the code is
+    appended to them. `exit 137` is read off `metadata.exit_code`, never out of
+    the result's prose, which says the same thing in words this layer ignores.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_OOM_KILLED_CALL_JSONL):
+        r.feed(line)
+    turn = r.snapshot().turns[0]
+    assert turn.call.summary == "test"
+    assert turn.observation.outcome == "failed"
+    assert turn.observation.summary == "exit 137 · 37 tests · 8 F · 0 S · TEST_FAILURE"
+
+
+def test_reducer_marks_a_refused_call():
+    """`RefusalRecordPayload` forbids extras: five fields, and no `reason`."""
+    r = TrajectoryReducer()
+    r.feed(_event(1, "refusal_record", REAL_CANCELLED_REFUSAL))
+    turn = r.snapshot().turns[0]
+    assert turn.observation.outcome == "cancelled"
+    assert turn.observation.summary == "cancelled"
+
+
+def test_a_refusal_that_is_not_a_cancellation_names_its_code():
+    """The 288 archived refusals that were not batch breaks: the code is the line."""
+    r = TrajectoryReducer()
+    r.feed(_event(1, "refusal_record", REAL_REFUSAL_PHASE_MISMATCH))
+    r.feed(_event(2, "refusal_record", REAL_REFUSAL_CLOSED))
+    turns = r.snapshot().turns
+    assert [t.observation.outcome for t in turns] == ["refused", "refused"]
+    assert [t.observation.summary for t in turns] == [
+        "PHASE_ACTION_MISMATCH",
+        "execution_refused:evidence_closed",
+    ]
+
+
+def test_the_new_fixtures_are_the_shape_the_engine_would_seal():
+    """Each payload above is validated against the class the engine seals it with.
+
+    A fixture that claims provenance has to earn it. The forced action is the
+    whole ignite seq-235 line, digest included, so `ForcedActionPayload`'s
+    `action_sha256` validator re-derives the hash from the fields and agrees —
+    which a hand-assembled lookalike cannot do.
+    """
+    forced = json.loads(REAL_IGNITE_FORCED_ACTION_JSONL)["payload"]
+    assert ForcedActionPayload.model_validate(forced).tool == "build"
+    assert GateDecisionPayload.model_validate(REAL_GATE_PAYLOAD).validator_state == "green"
+    for line in (REAL_CANCELLED_REFUSAL, REAL_REFUSAL_PHASE_MISMATCH, REAL_REFUSAL_CLOSED):
+        assert RefusalRecordPayload.model_validate(line).tool
+    assert ToolResultPayload.model_validate(REAL_BUILD_RESULT_PAYLOAD).tool == "build"
+
+
+def test_a_forced_action_summarises_its_call_like_any_other():
+    """ignite seq 235 verbatim — the controller's turn reads like the model's."""
+    r = TrajectoryReducer()
+    r.feed(REAL_IGNITE_FORCED_ACTION_JSONL)
+    turn = r.snapshot().turns[0]
+    assert turn.actor == "controller"
+    assert turn.call.summary == "test"
+    assert turn.call.params_ref == "forced-000235"
+
+
+def test_phase_carries_the_gates_validator_state_and_reason():
+    r = TrajectoryReducer()
+    r.feed(_event(1, "gate_decision", dict(REAL_GATE_PAYLOAD)))
+    r.feed(
+        _event(
+            2,
+            "phase_transition",
+            {
+                "expected_kind": "advance",
+                "expected_target": "analyze",
+                "expected_reason_code": "provision_complete",
+            },
+        )
+    )
+    phase = r.snapshot().phases[0]
+    assert phase.name == "provision"
+    assert phase.validator_state == "green"
+    assert phase.reason == "workspace /workspace/kafka exists"
+    assert phase.key_results.startswith("Checked out apache/kafka.git")
+
+
+def test_key_results_longer_than_the_cap_are_clipped_and_say_so():
+    """Five of kafka's seven gates write more than 400 characters of results."""
+    payload = dict(REAL_GATE_PAYLOAD, key_results="x" * 900)
+    r = TrajectoryReducer()
+    r.feed(_event(1, "gate_decision", payload))
+    phase = r.snapshot().phases[0]
+    assert len(phase.key_results) == KEY_RESULTS_MAX_CHARS
+    assert phase.key_results.endswith("…")
+
+
+def test_a_gate_that_states_no_key_results_leaves_the_phase_saying_nothing():
+    """`GateDecisionPayload.key_results` defaults to `""`, and camel-quarkus
+    seq 250 really writes it. `""` in the ledger means "not stated", and
+    `PhaseInfo.key_results` rejects it outright — so a band whose ONLY gate
+    wrote `""` says `None` rather than showing a reader a blank line where a
+    paragraph would go.
+    """
+    r = TrajectoryReducer()
+    r.feed(_event(1, "gate_decision", dict(REAL_GATE_PAYLOAD, key_results="", reason="")))
+    phase = r.snapshot().phases[0]
+    assert phase.key_results is None
+    assert phase.reason is None
+    assert phase.validator_state == "green"
+
+
+def test_a_later_gate_that_states_nothing_does_not_un_say_the_earlier_reading():
+    """The band keeps the last STATED reading, not the last writer's.
+
+    This is the other half of the test above, and the pair is what tells the
+    two rules apart: one gate writing `""` means nobody ever stated a value;
+    a gate writing `""` AFTER one that stated a paragraph means only that this
+    gate did not restate it. Overwriting the paragraph with `None` would assert
+    an absence no event declared — the mirror image of inventing a value.
+
+    camel-quarkus-d2r3's `test` band is this shape on real bytes: ten gates,
+    nine stating `key_results` (the last 769 characters) and seq 250 stating
+    `""`. Last-writer-wins rendered that band as having achieved nothing.
+    """
+    r = TrajectoryReducer()
+    r.feed(_event(1, "gate_decision", dict(REAL_GATE_PAYLOAD)))
+    r.feed(
+        _event(
+            2,
+            "gate_decision",
+            dict(
+                REAL_GATE_PAYLOAD,
+                key_results="",
+                reason="",
+                validator_state="red",
+                decision_id="gate-000000000000000000000000000000aa",
+                supersedes=REAL_GATE_PAYLOAD["decision_id"],
+            ),
+        )
+    )
+    phase = r.snapshot().phases[0]
+
+    # Two fields the second gate did not restate, and one it did. The three
+    # merge independently: a gate is not required to repeat itself to keep
+    # what it already said.
+    assert phase.key_results == REAL_GATE_PAYLOAD["key_results"]
+    assert phase.reason == REAL_GATE_PAYLOAD["reason"]
+    assert phase.validator_state == "red"
+
+
+#: SYNTHETIC, and deliberately so. Across 425 archived ledgers and 11,970
+#: `tool_result` events, NO envelope is answered twice, and the only four
+#: `(invocation_status, operation_outcome)` pairs that occur — (completed,
+#: success), (completed, failed), (pending, unknown), (crashed, failed) — all
+#: state an outcome. So a second result that derives nothing is a shape no
+#: recorded run produces. It is fenced anyway: "a later blank never erases a
+#: stated value" is a rule of this layer, and a layer with one honest path and
+#: one unfenced path is how the last three rounds of this plan went wrong.
+#: The line validates as `ToolResultPayload`, so it is at least a shape the
+#: engine could seal.
+SYNTHETIC_SECOND_RESULT_PAYLOAD = {
+    "envelope_id": "envelope-000001",
+    "execution_id": "execution_second",
+    "tool": "build",
+    "params": {"command": "mvn clean verify"},
+    "scope": "test_runtime",
+    "result": {
+        "conflicts": [],
+        "evidence_refs": [],
+        "evidence_status": "unverified",
+        "facts": {},
+        "metadata": {},
+        "refs": [],
+        "validator_findings": [],
+    },
+}
+
+
+def test_a_second_result_that_derives_nothing_leaves_the_first_ones_line_standing():
+    """The band's rule, applied to the observation: a blank never erases.
+
+    The first result states `ok` and a full count line. A second result on the
+    same envelope that states neither must leave both alone — writing `None`
+    over them would assert that nobody ever measured the build, which is the
+    same untruth as `key_results: null` on a band nine gates wrote to.
+    """
+    assert ToolResultPayload.model_validate(SYNTHETIC_SECOND_RESULT_PAYLOAD).tool == "build"
+    r = TrajectoryReducer()
+    r.feed(
+        _event(
+            1,
+            "action_envelope",
+            {
+                "envelope_id": "envelope-000001",
+                "tool_call_id": "call-1",
+                "tool": "build",
+                "exact_params": {"command": "mvn clean verify", "action": "verify"},
+                "envelope_sha256": "a" * 64,
+            },
+        )
+    )
+    r.feed(_event(2, "tool_result", REAL_BUILD_RESULT_PAYLOAD))
+    r.feed(_event(3, "tool_result", SYNTHETIC_SECOND_RESULT_PAYLOAD))
+
+    turn = r.snapshot().turns[0]
+    assert turn.observation.outcome == "ok"
+    assert turn.observation.summary == "exit 0 · 994 tests · 0 F · 61 S · 1 artifact"
+
+
+def test_a_sealed_turn_keeps_the_line_its_result_derived():
+    """The record states [C]'s ref; it does not re-state what came back.
+
+    `turn_record` delivers the observation the model READ, which displaces the
+    tool's own ref into `evidence_ref`. It carries no result payload, so it can
+    derive nothing — and taking the row means carrying forward the outcome and
+    the line the result already derived, not blanking them.
+    """
+    r = TrajectoryReducer()
+    for line in REAL_TRIPLE:
+        r.feed(line)
+    r.feed(SYNTHETIC_TURN_RECORD_JSONL)
+
+    turn = r.snapshot().turns[0]
+    assert turn.observation.ref == "output_dddddddddddd"  # what the model read
+    assert turn.observation.evidence_ref == "output_6163859b019d"  # what the tool wrote
+    assert turn.observation.outcome == "ok"
+    assert turn.observation.summary == "26b251a → /workspace/kafka"
+
+
+def test_a_revision_updates_only_the_field_it_states():
+    """A revision moves the word and says why; it does not re-read the validator.
+
+    `GateOutcomeRevisedPayload` declares `reason` and no `validator_state`, no
+    `key_results`. So a revision REPLACES the band's reason — the old one
+    explains a word that has been withdrawn — and leaves the other two exactly
+    as the gate that stated them left them. The rule doing that work is
+    "a blank never erases a stated value", not where the call site sits: the
+    same helper runs for decisions and revisions alike.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_SILENT_PHASE_CALL_JSONL)[:4]:
+        r.feed(line)
+    r.feed(_event(28, "gate_decision", dict(REAL_GATE_PAYLOAD)))
+    before = r.snapshot().phases[0]
+    assert (before.validator_state, before.key_results) == (
+        "green",
+        REAL_GATE_PAYLOAD["key_results"],
+    )
+
+    r.feed(SYNTHETIC_GATE_REVISION_JSONL)
+    band = next(p for p in r.snapshot().phases if p.name == "provision")
+
+    assert band.gates[-1].word == "partial"  # the word did move
+    assert band.reason == "the workspace check read a mount that had been replaced"
+    assert band.validator_state == "green"  # not restated, so not withdrawn
+    assert band.key_results == REAL_GATE_PAYLOAD["key_results"]

@@ -4,7 +4,7 @@
 for the ledger beside it:
 
 ```
-.venv/bin/sag trajectory webui/src/test/fixtures/empty-segment | python3 -m json.tool
+.venv/bin/sag trajectory webui/src/test/fixtures/empty-segment --format json | python3 -m json.tool
 ```
 
 `control_events.jsonl` is a SYNTHETIC ledger, on the same terms as the synthetic

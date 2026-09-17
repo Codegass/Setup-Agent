@@ -2,11 +2,28 @@ import type {
   BuildSummary,
   EvidenceCountSummary,
   ObservationCountSummary,
+  SnapshotStatus,
   TestEvidenceLayers,
   TestSummary,
 } from "@/api/types"
 
 export type ResultTone = "green" | "red" | "amber" | "neutral"
+
+/** The one sentence for a run whose record this page could not read. */
+export const RECORD_UNREADABLE = "This run's result record could not be read here."
+
+/**
+ * Whether this run's record was read at all.
+ *
+ * `corrupt` and `untrusted` mean the bytes were there and this page could not
+ * read them, so nothing downstream checked anything. A tab that then says a
+ * count "was not recorded" or a total "was not measured" is stating a finding
+ * nobody made. `missing` and `unavailable` are different: nothing was written
+ * to read, which the surface may say plainly.
+ */
+export function recordWasRead(status: SnapshotStatus | null | undefined): boolean {
+  return status !== "corrupt" && status !== "untrusted"
+}
 
 export interface CompleteEvidenceCounts {
   executed: number
@@ -76,7 +93,7 @@ const DATA_NOTE_COPY: Record<string, string> = {
   build_coverage_scope_unverified: "Build coverage could not be verified across the full project scope.",
   test_primary_coordinate_unresolved: "The primary test project or module could not be identified.",
   test_executions_unattributed_to_receipts: "Some test runs could not be linked to their recorded tool executions.",
-  test_execution_interrupted: "The test runner stopped before the declared scope completed; shown counts are the sealed prefix.",
+  test_execution_interrupted: "The test runner stopped before the declared scope completed; the counts shown cover only what ran before it stopped.",
   rate_denominator_not_a_bound: "A rate denominator did not bound the observed count, so no percentage is shown.",
   metrics_conflict: "Conflicting test or build metrics were recorded.",
   reactor_scope_narrowed: "The build ran against a narrower module scope than the full project.",
@@ -320,7 +337,7 @@ export function presentTestAccounting(test: TestSummary): TestAccountingPresenta
 export function humanizeIdentityGap(reason: string | null | undefined): string {
   const normalized = reason?.trim().toLowerCase() ?? ""
   if (normalized.includes("module-qualified") || normalized.includes("subject/case identity")) {
-    return "Per-test results with module and test names were not sealed for this run."
+    return "Per-test results with module and test names were not recorded for this run."
   }
   if (normalized.includes("receipt") && normalized.includes("identity")) {
     return "Some test results were missing the module and test name needed for verification."

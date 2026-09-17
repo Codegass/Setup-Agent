@@ -2,6 +2,7 @@
 
 import builtins
 import json
+import os
 import re
 import subprocess
 import sys
@@ -22,7 +23,6 @@ from sag.agent.context_journal import JOURNAL_DIR
 from sag.agent.history_state import HistoryActionState, decode_history_action_state
 from sag.agent.phase_machine import PHASE_NAMES
 from sag.agent.verdict_finalizer import (
-    ReportDeliveryStatus,
     RunTermination,
     RunVerdictSnapshot,
     read_live_verdict_snapshot,
@@ -34,19 +34,40 @@ from sag.config import (
     get_config,
     get_session_logger,
     set_config,
-    suppress_console_logging,
 )
+from sag.console.result_block import render_result_block
+from sag.console.turn_stream import TurnStreamRenderer
 from sag.coverage.runner import apply_coverage
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.result_card import build_result_card
+from sag.result_card.run_evidence import (
+    find_recorded_session,
+    read_run_counts,
+    recorded_report,
+)
 from sag.runtime.container_io import read_container_text
 from sag.tools.module_metrics import MODULE_METRICS_PATH
-from sag.trajectory.builder import build_trajectory, follow_trajectory
-from sag.trajectory.schema import DETAIL_TIERS
+from sag.trajectory.builder import (
+    build_trajectory,
+    control_events_path,
+    follow_trajectory,
+    read_call_envelope,
+    read_output_bytes,
+    resolve_session_dir,
+)
+from sag.trajectory.schema import DETAIL_TIERS, TrajectoryDelta
 from sag.utils.git_utils import extract_project_name_from_url
-from sag.verdict_rates import render_rate_lines, render_snapshot_metric_lines
+from sag.web.models import WorkspaceResult
 from sag.web.server import run_web_server
 
 console = Console()
+
+#: What a cell says when the run did not measure it. Absence is stated; it is
+#: never rendered as a zero a reader would take for a measurement.
+_NOT_MEASURED = "—"
+
+#: What tells a path from a container name. A container name never holds one.
+_SEPARATORS = frozenset({"/", os.sep})
 
 # Note: You may see "Exception ignored while finalizing... ValueError: I/O operation on closed file"
 # at the end of execution. This is a harmless cleanup issue from urllib3/docker-py during
@@ -58,37 +79,81 @@ def _render_setup_cli_result(
     termination: RunTermination,
     project_name: str,
     *,
-    metrics_v2: Mapping[str, Any] | None = None,
+    module_metrics: Mapping[str, Any] | None = None,
+    report_metrics: Mapping[str, Any] | None = None,
+    run_pin: Mapping[str, Any] | None = None,
+    run_counts: Mapping[str, Any] | None = None,
+    container: str | None = None,
+    session_dir: str | None = None,
+    report_path: str | None = None,
 ) -> tuple[str, int]:
-    """Render the setup result and translate only the sealed verdict to an exit code."""
-    from sag.tools.report_metrics import (
-        build_evidence_layer_projection,
-        format_evidence_layer_lines,
+    """Render the run's result block and translate only its verdict to an exit code.
+
+    `run_counts` arrives whole from `read_run_counts` and is splatted whole. No
+    surface names the counts one at a time, so none can fill four of the five
+    and drop the fifth — which is how the terminal came to bill tokens the web
+    API said nothing about for the same run.
+    """
+
+    card = build_result_card(
+        snapshot,
+        module_metrics=module_metrics,
+        report_metrics=report_metrics,
+        run_pin=run_pin,
+        **(read_run_counts(None) | dict(run_counts or {})),
+        termination=termination,
+        project=project_name,
+        container=container,
+        session_dir=session_dir,
+        report_path=report_path,
+    )
+    return render_result_block(card, width=console.width), (
+        0 if snapshot.verdict == "success" else 1
     )
 
-    if metrics_v2 is None:
-        metrics_v2 = build_evidence_layer_projection(
-            snapshot=snapshot.model_dump(mode="json"),
-            conflicts=[*snapshot.conflicts],
-        )
 
-    lines = render_snapshot_metric_lines(snapshot.model_dump(mode="json"))
-    from sag.agent.ci_comparison import render_ci_comparison_lines
-    from sag.agent.acceptance_task import render_task_completion_lines
+def _read_module_metrics_for_cli(orchestrator: DockerOrchestrator) -> Mapping[str, Any] | None:
+    """Read the per-module diagnostic file, or nothing when it is absent."""
 
-    lines.extend(render_ci_comparison_lines(snapshot.ci_comparison))
-    lines.extend(render_task_completion_lines(snapshot.task_completion))
-    lines.extend(
-        [
-            f"Verdict (derived): {snapshot.verdict}",
-            f"Project: {project_name}",
-            *format_evidence_layer_lines(metrics_v2),
-        ]
-    )
-    lines.append(f"Report delivery: {termination.report_delivery_status.value}")
-    if termination.report_delivery_status is ReportDeliveryStatus.FAILED:
-        lines.append("WARNING: setup report delivery failed; sealed verdict is unchanged")
-    return "\n".join(lines), 0 if snapshot.verdict == "success" else 1
+    try:
+        text = read_container_text(orchestrator, MODULE_METRICS_PATH)
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _report_name_for_block(report_path: str | None, session_dir: str | None) -> str | None:
+    """Name the report the way the block has room to print it.
+
+    The Evidence line directly above names the session directory, so a report
+    copied into it is named by its file rather than by a path several times
+    wider than the column, which would break the row it is printed in.
+    """
+
+    if not report_path or not session_dir:
+        return report_path
+    try:
+        return str(Path(report_path).relative_to(session_dir))
+    except ValueError:
+        return report_path
+
+
+def _read_run_pin_for_cli(session_logger: Any) -> Mapping[str, Any] | None:
+    """Read the host's run pin, or nothing when this run did not write one."""
+
+    if session_logger is None:
+        return None
+    try:
+        parsed = json.loads(Path(session_logger.run_pin_path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _read_metrics_v2_for_cli(orchestrator: DockerOrchestrator) -> Mapping[str, Any] | None:
@@ -109,6 +174,73 @@ def _start_agent_session_logging(config: Config) -> None:
     if config.verbose and session_logger:
         logger.info(f"Session ID: {session_logger.session_id}")
         logger.info(f"Logs directory: {session_logger.session_log_dir}")
+
+
+def _turn_stream_sink() -> Callable[[str], None]:
+    """Where a turn stream writes. One function, because there are two callers.
+
+    It writes through `console.print`, not `console.file.write`: the latter is
+    a raw stream write that interprets no markup, so on a real terminal every
+    styled token would arrive as a literal `[red]failed[/red]`. All three
+    keywords are load bearing — `end=""` because the renderer owns its newlines
+    and completes a dispatch line in place, `soft_wrap=True` because Rich would
+    otherwise re-wrap a line the renderer has already fitted to the width, and
+    `highlight=False` because Rich's auto-highlighter would colour numbers
+    inside a summary the renderer is already styling.
+
+    The live run and `sag trajectory` share it so that a fix here cannot land
+    at one wiring site and miss the other, which is how the raw write survived
+    its first correction.
+    """
+
+    return lambda text: console.print(text, end="", markup=True, highlight=False, soft_wrap=True)
+
+
+def _attach_turn_stream() -> Optional[TurnStreamRenderer]:
+    """Show the run as turns. Returns the renderer so the caller can close it.
+
+    The renderer stands beside the session's control ledger and reads the same
+    lines the ledger keeps — never a log line.
+    """
+
+    session_logger = get_session_logger()
+    if session_logger is None:
+        return None
+    renderer = TurnStreamRenderer(
+        _turn_stream_sink(),
+        width=console.width,
+        tty=console.is_terminal,
+    )
+    session_logger.get_control_event_sink().add_observer(renderer.feed)
+    return renderer
+
+
+def _close_turn_stream(renderer: Optional[TurnStreamRenderer]) -> None:
+    """End the stream: stop watching, then flush. Never raises.
+
+    Both halves matter. The renderer comes off the sink first because the sink
+    outlives it and a finished renderer refuses to be fed — that refusal would
+    travel through stdlib `logging`, which nothing here routes, and land on the
+    console this layer just quieted. And nothing in here may raise: this runs
+    from the `finally` of a command that ends in a broad `except`, so a write
+    that fails while closing — a closed terminal, a `BrokenPipeError` from
+    `sag project … | head` — would otherwise replace whatever the run actually
+    died of with a rendering error. The run's own exception outranks any
+    renderer, exactly as the ledger's append outranks any observer.
+    """
+
+    if renderer is None:
+        return
+    session_logger = get_session_logger()
+    if session_logger is not None:
+        try:
+            session_logger.get_control_event_sink().remove_observer(renderer.feed)
+        except Exception as exc:
+            logger.warning(f"Could not detach the turn stream from the control stream: {exc}")
+    try:
+        renderer.close()
+    except Exception as exc:
+        logger.warning(f"The turn stream failed to finish its last line: {exc}")
 
 
 def _execute_control(orchestrator, command: str, **kwargs):
@@ -219,18 +351,24 @@ def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str
         return None
 
 
-def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> None:
+def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> str | None:
     """Copy setup artifacts from Docker container to local session logs.
+
+    Returns the host path of the setup report that was copied, so the result
+    block can name the file a reader can actually open. ``None`` whenever no
+    report reached the host, for any reason; copying is best-effort and never
+    fails the run.
 
     Args:
         orchestrator: Docker orchestrator for the project
         project_name: Name of the project
     """
+    copied_report: str | None = None
     try:
         session_logger = get_session_logger()
         if not session_logger:
             logger.warning("No session logger available, skipping artifact save")
-            return
+            return None
 
         # Get the session log directory
         session_dir = session_logger.session_log_dir
@@ -249,8 +387,10 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
             copy_cmd = (
                 f"docker cp {orchestrator.container_name}:/workspace/.setup_agent {session_dir}/"
             )
-            import subprocess
-
+            # `subprocess` is imported at module scope. A second import here
+            # made the name local to this whole function, so a container with
+            # no `.setup_agent` folder left the report copy below reading an
+            # unbound local and losing every report it was asked to save.
             result = subprocess.run(copy_cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
                 logger.info("✅ Copied .setup_agent folder from container")
@@ -277,6 +417,7 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
                     result = subprocess.run(copy_cmd, shell=True, capture_output=True, text=True)
                     if result.returncode == 0:
                         logger.info(f"✅ Copied {filename} from container")
+                        copied_report = str(session_dir / filename)
                     else:
                         logger.warning(f"Failed to copy {filename}: {result.stderr}")
         else:
@@ -288,6 +429,7 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
         logger.error(f"Failed to save artifacts: {e}")
         # Don't fail the main operation if artifact saving fails
         console.print(f"[yellow]⚠️ Could not save artifacts: {e}[/yellow]")
+    return copied_report
 
 
 def _detect_coverage_build_system(orchestrator, project_dir: str):
@@ -410,20 +552,9 @@ def _run_coverage_evidence_pass(
 )
 @click.option("--log-file", type=click.Path(), help="Path to log file")
 @click.option("--verbose", is_flag=True, help="Enable verbose debugging output with detailed logs")
-@click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.pass_context
-def cli(ctx, log_level, log_file, verbose, ui):
+def cli(ctx, log_level, log_file, verbose):
     """SAG: Setup-Agent - LLM Powered project setup automation."""
-
-    # Check for mutually exclusive flags
-    if verbose and ui:
-        console.print(
-            "[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]"
-        )
-        console.print("[dim]Please choose one:[/dim]")
-        console.print("  --verbose : Detailed console logs for debugging")
-        console.print("  --ui      : Clean interactive UI with live updates")
-        sys.exit(1)
 
     # Create configuration
     config = Config.from_env()
@@ -435,25 +566,21 @@ def cli(ctx, log_level, log_file, verbose, ui):
         config.log_file = log_file
     if verbose:
         config.verbose = verbose
-    if ui:
-        config.ui_mode = ui
 
     # Set global config without opening a session log. Session logs are for
     # agent executions only; read-only CLI commands should not create
     # logs/session_* directories.
-    set_config(config, initialize_logging=False, quiet_console=log_level is None)
+    set_config(config, initialize_logging=False)
 
     # Ensure context object exists
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
 
-    # Display welcome message for main commands (skip in UI mode, will be shown by UIManager).
-    # `trajectory` is excluded because its stdout is JSON somebody parses.
-    if (
-        ctx.invoked_subcommand not in ["list", "trajectory"]
-        and not config.verbose
-        and not config.ui_mode
-    ):
+    # The panel greets the two commands that start agent work. Every other
+    # command's stdout is something somebody reads or pipes — `sag result X
+    # --json | jq` is dead with a panel above it, and so is a turn view a
+    # reader is scrolling. `--verbose` still suppresses it, as it always has.
+    if ctx.invoked_subcommand in {"project", "run"} and not config.verbose:
         console.print(
             Panel.fit(
                 "[bold blue]SAG[/bold blue] - [dim]Setup Agent[/dim]\n"
@@ -463,57 +590,94 @@ def cli(ctx, log_level, log_file, verbose, ui):
         )
 
 
+#: The colour a verdict wears in the terminal, matching `sag result`'s block.
+_VERDICT_STYLE = {"success": "green", "partial": "yellow", "failed": "red"}
+
+
+def _workspace_result_cells(result: WorkspaceResult | None) -> Tuple[Text, Text, Text]:
+    """The Setup, Required task and Tests cells for one row of `sag list`.
+
+    Copied off `WorkspaceSummary.result`, which the read model fills from the
+    run's own card — the same four numbers the Workbench rail shows, so the
+    terminal and the web page cannot disagree about a workspace. A cell the run
+    did not measure is a dash: absence is said, not guessed at.
+    """
+
+    if result is None:
+        dash = Text(_NOT_MEASURED, style="dim")
+        return dash, dash.copy(), dash.copy()
+
+    setup = Text(result.verdict, style=_VERDICT_STYLE.get(result.verdict, "dim"))
+
+    task = (
+        Text(f"{result.task.completed}/{result.task.required}")
+        if result.task is not None
+        else Text(_NOT_MEASURED, style="dim")
+    )
+
+    if result.tests is None:
+        tests = Text(_NOT_MEASURED, style="dim")
+    else:
+        tests = Text(f"{result.tests.passed:,}/{result.tests.executed:,}")
+        red = result.tests.failed + result.tests.errors
+        if red:
+            # The rail prints the same red `+N` beside the same two numbers.
+            tests.append(f" +{red:,}", style="red")
+
+    return setup, task, tests
+
+
 @cli.command()
 def list():
-    """List all SAG-managed Docker containers with their status and last comment."""
+    """List SAG workspaces and what each run produced."""
 
-    try:
-        orchestrator = DockerOrchestrator()
-        projects = orchestrator.list_sag_projects()
+    # The same read model the Workbench dashboard renders, so the terminal and
+    # the web page cannot disagree about a workspace.
+    from sag.web.read_model import ReadModelBuilder
 
-        if not projects:
-            console.print("[yellow]No SAG projects found.[/yellow]")
-            console.print("[dim]Use 'sag project <repo_url>' to create a new project.[/dim]")
-            return
+    dashboard = ReadModelBuilder().dashboard()
 
-        # Create table
-        table = Table(title="SAG Projects", show_header=True, header_style="bold magenta")
-        table.add_column("Project Name", style="cyan", no_wrap=True)
-        table.add_column("Docker Name", style="blue", no_wrap=True)
-        table.add_column("Status", style="green")
-        table.add_column("Last Comment", style="white", max_width=50)
-        table.add_column("Created", style="dim")
-
-        for project in projects:
-            # Get status with color
-            status = project["status"]
-            if status == "running":
-                status_text = Text("🟢 running", style="green")
-            elif status == "exited":
-                status_text = Text("🔴 stopped", style="red")
-            else:
-                status_text = Text(f"🟡 {status}", style="yellow")
-
-            # Get last comment from agent
-            last_comment = project.get("last_comment", "No comment available")
-            # Show full comment without truncation
-
-            table.add_row(
-                project["project_name"],
-                project["docker_name"],
-                status_text,
-                last_comment,
-                project["created"],
-            )
-
-        console.print(table)
+    # A read that failed is not an empty dashboard, and saying so would invent
+    # a fact about the machine. It exits 1, the way `sag result` does: one
+    # branch cannot report "I could not look" as success while its neighbour
+    # reports the same thing as failure.
+    if dashboard.read_status != "available":
         console.print(
-            f"\n[dim]Use 'sag run <docker_name> --task \"description\"' to continue working on a project.[/dim]"
+            f"[bold red]❌ {dashboard.read_error or 'Workspace data could not be read.'}[/bold red]"
+        )
+        sys.exit(1)
+
+    if not dashboard.workspaces:
+        console.print("[yellow]No SAG workspaces found.[/yellow]")
+        console.print("[dim]Use 'sag project <repo_url>' to create one.[/dim]")
+        return
+
+    table = Table(title="SAG Workspaces", show_header=True, header_style="bold magenta")
+    table.add_column("Project", style="cyan", no_wrap=True)
+    table.add_column("Container", style="blue", no_wrap=True)
+    table.add_column("State")
+    table.add_column("Setup")
+    table.add_column("Required task")
+    table.add_column("Tests")
+    table.add_column("Updated", style="dim")
+
+    for workspace in dashboard.workspaces:
+        status = workspace.docker.status or "—"
+        setup, task, tests = _workspace_result_cells(workspace.result)
+        table.add_row(
+            workspace.project or "—",
+            workspace.container or workspace.id,
+            Text(status, style="green" if status == "running" else "yellow"),
+            setup,
+            task,
+            tests,
+            workspace.updated or "—",
         )
 
-    except Exception as e:
-        logger.error(f"List projects failed: {e}")
-        console.print(f"[bold red]❌ Failed to list projects: {e}[/bold red]")
+    console.print(table)
+    console.print(
+        "\n[dim]Use 'sag run <container> --task \"description\"' to continue a workspace.[/dim]"
+    )
 
 
 @cli.command()
@@ -531,7 +695,6 @@ def list():
     is_flag=True,
     help="Run an isolated JaCoCo coverage pass before verdict close (best-effort)",
 )
-@click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.option(
     "--ref",
     "project_ref",
@@ -559,7 +722,6 @@ def project(
     goal,
     record,
     coverage,
-    ui,
     project_ref,
     ci_target_file,
     acceptance_command,
@@ -597,21 +759,6 @@ def project(
         except (OSError, ValueError) as exc:
             raise click.ClickException(f"Invalid CI target: {exc}") from exc
 
-    # Override ui_mode from command-line flag if provided
-    if ui:
-        # Check for mutual exclusion with verbose
-        if config.verbose:
-            console.print(
-                "[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]"
-            )
-            console.print("[dim]Please choose one:[/dim]")
-            console.print("  --verbose : Detailed console logs for debugging")
-            console.print("  --ui      : Clean interactive UI with live updates")
-            sys.exit(1)
-        config.ui_mode = ui
-        # Suppress console logging for UI mode
-        suppress_console_logging()
-
     try:
         # ALWAYS extract project_name from URL - this is the actual directory name
         # The --name flag only affects Docker container/volume naming
@@ -626,26 +773,23 @@ def project(
 
         docker_name = f"sag-{docker_label}"
 
-        # Only show project setup details in non-UI mode
-        if not config.ui_mode:
-            console.print(f"[bold green]🚀 Setting up new project[/bold green]")
-            console.print(f"[dim]Repository:[/dim] {repo_url}")
-            if project_ref:
-                console.print(f"[dim]Repository Ref:[/dim] {project_ref}")
-            console.print(f"[dim]Project Name:[/dim] {project_name}")
-            console.print(f"[dim]Docker Name:[/dim] {docker_name}")
-            if name and name != project_name:
-                console.print(
-                    f"[dim]Note:[/dim] Using custom Docker name, project directory will be /workspace/{project_name}"
-                )
-            console.print(f"[dim]Goal:[/dim] {goal}")
-            if record:
-                console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
+        console.print(f"[bold green]🚀 Setting up new project[/bold green]")
+        console.print(f"[dim]Repository:[/dim] {repo_url}")
+        if project_ref:
+            console.print(f"[dim]Repository Ref:[/dim] {project_ref}")
+        console.print(f"[dim]Project Name:[/dim] {project_name}")
+        console.print(f"[dim]Docker Name:[/dim] {docker_name}")
+        if name and name != project_name:
+            console.print(
+                f"[dim]Note:[/dim] Using custom Docker name, project directory will be /workspace/{project_name}"
+            )
+        console.print(f"[dim]Goal:[/dim] {goal}")
+        if record:
+            console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
 
         # Check if project already exists (using docker_label for container naming)
         orchestrator = DockerOrchestrator(project_name=docker_label)
         if orchestrator.container_exists():
-            # Always show critical errors/warnings, even in UI mode
             console.print(
                 f"[bold yellow]⚠️ Container '{docker_name}' already exists![/bold yellow]"
             )
@@ -655,69 +799,73 @@ def project(
             return
 
         _start_agent_session_logging(config)
+        turn_stream = _attach_turn_stream()
 
-        # Initialize agent
-        agent = SetupAgent(config=config, orchestrator=orchestrator)
+        # The close has to run from a `finally`: this command ends in a broad
+        # `except Exception`, which would otherwise take the crash before the
+        # stream flushed its last line and the warnings it is still holding —
+        # on exactly the runs a reader most needs to read.
+        try:
+            # Initialize agent
+            agent = SetupAgent(config=config, orchestrator=orchestrator)
 
-        # Run the setup - pass project_name (from URL) and docker_label for metadata
-        termination = agent.setup_project(
-            project_url=repo_url,
-            project_name=project_name,
-            goal=goal,
-            docker_label=docker_label,
-            project_ref=project_ref,
-            **({"ci_target": ci_target} if ci_target is not None else {}),
-            **({"acceptance_task": acceptance_task} if acceptance_task is not None else {}),
-            pre_finalize_evidence_callback=(
-                (
-                    lambda: _run_coverage_evidence_pass(
-                        orchestrator,
-                        project_name,
-                        validator=getattr(
-                            getattr(agent, "react_engine", None),
-                            "physical_validator",
-                            None,
-                        ),
+            # Run the setup - pass project_name (from URL) and docker_label for metadata
+            termination = agent.setup_project(
+                project_url=repo_url,
+                project_name=project_name,
+                goal=goal,
+                docker_label=docker_label,
+                project_ref=project_ref,
+                **({"ci_target": ci_target} if ci_target is not None else {}),
+                **({"acceptance_task": acceptance_task} if acceptance_task is not None else {}),
+                pre_finalize_evidence_callback=(
+                    (
+                        lambda: _run_coverage_evidence_pass(
+                            orchestrator,
+                            project_name,
+                            validator=getattr(
+                                getattr(agent, "react_engine", None),
+                                "physical_validator",
+                                None,
+                            ),
+                        )
                     )
-                )
-                if coverage
-                else None
-            ),
-        )
+                    if coverage
+                    else None
+                ),
+            )
+        finally:
+            _close_turn_stream(turn_stream)
+
         snapshot = read_live_verdict_snapshot(orchestrator)
+        session_logger = get_session_logger()
+        session_dir = str(session_logger.session_log_dir) if session_logger else None
+
+        # The block names the report a reader can open, so the copy has to have
+        # happened before the block is built.
+        report_path = _save_setup_artifacts(orchestrator, project_name) if record else None
+
+        run_counts = read_run_counts(session_dir)
         cli_result, exit_code = _render_setup_cli_result(
             snapshot,
             termination,
             project_name,
-            metrics_v2=_read_metrics_v2_for_cli(orchestrator),
+            module_metrics=_read_module_metrics_for_cli(orchestrator),
+            report_metrics=_read_metrics_v2_for_cli(orchestrator),
+            run_pin=_read_run_pin_for_cli(session_logger),
+            run_counts=run_counts,
+            container=docker_name,
+            session_dir=session_dir,
+            report_path=_report_name_for_block(report_path, session_dir),
         )
 
-        # Save artifacts if recording is enabled
-        if record:
-            _save_setup_artifacts(orchestrator, project_name)
-
-        # Only show completion messages in non-UI mode (UI manager handles this)
-        if not config.ui_mode:
-            console.print(cli_result)
-            if snapshot.verdict == "success":
-                console.print(
-                    f"[bold green]✅ Project '{project_name}' setup completed![/bold green]"
-                )
-                console.print(f"\n[dim]Next steps:[/dim]")
-                console.print(f'  uv run sag run {docker_name} --task "run the application"')
-                console.print(f'  uv run sag run {docker_name} --task "add tests"')
-                console.print(f"  uv run sag shell {docker_name}")
-            else:
-                console.print("[bold yellow]⚠️ Project setup needs attention.[/bold yellow]")
-                console.print(f"[dim]Check logs for details. You can retry with:[/dim]")
-                console.print(f'  sag run {docker_name} --task "continue setup"')
+        console.print(cli_result)
 
         if exit_code:
             sys.exit(exit_code)
 
     except Exception as e:
         logger.error(f"Project setup failed: {e}")
-        # Always show critical errors, even in UI mode
         console.print(f"[bold red]❌ Setup failed: {e}[/bold red]")
         sys.exit(1)
 
@@ -734,27 +882,11 @@ def project(
     is_flag=True,
     help="Run an isolated JaCoCo coverage pass after setup (best-effort)",
 )
-@click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.pass_context
-def run(ctx, docker_name, task, max_iterations, record, coverage, ui):
+def run(ctx, docker_name, task, max_iterations, record, coverage):
     """Run a specific task on an existing SAG project."""
 
     config = ctx.obj["config"]
-
-    # Override ui_mode from command-line flag if provided
-    if ui:
-        # Check for mutual exclusion with verbose
-        if config.verbose:
-            console.print(
-                "[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]"
-            )
-            console.print("[dim]Please choose one:[/dim]")
-            console.print("  --verbose : Detailed console logs for debugging")
-            console.print("  --ui      : Clean interactive UI with live updates")
-            sys.exit(1)
-        config.ui_mode = ui
-        # Suppress console logging for UI mode
-        suppress_console_logging()
 
     try:
         # Extract docker_label from docker name (this is the container identifier)
@@ -791,28 +923,30 @@ def run(ctx, docker_name, task, max_iterations, record, coverage, ui):
         else:
             actual_project_name = detected or docker_label
 
-        # Only show task info in non-UI mode (UI manager handles this)
-        if not config.ui_mode:
-            console.print(
-                f"[bold green]🔧 Running task on project: {actual_project_name}[/bold green]"
-            )
-            console.print(f"[dim]Docker:[/dim] {docker_name}")
-            console.print(f"[dim]Task:[/dim] {task}")
-            if record:
-                console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
+        console.print(f"[bold green]🔧 Running task on project: {actual_project_name}[/bold green]")
+        console.print(f"[dim]Docker:[/dim] {docker_name}")
+        console.print(f"[dim]Task:[/dim] {task}")
+        if record:
+            console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
 
         _start_agent_session_logging(config)
+        turn_stream = _attach_turn_stream()
 
-        # Initialize agent
-        final_max_iterations = (
-            max_iterations if max_iterations is not None else config.max_iterations
-        )
-        agent = SetupAgent(
-            config=config, orchestrator=orchestrator, max_iterations=final_max_iterations
-        )
+        # Same reason as `project`: the stream's last line and its held
+        # warnings belong to the reader even when the run dies.
+        try:
+            # Initialize agent
+            final_max_iterations = (
+                max_iterations if max_iterations is not None else config.max_iterations
+            )
+            agent = SetupAgent(
+                config=config, orchestrator=orchestrator, max_iterations=final_max_iterations
+            )
 
-        # Run the task with the actual project name
-        success = agent.run_task(project_name=actual_project_name, task_description=task)
+            # Run the task with the actual project name
+            success = agent.run_task(project_name=actual_project_name, task_description=task)
+        finally:
+            _close_turn_stream(turn_stream)
 
         # Save artifacts if recording is enabled
         if record:
@@ -821,13 +955,13 @@ def run(ctx, docker_name, task, max_iterations, record, coverage, ui):
         if coverage:
             _run_coverage_pass(orchestrator, actual_project_name)
 
-        # Only show completion messages in non-UI mode (UI manager handles this)
-        if not config.ui_mode:
-            if success:
-                console.print(f"[bold green]✅ Task completed successfully![/bold green]")
-            else:
-                console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
-                console.print(f"[dim]Check logs for details or run another task to continue.[/dim]")
+        # The command's exit code is the run's answer: a task that did not
+        # finish must not read as a success to a script.
+        if success:
+            console.print("[green]Task completed.[/green]")
+        else:
+            console.print("[yellow]Task did not finish. Run another task to continue.[/yellow]")
+            sys.exit(1)
 
     except Exception as e:
         logger.error(f"Task execution failed: {e}")
@@ -1420,6 +1554,88 @@ def _inspect_render_phase_list(source) -> str:
     return "\n".join(lines)
 
 
+def _inspect_render_turn(session_dir: Path, turn_id: int) -> str:
+    """One turn: what was asked, what came back, and what the gate decided.
+
+    This reads the control ledger through `build_trajectory`, so it answers for
+    any recorded session that has one — including a session with no recorded
+    context tree, which the phase and iteration views cannot read.
+    """
+
+    document = build_trajectory(session_dir)
+    turn = next((item for item in document.turns if item.turn_id == turn_id), None)
+    if turn is None:
+        ids = [item.turn_id for item in document.turns]
+        span = f"{min(ids)}..{max(ids)}" if ids else "none"
+        raise _InspectError(f"No turn {turn_id} (recorded turns: {span})")
+
+    lines = [f"=== Turn {turn.turn_id} ({turn.phase}, {turn.actor}) ==="]
+    if turn.iteration is not None:
+        lines.append(f"Iteration: {turn.iteration}")
+    if turn.control_seq:
+        lines.append("Control events: " + ", ".join(str(seq) for seq in turn.control_seq))
+    else:
+        lines.append("Control events: this turn names none")
+    lines.append("")
+
+    lines.append("Call:")
+    if turn.call is None:
+        lines.append("  this turn called no tool")
+    else:
+        lines.append(f"  tool: {turn.call.tool}")
+        if turn.call.summary:
+            lines.append(f"  summary: {turn.call.summary}")
+        if turn.call.params_ref:
+            envelope = read_call_envelope(session_dir, turn.call.params_ref)
+            if envelope is None:
+                lines.append(f"  the ledger has no call parameters for {turn.call.params_ref}")
+            else:
+                params = json.dumps(envelope.get("exact_params"), indent=2, sort_keys=True)
+                lines.append(textwrap.indent(params, "  "))
+    lines.append("")
+
+    lines.append("Result:")
+    observation = turn.observation
+    if observation is None:
+        lines.append("  no result is recorded for this turn")
+    else:
+        if observation.outcome:
+            lines.append(f"  outcome: {observation.outcome}")
+        if observation.summary:
+            lines.append(f"  summary: {observation.summary}")
+        if observation.error_code:
+            lines.append(f"  error code: {observation.error_code}")
+        # Only this turn's refs are resolved. The full tier resolves every ref
+        # the whole session holds, which on a real run is a hundred lookups and
+        # a store warning for each one that misses — 56 lines on stderr to
+        # print two.
+        resolved = read_output_bytes(session_dir, (observation.ref, observation.evidence_ref))
+        for label, ref in (
+            ("model-visible", observation.ref),
+            ("evidence", observation.evidence_ref),
+        ):
+            if not ref:
+                continue
+            # Bytes that resolved to nothing and bytes this session never kept
+            # are different facts, and a quiet successful command is the first
+            # of them.
+            body = resolved.get(ref)
+            lines.append(f"  {label} ref {ref}:")
+            if body is None:
+                lines.append("    this session's store has no bytes for this ref")
+            elif body == "":
+                lines.append("    the store holds this ref, and it is empty")
+            else:
+                lines.append(textwrap.indent(body, "    "))
+
+    if turn.gate is not None:
+        gate_line = f"Gate: {turn.gate.word}"
+        if turn.gate.decision_id:
+            gate_line += f" (decision {turn.gate.decision_id})"
+        lines.extend(["", gate_line])
+    return "\n".join(lines)
+
+
 @cli.command()
 @click.argument("docker_name")
 @click.option("--phase", default=None, help=f"Phase to inspect ({'/'.join(PHASE_NAMES)})")
@@ -1436,9 +1652,31 @@ def _inspect_render_phase_list(source) -> str:
     default=None,
     help="Read from a local --record artifact dir (e.g. logs/session_X) instead of the container",
 )
-def inspect(docker_name, phase, iteration, session_dir):
-    """Inspect recorded context windows: phase timelines and per-iteration views."""
+@click.option(
+    "--turn",
+    "turn_id",
+    default=None,
+    type=int,
+    help="Show one turn end to end: its call, its result and how the gate graded it",
+)
+def inspect(docker_name, phase, iteration, session_dir, turn_id):
+    """Inspect a recorded run: phase timelines, per-iteration views, one turn."""
     try:
+        # The turn view derives from the control ledger, which a recorded
+        # session carries whether or not it also has a context tree. It is
+        # answered before any context source is opened, because opening one
+        # would fail on exactly the sessions this view exists to read.
+        if turn_id is not None:
+            if not session_dir:
+                raise _InspectError(
+                    "--turn reads a recorded session; name one with --session <dir>"
+                )
+            directory = Path(session_dir)
+            if not directory.is_dir():
+                raise _InspectError(f"No session directory at '{directory}'")
+            click.echo(_inspect_render_turn(directory, turn_id))
+            return
+
         if session_dir:
             source = _SessionInspectSource(session_dir)
         else:
@@ -1490,50 +1728,140 @@ def inspect(docker_name, phase, iteration, session_dir):
         sys.exit(1)
 
 
+def _trajectory_header(document) -> str:
+    """One line naming the run, before its turns."""
+
+    session = document.session
+    turns = len(document.turns)
+    parts = (
+        session.project,
+        session.run_id,
+        f"verdict {session.verdict}" if session.verdict else None,
+        f"{turns:,} turn{'' if turns == 1 else 's'}" if turns else None,
+    )
+    return " · ".join(part for part in parts if part)
+
+
+def _trajectory_table(session_dir: Path, *, follow: bool) -> None:
+    """Replay or tail the session as the turn stream a live run prints.
+
+    One renderer, closed once. A replay feeds the ledger's own lines through
+    it; a follow leaves the lines to `follow_trajectory` and is handed each one
+    as it lands, because a phase closing lives in the raw event and no delta
+    carries it — a follow driven by deltas alone showed five fewer lines than a
+    replay of the same bytes. The two are alternatives, not stages: feeding the
+    whole ledger and then following would show every turn twice, the second
+    time after the stream had already said what the run finished with.
+
+    The document is built first, and not only for the header: the joins it
+    makes state holes the renderer's own fold cannot see — a ledger that was
+    never written, one that could not be read — and those go through the same
+    renderer rather than being left as silence.
+    """
+
+    directory = resolve_session_dir(session_dir)
+    document = build_trajectory(directory)
+    header = _trajectory_header(document)
+    if header:
+        console.print(header, markup=False, highlight=False)
+    stream = TurnStreamRenderer(_turn_stream_sink(), width=console.width, tty=console.is_terminal)
+    try:
+        if follow:
+            tail = follow_trajectory(directory, on_line=stream.note_event)
+            try:
+                for delta in tail:
+                    stream.render_delta(delta)
+            finally:
+                # Ending the follow is what turns a withheld tail into a torn
+                # one, so the last delta is produced by stopping, not by an
+                # event. It is rendered on the same terms as every other.
+                final = tail.close()
+                if final is not None:
+                    stream.render_delta(final)
+            return
+        ledger = control_events_path(directory)
+        if ledger is not None:
+            with ledger.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    stream.feed(line)
+        # What the replay could not say for itself. A statement already made
+        # from the lines is the same statement by value and is shown once.
+        stream.render_delta(TrajectoryDelta(warnings=document.warnings))
+    finally:
+        stream.close()
+
+
+def _trajectory_json(session_dir: Path, *, follow: bool, detail: str) -> None:
+    """Print the document, or one delta per line while the run is still going.
+
+    The directory is resolved the same way the table resolves it. Two formats
+    of one command answering for two different runs would be worse than either
+    of them being wrong on its own.
+    """
+
+    directory = resolve_session_dir(session_dir)
+    if follow:
+        stream = follow_trajectory(directory, detail=detail)
+        try:
+            for delta in stream:
+                click.echo(delta.model_dump_json())
+        finally:
+            # Ending the follow is what turns a withheld tail into a torn one,
+            # so the last delta is produced by stopping, not by an event. It
+            # goes out through the same channel as every other.
+            final = stream.close()
+            if final is not None:
+                click.echo(final.model_dump_json())
+        return
+    click.echo(build_trajectory(directory, detail=detail).model_dump_json())
+
+
 @cli.command()
 @click.argument("session_dir", type=click.Path(file_okay=False, path_type=Path))
 @click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(("table", "json")),  # a tuple: `list` is a command here
+    default="table",
+    show_default=True,
+    help="table: one line per turn, as the run happened. json: the whole document",
+)
+@click.option(
     "--follow",
     is_flag=True,
-    help="Tail a running session: one JSON delta per line until interrupted",
+    help="Tail a running session instead of replaying a finished one",
 )
 @click.option(
     "--detail",
     type=click.Choice(DETAIL_TIERS),  # a tuple: `list` is a command in this module
-    default="summary",
-    show_default=True,
-    help="summary: names, codes, timing, tokens. full: also the bytes each ref names",
+    default=None,
+    help="json only — summary: names, codes, timing, tokens. full: also the bytes each ref names",
 )
-def trajectory(session_dir, follow, detail):
-    """Derive trajectory-v1 from a recorded session directory, as JSON on stdout.
+def trajectory(session_dir, output_format, follow, detail):
+    """Print a session's turns: a table to read, or the trajectory document.
 
     SESSION_DIR is a --record artifact dir (e.g. logs/session_X) or a mirrored
     live session. Nothing in it is written, moved, or locked, and console logs
     are never read: the derivation folds the authoritative ledger only.
+
+    The table is the default because most readers are people. `--format json`
+    is what a program reads, and what `| jq` needs.
     """
+    if output_format == "table" and detail is not None:
+        raise click.UsageError("--detail applies to --format json; the table has one detail tier")
     try:
-        if follow:
-            stream = follow_trajectory(session_dir, detail=detail)
-            try:
-                for delta in stream:
-                    click.echo(delta.model_dump_json())
-            finally:
-                # Ending the follow is what turns a withheld tail into a torn
-                # one, so the last delta is produced by stopping, not by an
-                # event. It goes out through the same channel as every other.
-                final = stream.close()
-                if final is not None:
-                    click.echo(final.model_dump_json())
-            return
-        click.echo(build_trajectory(session_dir, detail=detail).model_dump_json())
+        if output_format == "json":
+            _trajectory_json(session_dir, follow=follow, detail=detail or DETAIL_TIERS[0])
+        else:
+            _trajectory_table(session_dir, follow=follow)
     except KeyboardInterrupt:
         return  # a follower ends when whoever was watching stops watching
     except (OSError, ValueError) as exc:
-        # STDOUT is this command's contract — `sag trajectory | jq` is the point
-        # of it — so a failure puts nothing there and the reason on stderr,
-        # beside click's own parser errors. Plain text, not a rich panel: a
-        # panel hard-wraps the path it is naming and colours a pipe nobody is
-        # reading with a terminal.
+        # STDOUT is `--format json`'s contract — `sag trajectory | jq` is the
+        # point of it — so a failure puts nothing there and the reason on
+        # stderr, beside click's own parser errors. Plain text, not a rich
+        # panel: a panel hard-wraps the path it is naming and colours a pipe
+        # nobody is reading with a terminal.
         #
         # OSError, not FileNotFoundError: a missing directory is one of many
         # ways the I/O this command does can fail, and `--follow` runs for the
@@ -1542,6 +1870,175 @@ def trajectory(session_dir, follow, detail):
         # onto the stream that promised JSON. (Click retires EPIPE on its own.)
         click.echo(f"❌ {exc}", err=True)
         sys.exit(1)
+
+
+#: A run's own artifacts, by the names it writes them under.
+_VERDICT_NAME = "verdict.json"
+_RUN_PIN_NAME = "run-pin.json"
+_PROJECT_META_NAME = "project_meta.json"
+_MODULE_METRICS_NAME = "module_metrics.json"
+_REPORT_METRICS_NAME = "report_metrics.json"
+
+#: Where those artifacts sit inside the directory that holds them — at its root
+#: or under `.setup_agent/`. The same two roots the trajectory builder reads, so
+#: a card and the turns beside it are never read from different copies.
+_RUN_ARTIFACT_ROOTS = (".", ".setup_agent")
+
+
+def _read_run_document(base: Path, name: str) -> Dict[str, Any] | None:
+    """Read one of a run's JSON artifacts, or nothing when it is not readable."""
+
+    for root in _RUN_ARTIFACT_ROOTS:
+        path = base / root / name
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _recorded_run(directory: Path) -> Tuple[Path, Dict[str, Any]] | None:
+    """A recorded run's verdict, and the directory the rest of the run sits in.
+
+    The directory comes back with the verdict because everything else the card
+    reads — the ledger, the run pin, the metrics, the report — has to come from
+    the same copy. Reading the verdict from an archive and the counts from the
+    session that no longer holds any would describe two runs as one.
+
+    Where to look is `resolve_session_dir`'s answer, which is also the one
+    `sag trajectory` uses: the `Next` line this command prints names that
+    command, and the two must agree about where a run lives.
+    """
+
+    if not directory.is_dir():
+        return None
+    base = resolve_session_dir(directory)
+    payload = _read_run_document(base, _VERDICT_NAME)
+    return (base, payload) if payload is not None else None
+
+
+def _live_run(target: str) -> Tuple[Any, Any] | None:
+    """The container's own verdict and the orchestrator that read it.
+
+    The two failures are told apart because they mean different things to
+    whoever is standing at the terminal: a container this host cannot be asked
+    about at all is a Docker problem, and a container with nothing to read is a
+    run that has not reached a verdict.
+    """
+
+    try:
+        # By keyword, and without the prefix: the constructor takes its base
+        # image first, so a container name handed over positionally opens
+        # `sag-default` instead of the container the user asked for.
+        orchestrator = DockerOrchestrator(project_name=target.removeprefix("sag-"))
+    except Exception as exc:  # a reader ends with a sentence, not a traceback
+        logger.debug(f"sag result could not reach Docker for {target}: {exc}")
+        console.print(f"[bold red]❌ Docker could not be asked about {target}: {exc}[/bold red]")
+        return None
+    try:
+        snapshot = read_live_verdict_snapshot(orchestrator)
+    except Exception as exc:
+        logger.debug(f"sag result could not read a verdict from {target}: {exc}")
+        return None
+    if snapshot is None or snapshot.verdict == "unknown":
+        return None
+    return orchestrator, snapshot
+
+
+@cli.command()
+@click.argument("target")
+@click.option("--json", "as_json", is_flag=True, help="Print the result card as JSON")
+def result(target, as_json):
+    """Print the result of a finished run, from a container or a session directory.
+
+    TARGET is a container name (sag-<project>) or a recorded session directory:
+    a --record artifact dir, or a campaign archive that kept the container's
+    copy beside the run. Nothing is written and nothing is re-judged — this
+    prints the result the run itself reached.
+
+    It exits 0 whenever a result could be read, whatever that result was.
+    Reading a run is not running one, so the run's own verdict is printed
+    rather than translated into this command's exit code.
+    """
+
+    directory = Path(target)
+    found = _recorded_run(directory)
+    payload: Dict[str, Any] | None = None
+    run_pin = module_metrics = report_metrics = termination = None
+    project = goal = container = session_dir = report_path = None
+    counts = read_run_counts(None)
+
+    if found is not None:
+        evidence_dir, payload = found
+        session_dir = str(directory)
+        run_pin = _read_run_document(evidence_dir, _RUN_PIN_NAME)
+        module_metrics = _read_run_document(evidence_dir, _MODULE_METRICS_NAME)
+        report_metrics = _read_run_document(evidence_dir, _REPORT_METRICS_NAME)
+        meta = _read_run_document(evidence_dir, _PROJECT_META_NAME) or {}
+        project = meta.get("project_name") or None
+        goal = meta.get("goal") or None
+        counts = read_run_counts(evidence_dir)
+        termination, found_report = recorded_report(directory, evidence_dir)
+        report_path = _report_name_for_block(found_report, session_dir)
+    elif _SEPARATORS.isdisjoint(target):
+        # A name with no path separator in it is a container name, whether or
+        # not the current directory happens to hold something called that.
+        live = _live_run(target)
+        if live is not None:
+            orchestrator, snapshot = live
+            payload = snapshot.model_dump(mode="json")
+            container = orchestrator.container_name
+            project = orchestrator.project_name
+            module_metrics = _read_module_metrics_for_cli(orchestrator)
+            report_metrics = _read_metrics_v2_for_cli(orchestrator)
+            # The container holds the run; the host holds the record of it. The
+            # counts, the model pin and the report are all in the session
+            # directory this run wrote, and reading them is what keeps the two
+            # halves of this one command from printing two different cards.
+            recorded = find_recorded_session(snapshot.run_id)
+            if recorded is not None:
+                session_dir = str(recorded)
+                counts = read_run_counts(recorded)
+                run_pin = _read_run_document(recorded, _RUN_PIN_NAME)
+                termination, found_report = recorded_report(recorded)
+                report_path = _report_name_for_block(found_report, session_dir)
+
+    if payload is None:
+        console.print(f"[bold red]❌ no result could be read from {target}[/bold red]")
+        sys.exit(1)
+
+    card = build_result_card(
+        payload,
+        module_metrics=module_metrics,
+        report_metrics=report_metrics,
+        run_pin=run_pin,
+        **counts,
+        termination=termination,
+        project=project,
+        goal=goal,
+        container=container,
+        session_dir=session_dir,
+        report_path=report_path,
+    )
+    if as_json:
+        click.echo(json.dumps(card.model_dump(mode="json"), indent=2, sort_keys=True))
+        return
+    # `exit_hint=False`: the block's closing line names the code the run exited
+    # with, and this command exits 0 whatever it read. Naming one here would
+    # state something the command did not do.
+    #
+    # `soft_wrap=True`: the block has already fitted every line to this width.
+    # Letting the console wrap them a second time, at the same width and with
+    # no indent, snaps a session path in half against the left margin.
+    console.print(
+        render_result_block(card, width=console.width, exit_hint=False),
+        highlight=False,
+        soft_wrap=True,
+    )
 
 
 @cli.command()

@@ -13,7 +13,7 @@ import {
 import { cn } from "@/lib/utils"
 
 import { DetailHeader } from "./DetailHeader"
-import { VerdictBand } from "./VerdictBand"
+import { ResultBand } from "./ResultBand"
 import { buildDetailTabs, TabBody, type TabId } from "./facets"
 
 /** The tab bar: one nav model where a tab swaps the panel below it. A badge = items
@@ -86,6 +86,7 @@ export function DetailPane({
   onDelete: (workspaceId: string) => Promise<void>
 }) {
   const tabs = useMemo(() => buildDetailTabs(detail), [detail])
+  const tabIds = useMemo(() => tabs.map((tab) => tab.id), [tabs])
   const initial: TabId =
     initialFacet && tabs.some((t) => t.id === initialFacet)
       ? (initialFacet as TabId)
@@ -119,19 +120,19 @@ export function DetailPane({
       />
 
       <div className="shrink-0 bg-card px-5 pb-4 pt-4 sm:px-7">
-        <VerdictBand detail={detail} />
+        <ResultBand
+          availableTabs={tabIds}
+          card={detail.resultCard}
+          onOpenTab={setActive}
+          snapshotStatus={detail.snapshotStatus}
+        />
       </div>
 
       <TabBar active={active} onSelect={setActive} tabs={tabs} />
 
       <main className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-7">
         <div className="mx-auto max-w-[1000px]">
-          <TabBody
-            detail={detail}
-            onOpenFlow={() => setActive("flow")}
-            onSubmitTask={onSubmitTask}
-            tabId={active}
-          />
+          <TabBody detail={detail} onSubmitTask={onSubmitTask} tabId={active} />
         </div>
       </main>
 

@@ -1650,17 +1650,22 @@ class ControlEventSink:
         clock: Callable[[], str] | None = None,
         id_factory: Callable[[int], str] | None = None,
         run_id: str | None = None,
+        observers: tuple[Callable[[str], None], ...] = (),
     ) -> None:
         self.path = Path(path)
         self.run_id = run_id
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._mirror = mirror
+        self._observers: list[Callable[[str], None]] = list(observers)
         self._clock = clock or (
             lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         )
         self._id_factory = id_factory or (lambda sequence: f"control-{sequence:06d}")
         self._lock = threading.RLock()
         self._sequence = self._read_last_sequence()
+        #: Where this sink found the ledger. Lines at or below it belong to an
+        #: earlier process and are never replayed to a late-arriving mirror.
+        self._opening_sequence = self._sequence
 
     def _read_last_sequence(self) -> int:
         if not self.path.exists():
@@ -1677,6 +1682,75 @@ class ControlEventSink:
     @property
     def sequence(self) -> int:
         return self._sequence
+
+    def add_observer(self, observer: Callable[[str], None]) -> None:
+        """Watch every line from here on. Observers never gate the append."""
+
+        with self._lock:
+            self._observers.append(observer)
+
+    def remove_observer(self, observer: Callable[[str], None]) -> bool:
+        """Stop watching. Returns whether this observer was registered.
+
+        A renderer that has finished must come off the sink: the sink outlives
+        it, and feeding a finished renderer raises, which would be logged
+        through stdlib `logging` — unrouted here, so it reaches stderr through
+        `lastResort` and lands on a console this layer exists to keep quiet.
+        """
+
+        with self._lock:
+            try:
+                self._observers.remove(observer)
+            except ValueError:
+                return False
+            return True
+
+    def attach_mirror(self, mirror: Callable[[str], None]) -> bool:
+        """Fill in the container mirror on a sink that was built without one.
+
+        The CLI now asks the session for its sink before the agent exists, so
+        the agent's mirror arrives second and must still be installed — the
+        container copy is what `--record` archives, and its absence is silent.
+        Returns whether this call installed it: an existing mirror is never
+        displaced, because two writers appending to one container file would
+        interleave.
+
+        Anything this sink already emitted is handed to the new mirror first,
+        in order, so the container copy starts where the host copy starts. Only
+        this sink's own appends are replayed — a sink opened on a ledger that
+        already had lines does not re-send someone else's run.
+        """
+
+        with self._lock:
+            if self._mirror is not None:
+                return False
+            self._mirror = mirror
+            self._backfill_mirror(mirror)
+            return True
+
+    def _backfill_mirror(self, mirror: Callable[[str], None]) -> None:
+        """Replay this sink's own appends to a mirror that arrived late."""
+
+        if self._sequence <= self._opening_sequence or not self.path.exists():
+            return
+        with self.path.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                if not raw.strip():
+                    continue
+                try:
+                    sequence = int(ControlEvent.model_validate_json(raw).sequence)
+                except Exception:  # a torn line is not ours to re-send
+                    continue
+                if self._opening_sequence < sequence <= self._sequence:
+                    try:
+                        mirror(raw if raw.endswith("\n") else raw + "\n")
+                    except Exception as exc:  # host truth outranks the mirror
+                        logging.getLogger(__name__).warning(
+                            "control-event mirror backfill failed at sequence %s: %s",
+                            sequence,
+                            exc,
+                        )
+                        return
 
     def emit(
         self,
@@ -1717,6 +1791,13 @@ class ControlEventSink:
                 except Exception as exc:  # host truth remains append-only if mirroring is down
                     logging.getLogger(__name__).warning(
                         "control-event mirror failed at sequence %s: %s", sequence, exc
+                    )
+            for observer in tuple(self._observers):
+                try:
+                    observer(line)
+                except Exception as exc:  # a renderer may fail; the ledger may not
+                    logging.getLogger(__name__).warning(
+                        "control-event observer failed at sequence %s: %s", sequence, exc
                     )
             return event
 

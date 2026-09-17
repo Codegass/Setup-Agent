@@ -687,6 +687,10 @@ from typing import Any
 
 from verdict_rate_fakes import complete_verdict_rates
 
+#: A snapshot cross-checks that its task completion and CI comparison belong to
+#: the same run, so every run_id in a fixture must be this one.
+RUN_ID = "20260914_210609_965730_e39856b237f2_9183-7-953da846d195"
+
 CLEAN_TEST_COUNTS = {
     "executed": 994,
     "passed": 933,
@@ -701,7 +705,7 @@ def snapshot_dict(**overrides: Any) -> dict[str, Any]:
 
     payload: dict[str, Any] = {
         "schema_version": 5,
-        "run_id": "20260914_210609_965730_e39856b237f2_9183-7-953da846d195",
+        "run_id": RUN_ID,
         "finalized_at": "2026-09-14T21:14:51Z",
         "input_refs": [],
         "verdict": "success",
@@ -732,7 +736,7 @@ def snapshot_dict(**overrides: Any) -> dict[str, Any]:
         "conflicts": [],
         "phase_records": [],
         "task_completion": {
-            "run_id": "20260914_210609_965730_e39856b237f2_9183-7-953da846d195",
+            "run_id": RUN_ID,
             "task_sha256": "a" * 64,
             "status": "complete",
             "steps": [
@@ -750,7 +754,7 @@ def snapshot_dict(**overrides: Any) -> dict[str, Any]:
         "ci_comparison": {
             "schema_version": 1,
             "status": "no_matched_cell",
-            "run_id": "20260914_210609_965730_e39856b237f2_9183-7-953da846d195",
+            "run_id": RUN_ID,
             "repo": "apache/commons-cli",
             "target_sha": "e17111798da51037659b3594d9c0b3b525040081",
             "target_record_sha256": None,
@@ -875,6 +879,7 @@ def module_metrics(**overrides: Any) -> dict[str, Any]:
 
 __all__ = [
     "CLEAN_TEST_COUNTS",
+    "RUN_ID",
     "attainment",
     "module_metrics",
     "phase_record",
@@ -924,7 +929,7 @@ from sag.agent.verdict_finalizer import (
 from sag.result_card.models import ResultStats
 from sag.result_card.rows import setup_row, task_row
 
-from result_card_fakes import phase_record, snapshot_dict
+from result_card_fakes import RUN_ID, phase_record, snapshot_dict
 
 
 def _snapshot(**overrides) -> RunVerdictSnapshot:
@@ -1015,7 +1020,7 @@ def test_task_row_reports_a_failed_step_with_its_reason():
     snapshot = _snapshot(
         verdict="partial",
         task_completion={
-            "run_id": "r",
+            "run_id": RUN_ID,
             "task_sha256": "b" * 64,
             "status": "incomplete",
             "steps": [
@@ -1054,7 +1059,7 @@ def test_task_row_glosses_its_unavailable_reason():
     snapshot = _snapshot(
         verdict="partial",
         task_completion={
-            "run_id": "r",
+            "run_id": RUN_ID,
             "task_sha256": None,
             "status": "unavailable",
             "steps": [],
@@ -1150,8 +1155,10 @@ def setup_row(snapshot: Any, *, stats: ResultStats, termination: Any | None) -> 
 
     verdict = str(snapshot.verdict)
     phases = None
-    if stats.phases_total:
-        phases = f"{stats.phases_completed or 0}/{stats.phases_total} phases"
+    # Both halves or neither: a fraction with an invented numerator reads as a
+    # measurement, and "0/5 phases" is a very different claim from "not counted".
+    if stats.phases_total is not None and stats.phases_completed is not None:
+        phases = f"{stats.phases_completed}/{stats.phases_total} phases"
     headline = _join(
         phases,
         f"{stats.turns:,} turns" if stats.turns is not None else None,
@@ -1470,8 +1477,11 @@ def build_row(snapshot: Any, *, module_metrics: Any = None) -> ResultRow:
     judgment = str(evidence.judgment)
     succeeded = evidence.reactor_modules_succeeded
     total = evidence.reactor_modules_total
-    if total:
-        headline = f"{succeeded or 0}/{total} modules built"
+    # `reactor_modules_succeeded` and `_total` are parsed independently, so one
+    # can be absent while the other is known. Printing "0/4 modules built" for
+    # that record would report a total build failure that never happened.
+    if succeeded is not None and total is not None:
+        headline = f"{succeeded}/{total} modules built"
     else:
         headline = judgment
 
@@ -1517,6 +1527,9 @@ def _lower_bounded(report_metrics: Any) -> bool:
 
 
 def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
+    # pytest's default `python_functions = test*` collects this production
+    # function as a test case in every module that imports it. The marker is the
+    # standard remedy and has precedent in `sag/evidence.py`.
     """How many tests ran and how they came out, with skips out of the rate."""
 
     stats = snapshot.test_stats
@@ -1524,6 +1537,14 @@ def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
     raw = stats.raw
     judgment = str(stats.judgment)
     status = _TEST_JUDGMENT_WORD.get(judgment, "unavailable")
+    # `judgment` defaults to "unknown", so a record can carry real counts and no
+    # judgment about them. The counts stay in the headline — they are real — but
+    # the row must say why its status word is "unavailable".
+    unjudged_reason = (
+        "the run recorded test outcomes but no judgment about them"
+        if status == "unavailable"
+        else None
+    )
 
     if unique.executed <= 0:
         return ResultRow(
@@ -1570,7 +1591,11 @@ def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
         tone=tone,
         headline=headline,
         detail=_join(rate_text, raw_text) or None,
+        reason=unjudged_reason,
     )
+
+
+tests_row.__test__ = False
 
 
 def coverage_row(snapshot: Any) -> ResultRow:
@@ -1635,10 +1660,27 @@ from result_card_fakes import attainment
 
 
 def _evaluated(**overrides) -> dict:
+    """An evaluated comparison, with the certificate the model insists on.
+
+    `CIComparisonSnapshot` refuses `status="evaluated"` unless a certificate is
+    bound and both digests are present ("evaluated CI comparison requires bound
+    certificate and target"), so this helper builds a real one. Follow the
+    existing fixture in `tests/test_ci_comparison_surfaces.py` for its shape;
+    a certificate that merely gets past validation is not good enough, because
+    `ci_row` reads the attainment beside it.
+    """
+
     comparison = dict(snapshot_dict()["ci_comparison"])
     comparison.update(
         {
             "status": "evaluated",
+            "certificate": _CI_CERTIFICATE,
+            "certificate_input_sha256": canonical_sha256(
+                _CI_CERTIFICATE_INPUT.model_dump(mode="json")
+            ),
+            "target_record_sha256": canonical_sha256(
+                {"repo": comparison["repo"], "sha": comparison["target_sha"]}
+            ),
             "attainment": attainment(**overrides),
             "acceptance_command": "mvn -B -f pom.xml -V clean test --batch-mode",
             "receipt_ids": ["inv-maven-1-17c8a2e62d8a-0001"],
@@ -1758,14 +1800,6 @@ _CI_TONE: dict[str, Tone] = {
 _MAX_RED_IDS = 10
 
 NOT_COMPARED = "not compared"
-
-_REPORT_TONE: dict[str, Tone] = {
-    "delivered": "neutral",
-    "skipped": "neutral",
-    "failed": "attention",
-    "unavailable": "attention",
-}
-
 
 def ci_row(snapshot: Any) -> ResultRow:
     """How this run measures against the project's own CI on the same commit."""
@@ -1919,7 +1953,7 @@ from sag.agent.verdict_finalizer import (
 from sag.result_card.build import build_result_card
 from sag.result_card.models import ROW_ORDER
 
-from result_card_fakes import module_metrics, phase_record, snapshot_dict
+from result_card_fakes import RUN_ID, module_metrics, phase_record, snapshot_dict
 
 
 def _termination(delivery=ReportDeliveryStatus.DELIVERED) -> RunTermination:
@@ -1993,7 +2027,7 @@ def test_attention_leads_with_incomplete_task_steps():
         snapshot_dict(
             verdict="partial",
             task_completion={
-                "run_id": "r",
+                "run_id": RUN_ID,
                 "task_sha256": "c" * 64,
                 "status": "incomplete",
                 "steps": [
@@ -2657,10 +2691,12 @@ Create `tests/test_result_card_markdown.py`:
 ```python
 """The report's Result section is the same seven rows as the terminal block."""
 
+import re
+
 from sag.result_card.build import build_result_card
 from sag.result_card.markdown import render_result_card_markdown
 
-from result_card_fakes import module_metrics, snapshot_dict
+from result_card_fakes import RUN_ID, module_metrics, snapshot_dict
 
 
 def _lines(**kwargs) -> list[str]:
@@ -2699,7 +2735,7 @@ def test_detail_and_reason_are_joined_in_the_third_column():
 def test_pipes_inside_a_command_do_not_break_the_table():
     snapshot = snapshot_dict(
         task_completion={
-            "run_id": "r",
+            "run_id": RUN_ID,
             "task_sha256": "d" * 64,
             "status": "complete",
             "steps": [
@@ -2716,7 +2752,9 @@ def test_pipes_inside_a_command_do_not_break_the_table():
         }
     )
     row = next(line for line in _lines(snapshot=snapshot) if "**Required task**" in line)
-    assert row.count("|") == 4
+    # An escaped pipe is still a `|` character, so count the column separators:
+    # every pipe that is not preceded by a backslash.
+    assert len(re.findall(r"(?<!\\)\|", row)) == 4
     assert r"\|" in row
 
 
@@ -3139,7 +3177,12 @@ Apply it by splitting each line from `format_evidence_layer_lines` on its first 
 - [ ] **Step 5: Run the report tests**
 
 Run: `PYTHONPATH=.:tests uv run pytest tests/test_report_honesty.py tests/test_report_tool_metrics_artifact.py tests/test_snapshot_surface_agreement.py -v`
-Expected: PASS. `test_report_honesty.py`'s existing four-line block assertion (around line 221) must be rewritten to assert the new table's rows; keep it asserting the same facts, not the same formatting.
+Expected: PASS after two edits to `tests/test_report_honesty.py`:
+
+- the four-line block assertion around line 221 is rewritten to assert the new table's rows — keep it asserting the same facts, not the same formatting;
+- line 806's `assert lines[0] == "## 🧾 Metrics-v2 Evidence Layers"` becomes `assert lines[0] == "## Evidence accounting"`, and the `"Claimed latest subjects: unavailable"` assertion below it becomes the new label, `"Test classes identified by module and name"`.
+
+Both are the only places in the repo outside `report_tool.py` that pin those strings (`grep -rn "Metrics-v2 Evidence Layers" src tests`).
 
 - [ ] **Step 6: Commit**
 

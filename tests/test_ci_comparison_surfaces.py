@@ -1,6 +1,7 @@
 """Reader and command-entry agreement; producer tests live in test_ci_comparison."""
 
 import hashlib
+import re
 import json
 
 import pytest
@@ -63,6 +64,20 @@ def comparison_fixture(*, missing_scope=False):
     )
 
 
+def _block_ci_fragments(comparison):
+    """What the result block must state about a sealed comparison."""
+
+    result = comparison.attainment
+    if result is None:
+        return ["not compared", *comparison.reasons]
+    score = (
+        f"{result.alpha.numerator:,}/{result.alpha.denominator:,}"
+        if result.alpha is not None
+        else "scope score unavailable"
+    )
+    return [str(result.verdict).replace("_", " "), score, result.cell_id]
+
+
 @pytest.mark.parametrize("status", ["met", "missing_scope", "no_target", "unavailable"])
 def test_published_comparison_is_identical_across_every_surface(snapshot_factory, status):
     comparison = (
@@ -78,10 +93,16 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     )
     surfaces = SurfaceHarness().render_all(snapshot)
     expected = render_ci_comparison_lines(comparison)
-    for surface in (surfaces.cli, surfaces.markdown, surfaces.condensed):
+    assert surfaces.condensed.verdict == "success"
+    for line in expected:
+        assert line in surfaces.condensed.text
+    # The report and the block print the same result card, so both say the same
+    # result in its words; the agreement is checked against the sealed
+    # comparison itself rather than against the condensed log's phrasing.
+    for surface in (surfaces.markdown, surfaces.cli):
         assert surface.verdict == "success"
-        for line in expected:
-            assert line in surface.text
+        for fragment in _block_ci_fragments(comparison):
+            assert fragment in surface.text
     files = {
         VERDICT_PATH: snapshot.model_dump_json(),
         "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
@@ -92,8 +113,33 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     second = _session_detail(item, "sag-tvm", None).model_dump(mode="json", by_alias=True)
     assert first == second
     assert first["ciComparison"] == comparison.model_dump(mode="json")
-    assert first["ciComparisonLines"] == expected
     assert first["canonicalVerdict"] == "success"
+    # The Workbench serves the card rather than rendering it, so the same
+    # fragments the block and the report print are read out of the CI row —
+    # each from the field that is supposed to carry it. Joining the five fields
+    # into one string and matching substrings let a fragment that had landed in
+    # the wrong field pass, which is most of what this fence is for.
+    ci = next(row for row in first["resultCard"]["rows"] if row["key"] == "ci")
+    result = comparison.attainment
+    if result is None:
+        assert ci["status"] == "not compared"
+        assert ci["headline"] == "not compared"
+        for reason in comparison.reasons[:1]:
+            assert ci["reason"] and reason in ci["reason"]
+    else:
+        word = {"not_met": "not met", "invalid": "not scored"}.get(
+            str(result.verdict), str(result.verdict)
+        )
+        assert ci["status"] == word
+        if result.alpha is not None:
+            assert ci["headline"] == (
+                f"{word} {result.alpha.numerator:,}/{result.alpha.denominator:,}"
+            )
+        elif word == "not scored":
+            assert ci["headline"] == word
+        else:
+            assert ci["headline"] == f"{word} · scope score unavailable"
+        assert ci["detail"] and f'cell "{result.cell_id}"' in ci["detail"]
     if status == "met":
         assert comparison.attainment.verdict == "met"
         assert comparison.attainment.alpha is not None
@@ -112,7 +158,9 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     )
     withdrawn = _setup_artifact_item(orchestrator, "sag-tvm")
     assert withdrawn["ci_comparison"] is None
-    assert "unavailable" in withdrawn["ci_comparison_lines"][0]
+    # Nothing left to copy: the detail offers no card at all rather than one
+    # assembled from a record it can no longer stand behind.
+    assert withdrawn["result_card"] is None
 
 
 def test_cli_loads_explicit_target_bytes_before_starting_agent(monkeypatch, tmp_path):
@@ -137,7 +185,9 @@ def test_cli_loads_explicit_target_bytes_before_starting_agent(monkeypatch, tmp_
     pinned = RecordingSetupAgent.calls[0]["ci_target"]
     assert pinned.record == target
     assert pinned.raw_sha256 == hashlib.sha256(raw).hexdigest()
-    assert "Official CI: unavailable" in result.output
+    # Adjacency, not two free-floating substrings: the row's label and its word
+    # on one line is the thing that can drift apart.
+    assert re.search(r"Official CI\s+not compared", result.output), result.output
     assert "[fully]" not in result.output
 
 

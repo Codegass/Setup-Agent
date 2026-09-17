@@ -17,7 +17,7 @@ from sag.config import Config
 
 @pytest.fixture
 def assembled_agent(monkeypatch):
-    config = Config(workspace_path="/workspace", ui_mode=False)
+    config = Config(workspace_path="/workspace")
     monkeypatch.setattr(engine_module, "get_config", lambda: config)
     monkeypatch.setattr(
         engine_module, "ReactLLMClient", lambda **kwargs: SimpleNamespace(setup=lambda: None)
@@ -121,7 +121,6 @@ def test_two_public_setup_commands_bind_the_new_run(assembled_agent, monkeypatch
     )
     monkeypatch.setattr(agent_module.ContextManager, "get_current_context_info", lambda self: {})
     monkeypatch.setattr(agent, "_save_project_metadata", lambda **kwargs: True)
-    monkeypatch.setattr(agent, "_provide_setup_summary", lambda *args: None)
     completed = RunTermination(
         termination=RunTerminationStatus.COMPLETED, report_delivery_status="skipped"
     )

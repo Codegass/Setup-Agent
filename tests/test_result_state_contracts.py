@@ -30,7 +30,6 @@ class FakeLogger:
 
 
 class FakeConfig:
-    ui_mode = False
     max_iterations = 3
 
 
@@ -91,7 +90,6 @@ def test_run_task_uses_run_task_completion_without_appending_setup_todo(monkeypa
     agent.orchestrator = FakeOrchestrator()
     agent.max_iterations = 3
     agent.console = Console(file=StringIO())
-    agent.ui_manager = None
     agent.agent_logger = FakeLogger()
     agent._ensure_container_running = lambda project_name: True
 
@@ -135,7 +133,6 @@ def test_run_task_does_not_start_model_when_framework_survey_fails(monkeypatch):
     agent.orchestrator = FakeOrchestrator()
     agent.max_iterations = 3
     agent.console = Console(file=StringIO())
-    agent.ui_manager = None
     agent.agent_logger = FakeLogger()
     agent._ensure_container_running = lambda project_name: True
 
@@ -189,14 +186,13 @@ def test_run_task_bootstraps_overlay_after_authority_before_context_io(monkeypat
     agent.run_id = "run-overlay-order"
     agent.run_evidence_state = None
     agent.context_manager = None
-    agent.config = SimpleNamespace(workspace_path="/workspace", ui_mode=False)
+    agent.config = SimpleNamespace(workspace_path="/workspace")
     agent.orchestrator = SimpleNamespace()
     agent.agent_logger = FakeLogger()
     agent.phase_machine = None
     agent.context_journal = None
     agent.verdict_finalizer = None
     agent.control_event_sink = None
-    agent.ui_manager = None
     agent._initialize_control_recording = lambda: events.append("authority")
     agent._initialize_tools = lambda workflow_mode: events.append("tools") or []
     agent._bind_advisor_consult = lambda: None
@@ -234,7 +230,7 @@ def test_overlay_bootstrap_failure_prevents_context_io(monkeypatch):
     agent.run_id = "run-overlay-failure"
     agent.run_evidence_state = None
     agent.context_manager = None
-    agent.config = SimpleNamespace(workspace_path="/workspace", ui_mode=False)
+    agent.config = SimpleNamespace(workspace_path="/workspace")
     agent.orchestrator = SimpleNamespace()
     agent.agent_logger = FakeLogger()
     agent._initialize_control_recording = lambda: events.append("authority")
