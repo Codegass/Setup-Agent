@@ -24,7 +24,7 @@ function testIssues(d: ExecutionSessionDetail): number | null {
 
 export type TabId =
   | "overview"
-  | "trajectory"
+  | "turns"
   | "tests"
   | "build"
   | "ci"
@@ -46,16 +46,22 @@ export interface TabMeta {
  * the rest are offered only when the run produced something for them.
  */
 export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
-  // Trajectory leads the panels because it is the run itself, turn by turn, and
-  // for a real session it is never gated on data being present: it derives from
+  // Turns leads the panels because it is the run itself, turn by turn, and for
+  // a real session it is never gated on data being present: it derives from
   // the control ledger every run writes, and a run with no ledger YET says so
   // in its own words. A demo session is the one case where there is no ledger
   // to wait for — the read models are fabricated and stand for no run, which is
   // why the builder refuses to name a session directory for one — so the tab is
   // not offered rather than left to answer "unavailable" forever.
+  //
+  // `turns`, not `trajectory`: the terminal numbers them `#1 … #24` and
+  // `sag inspect --turn N` names one, so a turn is the word a reader already
+  // has. `trajectory-v1` is the derivation this tab reads and `sag trajectory`
+  // the command that prints it; both keep their names, because neither is a
+  // thing a person clicks.
   const tabs: TabMeta[] = [{ id: "overview", label: "Overview" }]
   if (!d.demo) {
-    tabs.push({ id: "trajectory", label: "Trajectory" })
+    tabs.push({ id: "turns", label: "Turns" })
   }
 
   const failing = testIssues(d)
@@ -93,8 +99,8 @@ export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
 export interface TabBodyProps {
   tabId: TabId
   detail: ExecutionSessionDetail
-  /** Used by the Overview goal button to jump into the Trajectory tab. Omitted
-   *  when this run has no such tab, so the button is not offered at all. */
+  /** Used by the Overview goal button to jump into the Turns tab. Omitted when
+   *  this run has no such tab, so the button is not offered at all. */
   onOpenFlow?: () => void
   onSubmitTask?: (
     workspaceId: string,
@@ -104,15 +110,15 @@ export interface TabBodyProps {
 }
 
 /**
- * Renders the panel body for a tab. `overview` and `trajectory` use the dedicated
+ * Renders the panel body for a tab. `overview` and `turns` use the dedicated
  * OverviewTab/TrajectoryTab panels; the rest delegate to the existing session
- * renderers. `onOpenFlow` lets the Overview goal button jump into Trajectory.
+ * renderers. `onOpenFlow` lets the Overview goal button jump into Turns.
  */
 export function TabBody({ tabId, detail, onOpenFlow }: TabBodyProps) {
   switch (tabId) {
     case "overview":
       return <OverviewTab detail={detail} onOpenFlow={onOpenFlow} />
-    case "trajectory":
+    case "turns":
       return <TrajectoryTab live={isLiveSessionStatus(detail.status)} sessionId={detail.id} />
     case "tests":
       return <TestFacet detail={detail} />

@@ -46,7 +46,7 @@ function Tile({
 }
 
 /**
- * Overview tab: the always-visible agent goal button (jumps to Trajectory),
+ * Overview tab: the always-visible agent goal button (jumps to Turns),
  * build and test summaries, the per-module overview table,
  * and the "needs attention" card. Markup/styling mirrors WorkbenchDetail.dc.html
  * lines 100–200 (the Overview block in the AFTER template).
@@ -101,7 +101,7 @@ export function OverviewTab({
             <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground">Goal</span>
             <span className="min-w-0 flex-1 truncate text-[13px] leading-snug text-foreground">{goal}</span>
             {progress ? <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{progress}</span> : null}
-            <span className="shrink-0 text-[12px] font-semibold text-primary">View the trajectory →</span>
+            <span className="shrink-0 text-[12px] font-semibold text-primary">View the turns →</span>
           </button>
         ) : (
           <div className="mb-3 flex w-full items-center gap-3 rounded-[10px] border border-border bg-card px-4 py-2.5 text-left">

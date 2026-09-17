@@ -134,7 +134,7 @@ export function DetailPane({
           <TabBody
             detail={detail}
             onOpenFlow={
-              tabIds.includes("trajectory") ? () => setActive("trajectory") : undefined
+              tabIds.includes("turns") ? () => setActive("turns") : undefined
             }
             onSubmitTask={onSubmitTask}
             tabId={active}

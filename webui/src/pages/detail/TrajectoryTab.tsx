@@ -226,7 +226,7 @@ export function TrajectoryTab({ sessionId, live }: { sessionId: string; live: bo
   if (!doc) {
     return (
       <Card className="max-w-xl p-5">
-        <div className="text-[15px] font-semibold text-foreground">Trajectory unavailable</div>
+        <div className="text-[15px] font-semibold text-foreground">Turns unavailable</div>
         <div className="mt-2 font-mono text-[12px] text-status-failed">{error}</div>
         <Button className="mt-4" onClick={() => void load()} type="button" variant="outline">
           Retry

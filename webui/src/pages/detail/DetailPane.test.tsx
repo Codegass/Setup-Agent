@@ -135,7 +135,7 @@ describe("DetailPane", () => {
     expect(screen.getByRole("button", { name: /^Overview/ })).toHaveAttribute("aria-current", "false")
   })
 
-  it("opens the trajectory from the result band's Setup row", async () => {
+  it("opens the turns from the result band's Setup row", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -154,7 +154,7 @@ describe("DetailPane", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind Setup" }))
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /^Trajectory/ })).toHaveAttribute(
+      expect(screen.getByRole("button", { name: /^Turns/ })).toHaveAttribute(
         "aria-current",
         "true",
       ),

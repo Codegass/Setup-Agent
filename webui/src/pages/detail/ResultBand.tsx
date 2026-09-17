@@ -8,7 +8,7 @@ import type { TabId } from "./facets"
 /** Which tab answers each row. Clicking a row is the two-click path from a
  *  number to the evidence behind it. */
 const ROW_TAB: Record<RowKey, TabId> = {
-  setup: "trajectory",
+  setup: "turns",
   task: "evidence",
   build: "build",
   tests: "tests",

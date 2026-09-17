@@ -58,7 +58,7 @@ describe("buildDetailTabs", () => {
   it("offers the tabs in reading order", () => {
     expect(buildDetailTabs(detailWithEverything()).map((tab) => tab.id)).toEqual([
       "overview",
-      "trajectory",
+      "turns",
       "tests",
       "build",
       "ci",
@@ -71,7 +71,7 @@ describe("buildDetailTabs", () => {
   it("names each tab in words a first-time reader can follow", () => {
     expect(buildDetailTabs(detailWithEverything()).map((tab) => tab.label)).toEqual([
       "Overview",
-      "Trajectory",
+      "Turns",
       "Tests",
       "Build",
       "Official CI",
@@ -124,21 +124,21 @@ describe("buildDetailTabs", () => {
   it("puts overview first, then the run itself", () => {
     const tabs = buildDetailTabs(detail())
     expect(tabs[0].id).toBe("overview")
-    expect(tabs.map((t) => t.id).slice(0, 2)).toEqual(["overview", "trajectory"])
+    expect(tabs.map((t) => t.id).slice(0, 2)).toEqual(["overview", "turns"])
   })
 
-  it("keeps the trajectory tab for every session that ran", () => {
-    // It does not wait on a context trace: the trajectory is derived from the
+  it("keeps the turns tab for every session that ran", () => {
+    // It does not wait on a context trace: the turns are derived from the
     // control ledger, which every run writes.
-    expect(buildDetailTabs(detail({ context: ctx })).map((t) => t.id)).toContain("trajectory")
+    expect(buildDetailTabs(detail({ context: ctx })).map((t) => t.id)).toContain("turns")
   })
 
-  it("omits the trajectory for a demo session, which never ran and wrote no ledger", () => {
+  it("omits the turns for a demo session, which never ran and wrote no ledger", () => {
     // `sag ui --demo` fabricates every read model; there is no session
     // directory behind one, which is why the builder refuses to name one. The
     // tab offered a reader a panel that could only ever say "unavailable".
     const tabs = buildDetailTabs(detail({ demo: true })).map((t) => t.id)
-    expect(tabs).not.toContain("trajectory")
+    expect(tabs).not.toContain("turns")
     expect(tabs[0]).toBe("overview")
   })
 
