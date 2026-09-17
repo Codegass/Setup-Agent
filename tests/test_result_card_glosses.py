@@ -104,3 +104,78 @@ def test_known_code_returns_its_sentence():
     assert gloss("official_ci_cell_not_matched") == (
         "no CI job on this commit matches the run's JDK and OS"
     )
+
+
+#: Every conflict id the archive actually contains, with how many distinct runs
+#: recorded it, measured over the 681 `verdict.json` under `logs/` on
+#: 2026-09-17. The fence above enumerates the codes three modules export as
+#: named constants; these are the ones that reach a reader in practice, and 43
+#: of the 53 distinct ids — 303 of 779 occurrences — printed as bare machine
+#: words on the terminal, in the report and in the browser.
+#:
+#: An id carrying a handle after a colon is listed by its family: the handle
+#: identifies one job or one attempt and is for a bug report, not for a reader.
+OBSERVED_CONFLICTS: dict[str, int] = {
+    "maven_reactor_unverified": 73,
+    "metrics_conflict": 41,
+    "test_primary_coordinate_unresolved": 41,
+    "build_validation_failed": 36,
+    "acceptance_task_incomplete": 30,
+    "build_requirements_unavailable": 18,
+    "jdk_mismatch": 11,
+    "build_receipt_module_scope_unavailable": 10,
+    "maven_success_vs_test_failures": 5,
+    "acceptance_task_unavailable": 4,
+    "job_barrier_integrity_failure": 2,
+    "build_receipt_scope_unavailable": 1,
+    "job_terminal_unpersisted": 20,
+    "job_live_at_close": 7,
+    "forced_test_attempt_nonreceipt": 4,
+}
+
+
+def test_every_conflict_the_archive_records_reads_as_a_sentence():
+    """Measured, not enumerated from constants — that is what let these through.
+
+    `test_inventory_covers_every_producing_module` above covers the three
+    modules that export their codes as named constants, and passes. These ids
+    are raised inline, so nothing enumerated them and nobody counted how often
+    they occur. They are 39% of every conflict occurrence in the archive.
+    """
+
+    unglossed = {code for code in OBSERVED_CONFLICTS if gloss(code) == code}
+    assert not unglossed, (
+        "conflict ids a reader meets as bare machine words: "
+        + ", ".join(f"{code} ({OBSERVED_CONFLICTS[code]} runs)" for code in sorted(unglossed))
+    )
+
+
+def test_a_conflict_that_carries_a_handle_is_read_by_its_family():
+    """`job_live_at_close:58db946542a8` is one fact plus one handle.
+
+    The handle names which job, which is what a bug report quotes and what no
+    reader of the Notes list can use. Without this, 31 of the archive's
+    occurrences printed a hex id on a line of English sentences.
+    """
+
+    assert gloss("job_live_at_close:58db946542a8") == gloss("job_live_at_close")
+    assert gloss("job_terminal_unpersisted:083f87b9600d") == gloss("job_terminal_unpersisted")
+    assert gloss(
+        "forced_test_attempt_nonreceipt:test-1:/workspace/ignite:maven:"
+        "candidate_mismatch:FORCED_TEST_CANDIDATE_MISMATCH"
+    ) == gloss("forced_test_attempt_nonreceipt")
+    # A family nobody glossed still shows the whole id, handle and all: there
+    # is nothing else to show, and half an unknown code is worse than all of it.
+    assert gloss("never_seen_family:abc123") == "never_seen_family:abc123"
+
+
+def test_the_handle_families_are_the_ones_the_archive_carries():
+    """A guard on the guard: the three families above are really suffixed.
+
+    If one of them stopped carrying a handle this test fails rather than the
+    family test passing for the wrong reason.
+    """
+
+    for family in ("job_live_at_close", "job_terminal_unpersisted", "forced_test_attempt_nonreceipt"):
+        assert gloss(family) != family, f"{family} itself must be glossed"
+        assert gloss(f"{family}:handle") == gloss(family)

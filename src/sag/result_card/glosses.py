@@ -84,15 +84,54 @@ REASON_GLOSS: dict[str, str] = {
     "test_execution_interrupted": "the test run stopped before it finished; the counts are what it reached",
     "test_stats_basis_incomparable": "two test counts were measured differently and cannot be combined",
     "build_oracle_divergence": "two checks disagree about whether the build succeeded",
+    # Conflicts raised inline by the validator, the runners and the job layer.
+    # None of these is exported as a named constant, so the inventory test
+    # above cannot reach them; they are 39% of every conflict occurrence in the
+    # archive and each one used to print as a bare machine word.
+    "maven_reactor_unverified": "which modules Maven built could not be confirmed from the build output",
+    "metrics_conflict": "two of the run's own measurements of the same thing disagree",
+    "test_primary_coordinate_unresolved": "which project directory the test reports came from could not be worked out",
+    "build_validation_failed": "the build did not succeed when its output was checked",
+    "build_requirements_unavailable": "what the project needs in order to build could not be read",
+    "jdk_mismatch": "the Java version this run used is not the one the project asks for",
+    "build_receipt_module_scope_unavailable": "a build record did not say which modules it covered",
+    "build_receipt_scope_unavailable": "the run's build records could not be tied to the checkout it ran on",
+    "maven_success_vs_test_failures": "Maven reported success while tests were failing",
+    # Required task, raised as `acceptance_task_<status>`.
+    "acceptance_task_incomplete": "one or more required task steps did not finish",
+    "acceptance_task_unavailable": "whether the required task finished could not be established",
+    # Background jobs. These arrive with the job's handle after a colon.
+    "job_terminal_unpersisted": "a background job finished and its result was never written down",
+    "job_live_at_close": "a background job was still running when the run ended",
+    "job_barrier_integrity_failure": "the record of waiting for a background job is incomplete",
+    "forced_test_attempt_nonreceipt": "a test attempt left no usable record of what it ran",
 }
 
 KNOWN_REASON_CODES: frozenset[str] = frozenset(REASON_GLOSS)
 
 
+def _sentence(code: str) -> str | None:
+    """The sentence for ``code``, reading past a handle when it carries one.
+
+    Some conflicts name the thing they are about after a colon —
+    ``job_live_at_close:58db946542a8``, and the forced-test attempt id with
+    four more fields behind it. The family is the fact; the handle identifies
+    one job for a bug report and is nothing a reader of a Notes list can use.
+    An unknown family keeps its whole id, handle included: half an unfamiliar
+    code is worse than all of it.
+    """
+
+    sentence = REASON_GLOSS.get(code)
+    if sentence:
+        return sentence
+    family, separator, _ = code.partition(":")
+    return REASON_GLOSS.get(family) if separator else None
+
+
 def gloss(code: str) -> str:
     """Return the sentence for ``code``, or the code itself when unglossed."""
 
-    return REASON_GLOSS.get(code) or code
+    return _sentence(code) or code
 
 
 def explain(code: str) -> str:
@@ -103,7 +142,7 @@ def explain(code: str) -> str:
     printing it twice — ``CODE (CODE)`` — reads as two different facts.
     """
 
-    sentence = REASON_GLOSS.get(code)
+    sentence = _sentence(code)
     return f"{sentence} ({code})" if sentence else code
 
 
@@ -114,7 +153,7 @@ def cited(code: str) -> str:
     reader scans codes down the left edge.
     """
 
-    sentence = REASON_GLOSS.get(code)
+    sentence = _sentence(code)
     return f"{code}: {sentence}" if sentence else code
 
 

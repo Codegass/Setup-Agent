@@ -86,11 +86,44 @@ export const REASON_GLOSS: Record<string, string> = {
   "test_execution_interrupted": "the test run stopped before it finished; the counts are what it reached",
   "test_stats_basis_incomparable": "two test counts were measured differently and cannot be combined",
   "build_oracle_divergence": "two checks disagree about whether the build succeeded",
+  // Conflicts raised inline by the validator, the runners and the job layer.
+  // None is exported as a named constant on the Python side, so the inventory
+  // test there cannot reach them; they are 39% of every conflict occurrence in
+  // the archive and each one used to print as a bare machine word.
+  "maven_reactor_unverified": "which modules Maven built could not be confirmed from the build output",
+  "metrics_conflict": "two of the run's own measurements of the same thing disagree",
+  "test_primary_coordinate_unresolved": "which project directory the test reports came from could not be worked out",
+  "build_validation_failed": "the build did not succeed when its output was checked",
+  "build_requirements_unavailable": "what the project needs in order to build could not be read",
+  "jdk_mismatch": "the Java version this run used is not the one the project asks for",
+  "build_receipt_module_scope_unavailable": "a build record did not say which modules it covered",
+  "build_receipt_scope_unavailable": "the run's build records could not be tied to the checkout it ran on",
+  "maven_success_vs_test_failures": "Maven reported success while tests were failing",
+  // Required task, raised as `acceptance_task_<status>`.
+  "acceptance_task_incomplete": "one or more required task steps did not finish",
+  "acceptance_task_unavailable": "whether the required task finished could not be established",
+  // Background jobs. These arrive with the job's handle after a colon.
+  "job_terminal_unpersisted": "a background job finished and its result was never written down",
+  "job_live_at_close": "a background job was still running when the run ended",
+  "job_barrier_integrity_failure": "the record of waiting for a background job is incomplete",
+  "forced_test_attempt_nonreceipt": "a test attempt left no usable record of what it ran",
 }
 
-/** The sentence for `code`, or the code itself when it has none. */
+/**
+ * The sentence for `code`, or the code itself when it has none.
+ *
+ * Some conflicts name the thing they are about after a colon —
+ * `job_live_at_close:58db946542a8`. The family is the fact; the handle
+ * identifies one job for a bug report and is nothing a reader can use. An
+ * unknown family keeps its whole id: half an unfamiliar code is worse than all
+ * of it. Mirrors `_sentence` in `src/sag/result_card/glosses.py`.
+ */
 export function gloss(code: string): string {
-  return REASON_GLOSS[code] ?? code
+  const exact = REASON_GLOSS[code]
+  if (exact) return exact
+  const colon = code.indexOf(":")
+  if (colon === -1) return code
+  return REASON_GLOSS[code.slice(0, colon)] ?? code
 }
 
 /**
