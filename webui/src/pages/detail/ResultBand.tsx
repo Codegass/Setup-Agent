@@ -2,6 +2,7 @@ import { useState } from "react"
 
 import type { CardTone, ResultCard, ResultRow, RowKey, SnapshotStatus } from "@/api/types"
 import { RECORD_UNREADABLE, recordWasRead } from "@/evidencePresentation"
+import { readStored, writeStored } from "@/lib/safeStorage"
 import { cn } from "@/lib/utils"
 
 import type { TabId } from "./facets"
@@ -36,6 +37,13 @@ const CHIP: Record<CardTone, string> = {
   failed: "bg-status-failed-soft text-status-failed",
   neutral: "bg-accent text-muted-foreground",
 }
+
+/** Whether the band is collapsed, remembered per viewer.
+ *
+ *  A convenience, not state anyone else needs: it belongs to this browser and
+ *  nothing reads it back. `safeStorage` degrades to null rather than throwing
+ *  where `localStorage` is absent, which is why it can be read at render init. */
+const COLLAPSED_KEY = "sag.resultBand.collapsed"
 
 const BAND: Record<CardTone, string> = {
   success: "border-status-success-border bg-status-success-soft/30",
@@ -76,6 +84,7 @@ function Row({
   row,
   linkedTab,
   onOpenTab,
+  compact = false,
 }: {
   row: ResultRow
   /** The tab that answers this row, when this run has it. `null` when it does
@@ -83,6 +92,10 @@ function Row({
    *  go nowhere. */
   linkedTab: TabId | null
   onOpenTab: (id: TabId) => void
+  /** Show the row's verdict and headline only. The detail, the reason and the
+   *  items are the rest of the answer, not a shorter version of it — a
+   *  collapsed band hides them rather than trimming them. */
+  compact?: boolean
 }) {
   const status = row.status.replace(/_/g, " ")
   return (
@@ -121,11 +134,17 @@ function Row({
         {row.headline === status ? null : (
           <p className="text-[13px] text-foreground">{row.headline}</p>
         )}
-        {row.detail ? <p className="text-[11px] text-muted-foreground">{row.detail}</p> : null}
-        {row.reason ? (
-          <p className="text-[11px] italic text-muted-foreground">{row.reason}</p>
-        ) : null}
-        <Items row={row} />
+        {compact ? null : (
+          <>
+            {row.detail ? (
+              <p className="text-[11px] text-muted-foreground">{row.detail}</p>
+            ) : null}
+            {row.reason ? (
+              <p className="text-[11px] italic text-muted-foreground">{row.reason}</p>
+            ) : null}
+            <Items row={row} />
+          </>
+        )}
       </div>
     </div>
   )
@@ -153,6 +172,12 @@ export function ResultBand({
    *  state the first when it only knew the second. */
   snapshotStatus?: SnapshotStatus | null
 }) {
+  const [collapsed, setCollapsed] = useState(() => readStored(COLLAPSED_KEY) === "1")
+  const toggle = () =>
+    setCollapsed((value) => {
+      writeStored(COLLAPSED_KEY, value ? "0" : "1")
+      return !value
+    })
   if (!card) {
     return (
       <div className="rounded-lg border border-border bg-card p-4" data-tone="neutral">
@@ -173,15 +198,30 @@ export function ResultBand({
           from the run that wrote it, and looks identical to one unless the page
           says so — which the terminal and the report both do, in these words.
           `tests/test_gloss_parity.py` holds the three copies together. */}
-      {card.verdictSource === "legacy" ? (
-        <p className="py-1 text-[11px] text-muted-foreground">
-          <span className="font-mono uppercase tracking-[0.1em]">Record</span>
-          {" — "}
-          {"reconstructed from an older run record"}
-        </p>
-      ) : null}
-      {card.rows.map((row) => (
+      <div className="flex items-baseline gap-3 py-1">
+        {card.verdictSource === "legacy" ? (
+          <p className="text-[11px] text-muted-foreground">
+            <span className="font-mono uppercase tracking-[0.1em]">Record</span>
+            {" — "}
+            {"reconstructed from an older run record"}
+          </p>
+        ) : null}
+        {/* The band is the first thing on the page and the tabs are under it,
+            so on a run with long reasons it can hold the whole screen. Collapsed
+            it keeps the first row — the run's own verdict and headline — and
+            drops the other six. The choice is this browser's and is remembered. */}
+        <button
+          aria-expanded={!collapsed}
+          className="ml-auto shrink-0 text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+          onClick={toggle}
+          type="button"
+        >
+          {collapsed ? `Show all ${card.rows.length} rows` : "Collapse"}
+        </button>
+      </div>
+      {(collapsed ? card.rows.slice(0, 1) : card.rows).map((row) => (
         <Row
+          compact={collapsed}
           key={row.key}
           linkedTab={linkable(ROW_TAB[row.key])}
           onOpenTab={onOpenTab}

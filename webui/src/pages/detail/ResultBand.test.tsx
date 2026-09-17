@@ -63,6 +63,11 @@ function card(overrides: Partial<ResultCard> = {}): ResultCard {
 describe("ResultBand", () => {
   afterEach(() => {
     cleanup()
+    // The band remembers whether it was collapsed, so a test that collapses it
+    // would otherwise decide what the next one renders. jsdom here exposes a
+    // `localStorage` object with no methods on it at all, which is why
+    // `safeStorage` exists — hence the optional call rather than a plain one.
+    window.localStorage?.clear?.()
   })
 
   it("shows every row's label, status and headline", () => {
@@ -73,6 +78,75 @@ describe("ResultBand", () => {
     expect(screen.getByText("994 executed · 994 passed · 0 failed · 0 errors · 0 skipped")).toBeInTheDocument()
     expect(screen.getByText("complete 1/1 steps")).toBeInTheDocument()
     expect(screen.getByText("not collected", { selector: "span" })).toBeInTheDocument()
+  })
+
+  it("collapses to the run's own verdict and drops the other six rows", () => {
+    render(<ResultBand card={card()} onOpenTab={() => {}} />)
+    fireEvent.click(screen.getByRole("button", { name: "Collapse" }))
+    expect(screen.getByText("Setup")).toBeInTheDocument()
+    expect(screen.getByText("4/4 phases · 12 turns")).toBeInTheDocument()
+    for (const label of ["Required task", "Build", "Tests", "Coverage", "Official CI", "Report"]) {
+      expect(screen.queryByText(label)).toBeNull()
+    }
+  })
+
+  it("expands again", () => {
+    render(<ResultBand card={card()} onOpenTab={() => {}} />)
+    fireEvent.click(screen.getByRole("button", { name: "Collapse" }))
+    expect(screen.queryByText("Tests")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Show all 7 rows" }))
+    expect(screen.getByText("Tests")).toBeInTheDocument()
+  })
+
+  it("remembers the choice for the next visit", () => {
+    // jsdom's `window.localStorage` here is an object with no methods, so
+    // `safeStorage` no-ops and the band would come back expanded no matter what
+    // it wrote. A real one is installed for this test only, because otherwise
+    // the persistence — the whole point of remembering — is never exercised.
+    const store = new Map<string, string>()
+    const original = Object.getOwnPropertyDescriptor(window, "localStorage")
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        clear: () => store.clear(),
+        getItem: (key: string) => store.get(key) ?? null,
+        removeItem: (key: string) => void store.delete(key),
+        setItem: (key: string, value: string) => void store.set(key, value),
+      },
+    })
+    try {
+      const first = render(<ResultBand card={card()} onOpenTab={() => {}} />)
+      fireEvent.click(screen.getByRole("button", { name: "Collapse" }))
+      first.unmount()
+
+      render(<ResultBand card={card()} onOpenTab={() => {}} />)
+      expect(screen.queryByText("Tests")).toBeNull()
+      expect(screen.getByRole("button", { name: "Show all 7 rows" })).toBeInTheDocument()
+    } finally {
+      if (original) Object.defineProperty(window, "localStorage", original)
+    }
+  })
+
+  it("hides a kept row's detail and reason rather than trimming them", () => {
+    const blocked = card({
+      rows: [
+        row({
+          key: "setup",
+          label: "Setup",
+          status: "partial",
+          tone: "attention",
+          headline: "3/4 phases · 29 turns · 25m 45s",
+          detail: "blocked at test: test receipt parsing is unreadable in the judge container",
+          reason: "the underlying test run completed with failures",
+        }),
+        row({ key: "tests", label: "Tests", status: "unavailable" }),
+      ],
+    })
+    render(<ResultBand card={blocked} onOpenTab={() => {}} />)
+    fireEvent.click(screen.getByRole("button", { name: "Collapse" }))
+    expect(screen.getByText("3/4 phases · 29 turns · 25m 45s")).toBeInTheDocument()
+    expect(screen.queryByText(/blocked at test/)).toBeNull()
+    expect(screen.queryByText(/completed with failures/)).toBeNull()
   })
 
   it("shows a row's reason when it has nothing to measure", () => {
