@@ -225,3 +225,26 @@ def test_an_older_record_is_read_as_the_version_it_carries():
     payload.pop("rates")
     card = build_result_card(payload)
     assert card.verdict_source == "legacy"
+
+
+def test_every_schema_this_run_can_no_longer_re_read_is_a_reconstruction():
+    """The provenance word is pinned to the finalizer, not to a copied number.
+
+    A v4 seal used to call itself a reading while the reader that authorizes
+    seals could not re-read it at all — which is how one surface came to state
+    a result and another to deny one existed for the same file. 184 of the 681
+    archived records are v4.
+    """
+
+    from sag.agent.verdict_finalizer import VERDICT_SCHEMA_VERSION
+
+    for version in range(3, VERDICT_SCHEMA_VERSION):
+        payload = snapshot_dict(schema_version=version)
+        payload.pop("rates", None)
+        assert build_result_card(payload).verdict_source == "legacy", (
+            f"a v{version} record is older than the v{VERDICT_SCHEMA_VERSION} seal this system "
+            "writes, so the card states it was reconstructed"
+        )
+    assert build_result_card(
+        snapshot_dict(schema_version=VERDICT_SCHEMA_VERSION)
+    ).verdict_source == "snapshot"

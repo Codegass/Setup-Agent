@@ -102,3 +102,34 @@ def test_the_browser_spells_a_ci_verdict_the_way_the_terminal_spells_it():
         "the browser and the terminal spell a comparison verdict differently: "
         f"browser {mirror}, terminal {dict(_CI_STATUS_WORD)}"
     )
+
+
+# ── the provenance sentence ──────────────────────────────────────────────────
+
+BAND = Path(__file__).resolve().parents[1] / "webui" / "src" / "pages" / "detail" / "ResultBand.tsx"
+
+
+def test_the_browser_states_a_reconstruction_in_the_same_words_as_the_terminal():
+    """Three renderers, three copies of one sentence, and no shared constant.
+
+    The terminal and the report are held together by
+    `tests/test_snapshot_surface_agreement.py`; the browser is a fourth
+    surface in another language, so its copy is compared here. A reader
+    holding a report beside the page is the only other thing that would catch
+    a drift, and by then the two have been disagreeing for a while.
+    """
+
+    from sag.console.result_block import _OLDER_RECORD
+    from sag.result_card.markdown import _OLDER_RECORD as _WRITTEN_RECORD
+
+    source = BAND.read_text(encoding="utf-8")
+
+    assert _OLDER_RECORD == _WRITTEN_RECORD
+    assert f'"{_OLDER_RECORD}"' in source, (
+        f"{BAND} does not state the sentence the terminal and the report print "
+        f"for a reconstructed result ({_OLDER_RECORD!r})"
+    )
+    assert 'verdictSource === "legacy"' in source, (
+        f"{BAND} states the sentence but not the condition the other two surfaces "
+        "use, so it could print it for a reading"
+    )

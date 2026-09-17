@@ -28,7 +28,6 @@ from sag.result_card.rows import (
 )
 
 _MAX_FAILING_NAMES = 5
-_LEGACY_SCHEMA_VERSION = 3
 
 #: The comparison findings that name work, as opposed to the ones that describe
 #: why no comparison happened. Spelled here so this package keeps reading the
@@ -41,6 +40,22 @@ _CI_FINDING_CODES = frozenset(
         "BUILD_AXIS_NOT_SUCCESSFUL",
     }
 )
+
+
+def _verdict_source(schema_version: int) -> str:
+    """Where the card's words came from: a reading, or a reconstruction.
+
+    Any seal older than the one this system writes is a reconstruction, because
+    the reader that authorizes seals (`read_live_verdict_snapshot`) answers
+    `unknown` for it and cannot confirm a thing about it. Pinned to the
+    finalizer's own constant rather than a number copied here, so when the
+    schema moves every surface's provenance moves with it in one place — a
+    hardcoded 3 is what let 184 archived v4 records call themselves readings.
+    """
+
+    from sag.agent.verdict_finalizer import VERDICT_SCHEMA_VERSION
+
+    return "legacy" if schema_version < VERDICT_SCHEMA_VERSION else "snapshot"
 
 
 def _as_snapshot(snapshot: Any) -> Any:
@@ -240,7 +255,7 @@ def build_result_card(
         "report": report_row(termination, report_path=report_path),
     }
 
-    source = "legacy" if sealed.schema_version <= _LEGACY_SCHEMA_VERSION else "snapshot"
+    source = _verdict_source(sealed.schema_version)
     resolved_commit = commit
     if resolved_commit is None:
         comparison = getattr(sealed, "ci_comparison", None)

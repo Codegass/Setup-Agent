@@ -169,6 +169,17 @@ export function ResultBand({
     availableTabs === undefined || availableTabs.includes(id) ? id : null
   return (
     <div className={cn("rounded-lg border px-4 py-2", BAND[tone])} data-tone={tone}>
+      {/* A result rebuilt from an older run record is worth less than one read
+          from the run that wrote it, and looks identical to one unless the page
+          says so — which the terminal and the report both do, in these words.
+          `tests/test_gloss_parity.py` holds the three copies together. */}
+      {card.verdictSource === "legacy" ? (
+        <p className="py-1 text-[11px] text-muted-foreground">
+          <span className="font-mono uppercase tracking-[0.1em]">Record</span>
+          {" — "}
+          {"reconstructed from an older run record"}
+        </p>
+      ) : null}
       {card.rows.map((row) => (
         <Row
           key={row.key}

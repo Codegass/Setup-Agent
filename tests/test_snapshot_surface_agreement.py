@@ -682,6 +682,54 @@ def test_web_valid_snapshot_owns_verdict_and_primary_counts(tvm_snapshot):
     assert detail.report_delivery_status is None
 
 
+def test_web_serves_a_result_for_a_seal_written_under_an_older_schema(tvm_snapshot):
+    """184 of 681 archived records are v4, and every one read as "no result".
+
+    `read_live_verdict_snapshot` answers `unknown` for any schema but the
+    current one, so a v4 seal could never match its own forensic copy and the
+    registry served no card — while `sag result <dir>`, reading the same bytes,
+    printed all seven rows. The browser then stated that the run recorded no
+    result, which is the one thing this layer exists not to do.
+    """
+
+    payload = json.loads(tvm_snapshot.model_dump_json())
+    payload["schema_version"] = 4
+    files = {
+        VERDICT_PATH: json.dumps(payload),
+        "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+    }
+
+    item = _setup_artifact_item(SnapshotOrchestrator(files), "sag-tvm")
+    detail = _session_detail(item, "sag-tvm", None)
+
+    assert detail.result_card is not None, "the card the terminal prints from these bytes"
+    assert detail.result_card.verdict == tvm_snapshot.verdict
+    assert detail.result_card.row("tests").headline.startswith("328 executed")
+    # Served, but never as a reading: the seal reader could not re-read it.
+    assert detail.result_card.verdict_source == "legacy"
+    assert detail.snapshot_status == "legacy"
+    assert detail.canonical_verdict == tvm_snapshot.verdict
+
+
+def test_web_still_refuses_a_current_seal_it_cannot_authorize(tvm_snapshot):
+    """Serving an older schema is not serving anything that fails to verify."""
+
+    payload = json.loads(tvm_snapshot.model_dump_json())
+    payload["verdict"] = "failed"
+    files = {
+        VERDICT_PATH: json.dumps(payload),
+        "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+    }
+
+    item = _setup_artifact_item(
+        SnapshotOrchestrator(files, publish_verdict=False), "sag-tvm"
+    )
+    detail = _session_detail(item, "sag-tvm", None)
+
+    assert detail.result_card is None
+    assert detail.snapshot_status == "untrusted"
+
+
 def test_web_card_keeps_the_mutable_module_rollup_out_of_the_build_word(snapshot_factory):
     """The rollup is a report diagnostic and the record is the result.
 
@@ -1183,6 +1231,39 @@ _FENCE_RECORDS: dict[str, tuple[dict, dict]] = {
             },
         ),
         {"termination": _DELIVERED, "report_path": "logs/session_old/setup-report.md"},
+    ),
+    # A schema-v4 record: the most common shape in the archive (184 of 681) and
+    # the one no surface comparison had ever covered. It carries rates and a CI
+    # block but predates the required task, so the task row reads `not supplied`
+    # — spec §2.5 — and the card marks it `legacy`, because the seal reader this
+    # system ships can no longer re-read it.
+    "a result sealed under the previous schema": (
+        snapshot_dict(
+            schema_version=4,
+            verdict="partial",
+            task_completion=None,
+            conflicts=["maven_reactor_unverified"],
+            test_stats={
+                "discovered": 472,
+                "denominator_basis": "complete",
+                "unique": dict(CLEAN_TEST_COUNTS),
+                "raw": dict(CLEAN_TEST_COUNTS),
+                "flaky_count": 0,
+                "judgment": "partial",
+                "collection_errors": 0,
+                "receipt_scoped": True,
+            },
+        ),
+        {
+            "module_metrics": module_metrics(),
+            "termination": _DELIVERED,
+            "report_path": "logs/session_v4/setup-report.md",
+            "project": "commons-cli",
+            "container": "sag-commons-cli",
+            "session_dir": "logs/session_v4",
+            "turn_count": 29,
+            "tool_calls": 28,
+        },
     ),
 }
 

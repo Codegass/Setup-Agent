@@ -27,12 +27,13 @@ from sag.agent.evidence_publications import (
     reset_evidence_publication_authority,
 )
 from sag.agent.verdict_finalizer import (
+    VERDICT_SCHEMA_VERSION,
     VERDICT_SNAPSHOT_PATH,
     ReportDeliveryStatus,
     RunVerdictSnapshot,
     read_live_verdict_snapshot,
 )
-from sag.result_card.build import build_result_card
+from sag.result_card.build import _verdict_source, build_result_card
 from sag.result_card.run_evidence import ReportDeliveryOnly, read_run_counts
 from sag.result_card.models import RunResultCard
 from sag.runtime.container_io import resolve_control_execute
@@ -950,6 +951,18 @@ def _read_setup_verdict_snapshot(
                     and live.model_dump_json() == forensic.model_dump_json()
                 ):
                     return live, "valid"
+
+    # A seal written under an older schema can never reach "valid", whatever
+    # its state: `read_live_verdict_snapshot` answers `unknown` for any version
+    # but the current one, so the re-read never matches the bytes on disk.
+    # Refusing it made this layer serve no card at all for 184 of the 681
+    # archived records, and the Workbench then said the run had recorded no
+    # result while `sag result` printed all seven rows from the same file.
+    # The record is served, and the card says it is a reconstruction — which is
+    # the lower trust label `verdict_source == "legacy"` already means, on
+    # every surface, from one derivation in `build_result_card`.
+    if forensic.schema_version < VERDICT_SCHEMA_VERSION:
+        return forensic, "legacy"
     return None, "untrusted"
 
 
@@ -1117,7 +1130,9 @@ def _setup_artifact_item(
         canonical_verdict = snapshot.verdict
         evidence_status = snapshot.verdict
         outcome = snapshot.verdict.upper()
-        verdict_source = "snapshot"
+        # One derivation, shared with the terminal and the report: a seal this
+        # system can no longer re-read is a reconstruction, not a reading.
+        verdict_source = _verdict_source(snapshot.schema_version)
         rates = snapshot.rates
     elif legacy:
         test = _test_payload_from_metrics(metrics) or _test_payload_from_report(report_raw)

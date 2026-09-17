@@ -139,6 +139,23 @@ describe("ResultBand", () => {
     expect(container.firstChild).toHaveAttribute("data-tone", "failed")
   })
 
+  // The terminal and the report both print a Record line for a reconstructed
+  // result (`tests/test_snapshot_surface_agreement.py`). The browser printed
+  // nothing, so the same run looked like a reading in one place and a
+  // reconstruction in another.
+  it("says when a result was reconstructed from an older record", () => {
+    render(
+      <ResultBand card={card({ verdictSource: "legacy" })} onOpenTab={() => {}} />,
+    )
+    expect(screen.getByText(/reconstructed from an older run record/)).toBeInTheDocument()
+  })
+
+  it("says nothing about provenance for a result read from the run that wrote it", () => {
+    render(<ResultBand card={card()} onOpenTab={() => {}} />)
+    expect(screen.queryByText(/reconstructed from an older run record/)).toBeNull()
+    expect(screen.queryByText("Record")).toBeNull()
+  })
+
   it("says so when no result was recorded at all", () => {
     render(<ResultBand card={null} onOpenTab={() => {}} snapshotStatus="missing" />)
     expect(screen.getByText(/No result was recorded for this run/)).toBeInTheDocument()
