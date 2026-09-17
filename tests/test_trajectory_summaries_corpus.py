@@ -59,14 +59,20 @@ ENVELOPES_PER_TOOL = {
 RESULTS_PER_TOOL = {session: dict(tools) for session, tools in ENVELOPES_PER_TOOL.items()}
 
 #: Results whose observation summary says something, per tool. Unlike a call, a
-#: result may honestly have nothing to state — a search that matched and a bash
-#: that exited 0 carry no line of their own — so these are coverage floors held
-#: exactly, not totals. `phase` and `build` at full count are the two that
-#: silently fell to zero before.
+#: result may honestly have nothing to state — a bash that exited 0 carries no
+#: line of its own — so these are held exactly, not as totals. `phase`, `build`
+#: and `search` at full count are the branches that summarised nothing before.
 OBSERVATIONS_NAMED_PER_TOOL = {
-    "camel-quarkus-d2r3": {"advisor": 2, "bash": 6, "build": 2, "phase": 14, "project": 6},
-    "ignite-d2r3": {"advisor": 3, "bash": 1, "build": 2, "phase": 6, "project": 3, "search": 1},
-    "kafka-d2r3": {"advisor": 2, "build": 2, "phase": 7, "project": 3},
+    "camel-quarkus-d2r3": {
+        "advisor": 2,
+        "bash": 6,
+        "build": 2,
+        "phase": 14,
+        "project": 6,
+        "search": 21,
+    },
+    "ignite-d2r3": {"advisor": 3, "bash": 1, "build": 2, "phase": 6, "project": 3, "search": 17},
+    "kafka-d2r3": {"advisor": 2, "build": 2, "phase": 7, "project": 3, "search": 7},
 }
 
 #: `(session, control sequence) -> the line a reader is shown`. Copied out of
@@ -77,7 +83,8 @@ REAL_CALL_LINES = {
     ("camel-quarkus-d2r3", 11): "done success",
     ("camel-quarkus-d2r3", 61): "consult",
     ("camel-quarkus-d2r3", 63): "compile",
-    ("camel-quarkus-d2r3", 89): "test",
+    # The args name the coordinate the run drove; the verb alone would not.
+    ("camel-quarkus-d2r3", 89): "test -DskipITs -DskipIntegrationTests -DskipNativeTests",
     ("camel-quarkus-d2r3", 254): "generate",
     ("ignite-d2r3", 6): "clone apache/ignite@2.18.0",
     ("ignite-d2r3", 17): "name:/usr|name:/usr/share|name:/opt /mvn|mvnw/",
@@ -88,6 +95,8 @@ REAL_CALL_LINES = {
     ("kafka-d2r3", 3): "clone apache/kafka@4.3.1",
     ("kafka-d2r3", 7): "provision java 17",
     ("kafka-d2r3", 11): "env gradle",
+    ("kafka-d2r3", 119): "compile --no-daemon",
+    ("kafka-d2r3", 141): "test --no-daemon :clients:test",
 }
 
 REAL_OBSERVATION_LINES = {
@@ -99,13 +108,18 @@ REAL_OBSERVATION_LINES = {
     ("camel-quarkus-d2r3", 62): "advice delivered",
     ("camel-quarkus-d2r3", 70): "exit 1 · JAVA_VERSION_ERROR",
     ("camel-quarkus-d2r3", 99): "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH",
+    ("camel-quarkus-d2r3", 54): "matched",
     ("ignite-d2r3", 18): "SEARCH_FAILED",
+    ("ignite-d2r3", 145): "no match",
+    # The two results in these sessions that counted their matches.
+    ("ignite-d2r3", 177): "80 matches",
     ("ignite-d2r3", 157): "note",
     ("ignite-d2r3", 174): "exit 0 · 5 jars",
     # The one dispatched job in the three sessions: pending, not failed.
     ("ignite-d2r3", 238): "running · job 2c4d56b2fdca",
     ("kafka-d2r3", 4): "26b251a → /workspace/kafka",
     ("kafka-d2r3", 124): "exit 0",
+    ("kafka-d2r3", 146): "80 matches",
     ("kafka-d2r3", 143): "exit 1 · DETACHED_OPERATION_FAILED",
 }
 

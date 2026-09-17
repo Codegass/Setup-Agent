@@ -54,7 +54,52 @@ def test_a_build_call_that_carries_only_a_verb_says_the_verb():
         call_summary("build", {"action": "compile", "timeout": 1200, "working_directory": "/w"})
         == "compile"
     )
-    assert call_summary("build", {"action": "test", "args": "--no-daemon :clients:test"}) == "test"
+    assert call_summary("build", {"action": "test", "working_directory": "/w"}) == "test"
+
+
+def test_a_build_call_carries_the_args_the_verb_was_given():
+    """`test` and `test --no-daemon :clients:test` are different runs.
+
+    The args name the coordinate the run actually drove, so a verb without them
+    is a line that cannot be told apart from the run next to it.
+    """
+    assert (
+        call_summary(
+            "build",
+            {
+                "action": "test",
+                "args": "--no-daemon :clients:test",
+                "timeout": 1200,
+                "working_directory": "/workspace/kafka",
+            },
+        )
+        == "test --no-daemon :clients:test"
+    )
+    assert (
+        call_summary("build", {"action": "compile", "args": "--no-daemon"}) == "compile --no-daemon"
+    )
+    # A command already spells out its own args; they are not appended twice.
+    assert (
+        call_summary(
+            "build",
+            {"action": "verify", "args": "-B clean", "source_command": "mvn -B clean verify"},
+        )
+        == "verify mvn -B clean verify"
+    )
+
+
+def test_build_args_that_are_not_one_line_of_text_are_left_out():
+    """A container never reaches the line as `['-B', 'clean']`.
+
+    Every real envelope states `args` as a string, and the build tool's own
+    parameter schema declares it one (`build_tool.py`, `"args": {"type":
+    "string"}`). A sequence is joined rather than printed, defensively; anything
+    else is dropped, and the verb stands alone.
+    """
+    assert call_summary("build", {"action": "test", "args": None}) == "test"
+    assert call_summary("build", {"action": "test", "args": "   "}) == "test"
+    assert call_summary("build", {"action": "test", "args": {"skip": True}}) == "test"
+    assert call_summary("build", {"action": "test", "args": ["-B", "clean"]}) == "test -B clean"
 
 
 def test_the_mirrored_build_verbs_are_the_build_tool_s_own():
@@ -446,6 +491,50 @@ def test_a_pending_job_names_its_handle():
     assert observation_summary("build", {"invocation_status": "pending"}) == "running"
 
 
+def test_a_search_result_says_whether_it_matched():
+    """`facts["matched"]` is a yes/no, not a count.
+
+    `search_tool.py` writes it as `True`, `False`, `bool(lines)` or `None`, so
+    the honest line is the answer to "did the pattern hit", and a number here
+    would be a count nobody took.
+    """
+    hit = {"operation_outcome": "success", "facts": {"matched": True, "target": "file:/w/pom.xml"}}
+    assert observation_summary("search", hit) == "matched"
+
+    miss = {"operation_outcome": "success", "facts": {"matched": False}}
+    assert observation_summary("search", miss) == "no match"
+
+    silent = {"operation_outcome": "success", "facts": {"matched": None}}
+    assert observation_summary("search", silent) is None
+    assert observation_summary("search", {"operation_outcome": "success"}) is None
+
+
+def test_a_search_result_that_counted_its_matches_says_the_count():
+    """`metadata.total_matches` is a real count, and it is preferred when stated."""
+
+    counted = {
+        "operation_outcome": "success",
+        "metadata": {"total_matches": 80, "matches_shown": 80},
+    }
+    assert observation_summary("search", counted) == "80 matches"
+
+    many = {"operation_outcome": "success", "metadata": {"total_matches": 12345}}
+    assert observation_summary("search", many) == "12,345 matches"
+
+    # A `True` is not a count of one.
+    flagged = {
+        "operation_outcome": "success",
+        "facts": {"matched": False},
+        "metadata": {"total_matches": True},
+    }
+    assert observation_summary("search", flagged) == "no match"
+
+
+def test_a_failed_search_names_its_error_instead():
+    failed = {"operation_outcome": "failed", "error_code": "SEARCH_FAILED", "facts": {}}
+    assert observation_summary("search", failed) == "SEARCH_FAILED"
+
+
 def test_a_result_that_states_no_error_states_nothing():
     """The generic tail carries a code or says nothing; `failed` is the outcome's word."""
 
@@ -454,7 +543,7 @@ def test_a_result_that_states_no_error_states_nothing():
         observation_summary("bash", {"operation_outcome": "failed", "error_code": "COMMAND_FAILED"})
         == "COMMAND_FAILED"
     )
-    assert observation_summary("search", {"operation_outcome": "success"}) is None
+    assert observation_summary("bash", {"operation_outcome": "success"}) is None
 
 
 def test_a_refusal_states_its_code():

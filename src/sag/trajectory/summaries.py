@@ -125,6 +125,21 @@ def _command_action(command: str | None) -> str | None:
     return named[-1] if named else None
 
 
+def _arguments(value: Any) -> str | None:
+    """The runner options a verb was given, as one line of text.
+
+    Every real envelope states `args` as a string, which is what the build
+    tool's own parameter schema declares. A sequence is joined rather than
+    printed, so a container can never reach the line as `['-B', 'clean']`;
+    anything else is left out and the verb stands alone.
+    """
+
+    if isinstance(value, (list, tuple)):
+        scalars = [str(item) for item in value if isinstance(item, (str, int, float, bool))]
+        return _first_line(" ".join(scalars))
+    return _first_line(value)
+
+
 def _build_call(params: dict[str, Any]) -> str | None:
     command = _first_line(params.get("command")) or _first_line(params.get("source_command"))
     action = (
@@ -132,9 +147,13 @@ def _build_call(params: dict[str, Any]) -> str | None:
         or _first_line(params.get("effective_action"))
         or _command_action(command)
     )
-    if command and action:
-        return f"{action} {command}"
-    return command or action
+    if command:
+        # A command spells out its own options; the args are not appended twice.
+        return f"{action} {command}" if action else command
+    if not action:
+        return None
+    args = _arguments(params.get("args"))
+    return f"{action} {args}" if args else action
 
 
 def _project_call(params: dict[str, Any]) -> str | None:
@@ -283,6 +302,23 @@ def _project_observation(result: dict[str, Any]) -> str | None:
     return f"java {java}" if java else None
 
 
+def _search_observation(result: dict[str, Any]) -> str | None:
+    """How a search came out: a count when one was taken, else whether it hit.
+
+    `metadata.total_matches` is a real count and is preferred when it is stated.
+    `facts["matched"]` is not a count — `search_tool.py` writes it as `True`,
+    `False` or `None` — so it answers "did the pattern hit" and nothing more.
+    """
+
+    total = _count(_mapping(result.get("metadata")).get("total_matches"))
+    if total is not None:
+        return f"{total:,} matches"
+    matched = _mapping(result.get("facts")).get("matched")
+    if isinstance(matched, bool):
+        return "matched" if matched else "no match"
+    return None
+
+
 def _phase_observation(result: dict[str, Any]) -> str | None:
     metadata = _mapping(result.get("metadata"))
     gate = _mapping(metadata.get("gate_result"))
@@ -310,6 +346,10 @@ def observation_summary(tool: str, result: Mapping[str, Any] | None) -> str | No
         return _clip(_first_line(values.get("error_code")))
     if tool == "phase":
         return _clip(_phase_observation(values))
+    if tool == "search":
+        if outcome == "ok":
+            return _clip(_search_observation(values))
+        return _clip(_first_line(values.get("error_code")))
     if tool == "advisor":
         if outcome == "ok":
             return "advice delivered"
