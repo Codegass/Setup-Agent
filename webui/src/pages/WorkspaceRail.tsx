@@ -153,7 +153,7 @@ function RailRow({
           <span className={cn("truncate text-[13px] font-medium", selected && !selectMode ? "text-status-running" : "text-foreground")}>
             {workspace.project}
           </span>
-          {workspace.release ? <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">{workspace.release}</span> : null}
+          {workspace.release ? <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{workspace.release}</span> : null}
           {workspace.activeSession ? <Activity className="shrink-0 text-status-running" size={11} /> : null}
         </span>
         <span className="mt-0.5 flex items-baseline gap-2">
@@ -238,7 +238,7 @@ function PendingRailRow({
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1.5">
           <span className="truncate text-[13px] font-medium text-muted-foreground">{project}</span>
-          {item.ref ? <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">{item.ref}</span> : null}
+          {item.ref ? <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{item.ref}</span> : null}
         </span>
         <span
           className={cn("mt-0.5 block truncate text-[10px]", failed ? "text-status-failed" : "text-muted-foreground")}
@@ -388,7 +388,7 @@ export function WorkspaceRail({
           <span className="flex h-6 w-6 items-center justify-center rounded bg-primary font-mono text-[11px] font-bold text-primary-foreground">S</span>
           <div className="min-w-0">
             <div className="text-[13px] font-semibold tracking-tight text-foreground">SAG Workbench</div>
-            <div className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">
+            <div className="flex items-center gap-1 font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
               <span className={cn("inline-flex h-1 w-1 rounded-full", dockerDot)} /> docker {data.docker.version ?? data.docker.status}
             </div>
           </div>
@@ -531,7 +531,7 @@ export function WorkspaceRail({
         </div>
       ) : null}
 
-      <div className="flex items-center gap-2 border-t border-border px-4 py-2 font-mono text-[9px] text-muted-foreground">
+      <div className="flex items-center gap-2 border-t border-border px-4 py-2 font-mono text-[11px] text-muted-foreground">
         <span>{lastUpdatedAt != null ? `Updated ${formatAgo(Date.now() - lastUpdatedAt)}` : "Updating…"}</span>
         {pollFailed ? (
           <span className="inline-flex items-center gap-1 text-status-attention">
