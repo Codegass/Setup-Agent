@@ -2,11 +2,28 @@ import type {
   BuildSummary,
   EvidenceCountSummary,
   ObservationCountSummary,
+  SnapshotStatus,
   TestEvidenceLayers,
   TestSummary,
 } from "@/api/types"
 
 export type ResultTone = "green" | "red" | "amber" | "neutral"
+
+/** The one sentence for a run whose record this page could not read. */
+export const RECORD_UNREADABLE = "This run's result record could not be read here."
+
+/**
+ * Whether this run's record was read at all.
+ *
+ * `corrupt` and `untrusted` mean the bytes were there and this page could not
+ * read them, so nothing downstream checked anything. A tab that then says a
+ * count "was not recorded" or a total "was not measured" is stating a finding
+ * nobody made. `missing` and `unavailable` are different: nothing was written
+ * to read, which the surface may say plainly.
+ */
+export function recordWasRead(status: SnapshotStatus | null | undefined): boolean {
+  return status !== "corrupt" && status !== "untrusted"
+}
 
 export interface CompleteEvidenceCounts {
   executed: number

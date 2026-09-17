@@ -107,8 +107,21 @@ describe("BuildFacet", () => {
     rerender(<BuildFacet detail={{
       build: { state: "unknown", tool: "—", time: "—", note: "" },
       modules: [],
+      snapshotStatus: "valid",
     } as any} />)
     expect(screen.getByText(/artifact totals were not measured/i)).toBeInTheDocument()
+  })
+
+  // "not measured" is a finding. A run whose record this page could not read
+  // was not measured and was not looked at, and only the second is known.
+  it("does not say totals were unmeasured when the record was never read", () => {
+    render(<BuildFacet detail={{
+      build: { state: "unknown", tool: "—", time: "—", note: "" },
+      modules: [],
+      snapshotStatus: "untrusted",
+    } as any} />)
+    expect(screen.queryByText(/artifact totals were not measured/i)).toBeNull()
+    expect(screen.getByText(/result record could not be read here/i)).toBeInTheDocument()
   })
 
   it("lists every command the run dispatched, with the toolchain each one used", () => {

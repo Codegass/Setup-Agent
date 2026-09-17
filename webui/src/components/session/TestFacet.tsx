@@ -4,7 +4,7 @@ import type { CardTone, ExecutionSessionDetail, ReceiptSummary, ResultRow } from
 import { Badge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
 import { TestBar } from "@/components/common/TestBar"
-import { formatRate, presentTestRun } from "@/evidencePresentation"
+import { RECORD_UNREADABLE, formatRate, presentTestRun, recordWasRead } from "@/evidencePresentation"
 
 import { EvidenceAccounting } from "./EvidenceAccounting"
 import { FailingCard } from "./FailingCard"
@@ -51,8 +51,15 @@ const TONE_CLASS: Record<CardTone, string> = {
  */
 function TestConclusionCard({ detail }: { detail: ExecutionSessionDetail }) {
   const test = detail.test
+  // `presentTestRun` reports the counts it was handed. When this run's record
+  // could not be read it was handed defaults, so its "not recorded" sentence
+  // would state a finding nobody made.
+  const recordRead = recordWasRead(detail.snapshotStatus)
   const row: ResultRow | undefined = detail.resultCard?.rows.find((r) => r.key === "tests")
   const run = presentTestRun(test)
+  const summary = recordRead
+    ? run.summary
+    : `${RECORD_UNREADABLE} Its test counts are not known here.`
 
   return (
     <Card className="overflow-hidden">
@@ -78,7 +85,7 @@ function TestConclusionCard({ detail }: { detail: ExecutionSessionDetail }) {
           ) : null}
         </div>
         <p className="mt-2 text-[13px] leading-relaxed text-foreground">
-          {row ? row.headline : run.summary}
+          {row ? row.headline : summary}
         </p>
         {row?.detail ? (
           <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{row.detail}</p>

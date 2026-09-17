@@ -124,6 +124,7 @@ export function DetailPane({
           availableTabs={tabIds}
           card={detail.resultCard}
           onOpenTab={setActive}
+          snapshotStatus={detail.snapshotStatus}
         />
       </div>
 

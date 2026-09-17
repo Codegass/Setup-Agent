@@ -6,6 +6,7 @@ import type { BuildSummary, ExecutionSessionDetail } from "@/api/types"
 import { Badge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
 import { statusMeta } from "@/components/common/status"
+import { RECORD_UNREADABLE, recordWasRead } from "@/evidencePresentation"
 import { cn } from "@/lib/utils"
 
 import { BuildDetailPage } from "./BuildDetailPage"
@@ -85,7 +86,7 @@ function ConclusionCard({ build }: { build: BuildSummary }) {
   )
 }
 
-function OutputsCard({ build }: { build: BuildSummary }) {
+function OutputsCard({ build, recordRead }: { build: BuildSummary; recordRead: boolean }) {
   const warnings = build.warnings ?? []
   const outputs = [
     build.classCount != null ? { label: "classes", value: build.classCount } : null,
@@ -102,7 +103,9 @@ function OutputsCard({ build }: { build: BuildSummary }) {
         </div>
       ) : (
         <p className="mt-2 text-[12px] leading-relaxed text-muted-foreground">
-          Artifact totals were not measured for this run.
+          {recordRead
+            ? "Artifact totals were not measured for this run."
+            : `${RECORD_UNREADABLE} Its artifact totals are not known here.`}
         </p>
       )}
       {warnings.length ? (
@@ -133,7 +136,7 @@ export function BuildFacet({ detail }: { detail: ExecutionSessionDetail }) {
     <div className="space-y-4">
       <div className="grid gap-4 sm:grid-cols-2">
         <ConclusionCard build={detail.build} />
-        <OutputsCard build={detail.build} />
+        <OutputsCard build={detail.build} recordRead={recordWasRead(detail.snapshotStatus)} />
       </div>
       {/* Unfiltered on purpose. The plan narrowed this to `tool` in {maven,
           gradle, bash, python}, which is the entire vocabulary the receipt

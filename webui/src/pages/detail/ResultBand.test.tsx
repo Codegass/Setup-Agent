@@ -140,8 +140,23 @@ describe("ResultBand", () => {
   })
 
   it("says so when no result was recorded at all", () => {
-    render(<ResultBand card={null} onOpenTab={() => {}} />)
+    render(<ResultBand card={null} onOpenTab={() => {}} snapshotStatus="missing" />)
     expect(screen.getByText(/No result was recorded for this run/)).toBeInTheDocument()
+  })
+
+  // A record this page could not read is not a run that recorded nothing. The
+  // band said the second when it only knew the first, which is the one failure
+  // this layer exists to prevent.
+  it("does not claim a run recorded nothing when its record could not be read", () => {
+    render(<ResultBand card={null} onOpenTab={() => {}} snapshotStatus="untrusted" />)
+    expect(screen.queryByText(/No result was recorded/)).toBeNull()
+    expect(screen.getByText(/result record could not be read here/i)).toBeInTheDocument()
+  })
+
+  it("says the same of a record it could read the bytes of but not parse", () => {
+    render(<ResultBand card={null} onOpenTab={() => {}} snapshotStatus="corrupt" />)
+    expect(screen.queryByText(/No result was recorded/)).toBeNull()
+    expect(screen.getByText(/result record could not be read here/i)).toBeInTheDocument()
   })
 
   // The band states a row's reason in the run's own words, code and all. This

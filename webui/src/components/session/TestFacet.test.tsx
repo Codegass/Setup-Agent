@@ -257,3 +257,27 @@ describe("TestFacet", () => {
     expect(screen.getByText("No command in this run wrote a test report.")).toBeInTheDocument()
   })
 })
+
+describe("a run whose record could not be read", () => {
+  // "Test counts were not recorded" is a finding about the run. When the
+  // record could not be read, nothing was looked at — so the only true thing
+  // to say is that.
+  it("does not report the counts as unrecorded when nothing checked", () => {
+    render(<TestFacet detail={{
+      test: { state: "unknown", pass: 0, fail: 0, skip: 0, total: 0 },
+      modules: [],
+      snapshotStatus: "untrusted",
+    } as any} />)
+    expect(screen.queryByText(/Test counts were not recorded/i)).toBeNull()
+    expect(screen.getByText(/result record could not be read here/i)).toBeInTheDocument()
+  })
+
+  it("still reports unrecorded counts when the record was read", () => {
+    render(<TestFacet detail={{
+      test: { state: "unknown", pass: 0, fail: 0, skip: 0, total: 0 },
+      modules: [],
+      snapshotStatus: "valid",
+    } as any} />)
+    expect(screen.getByText(/Test counts were not recorded/i)).toBeInTheDocument()
+  })
+})

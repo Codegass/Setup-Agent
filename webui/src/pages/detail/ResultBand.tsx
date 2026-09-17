@@ -1,6 +1,7 @@
 import { useState } from "react"
 
-import type { CardTone, ResultCard, ResultRow, RowKey } from "@/api/types"
+import type { CardTone, ResultCard, ResultRow, RowKey, SnapshotStatus } from "@/api/types"
+import { RECORD_UNREADABLE, recordWasRead } from "@/evidencePresentation"
 import { cn } from "@/lib/utils"
 
 import type { TabId } from "./facets"
@@ -141,17 +142,24 @@ export function ResultBand({
   card,
   onOpenTab,
   availableTabs,
+  snapshotStatus,
 }: {
   card: ResultCard | null | undefined
   onOpenTab: (id: TabId) => void
   /** The tabs this run actually has. Omit to link every row. */
   availableTabs?: TabId[]
+  /** How the run's record read. Without it the band cannot tell a run that
+   *  recorded nothing from a record this page could not read, and it used to
+   *  state the first when it only knew the second. */
+  snapshotStatus?: SnapshotStatus | null
 }) {
   if (!card) {
     return (
       <div className="rounded-lg border border-border bg-card p-4" data-tone="neutral">
         <p className="text-[13px] text-muted-foreground">
-          No result was recorded for this run yet.
+          {recordWasRead(snapshotStatus)
+            ? "No result was recorded for this run yet."
+            : `${RECORD_UNREADABLE} Whether the run recorded one is not known here.`}
         </p>
       </div>
     )
