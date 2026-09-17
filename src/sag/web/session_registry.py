@@ -47,9 +47,14 @@ from sag.web.models import (
     ExecutionSessionSummary,
     ModuleRollup,
     ModuleSummary,
+    ReceiptSummary,
     ReportDocument,
     TestSummary,
+    WorkspaceCIResult,
+    WorkspaceResult,
     WorkspaceSummary,
+    WorkspaceTaskResult,
+    WorkspaceTestResult,
 )
 
 SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
@@ -231,7 +236,7 @@ class ContainerSessionRegistry:
                 return None
 
         context = _read_context_trace(orchestrator)
-        return _session_detail(item, workspace.id, context)
+        return _session_detail(item, workspace.id, context, _read_receipts(orchestrator))
 
     def get_session_dir(self, session_id: str) -> Path | None:
         """The directory a session's trajectory is derived from, or None.
@@ -549,6 +554,11 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
         snapshot_status=_text(item.get("snapshot_status"), default="unavailable"),
         legacy=item.get("legacy") is True,
         report_delivery_status=_optional_text(item.get("report_delivery_status")),
+        result=(
+            WorkspaceResult.model_validate(item["result"])
+            if isinstance(item.get("result"), dict)
+            else None
+        ),
     )
 
 
@@ -577,10 +587,134 @@ def _module_rollup(value: Any) -> ModuleRollup | None:
         return None
 
 
+def _receipt_summary(payload: Any) -> ReceiptSummary | None:
+    """One receipt's presentable surface, or None when it is not a receipt."""
+
+    if not isinstance(payload, dict):
+        return None
+    required = ("receipt_id", "tool", "argv", "outcome")
+    if any(not payload.get(field) for field in required):
+        return None
+    toolchain = payload.get("toolchain_fingerprint")
+    jdk = payload.get("effective_jdk") if isinstance(payload.get("effective_jdk"), dict) else {}
+    runtime = ((jdk.get("provenance") or {}).get("dispatch_runtime") or {}) if jdk else {}
+    delta = payload.get("report_delta") if isinstance(payload.get("report_delta"), dict) else {}
+    totals = payload.get("testcase_execution_totals")
+    return ReceiptSummary(
+        receipt_id=str(payload["receipt_id"]),
+        tool=str(payload["tool"]),
+        argv=str(payload["argv"]),
+        working_directory=_optional_text(payload.get("working_directory")),
+        actual_cwd=_optional_text(payload.get("actual_cwd")),
+        exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
+        outcome=str(payload["outcome"]),
+        lifecycle_state=_optional_text(payload.get("lifecycle_state")),
+        toolchain=(
+            {
+                "executable": _optional_text(toolchain.get("executable")),
+                "version": _optional_text(toolchain.get("version")),
+            }
+            if isinstance(toolchain, dict)
+            else None
+        ),
+        jdk_major=_optional_text(jdk.get("major")) if jdk else None,
+        jdk_version=_optional_text(runtime.get("version")) if runtime else None,
+        reports_new=len(delta.get("new") or ()),
+        reports_changed=len(delta.get("changed") or ()),
+        tests_reported=(
+            totals.get("reported")
+            if isinstance(totals, dict) and isinstance(totals.get("reported"), int)
+            else None
+        ),
+    )
+
+
+def _read_receipts(orchestrator: Any) -> list[ReceiptSummary] | None:
+    """The run's recorded invocations, newest last, or None if unreadable.
+
+    `[]` is a statement — this run recorded no commands — so a read that could
+    not complete must not borrow it. A stream the transport refused, or one the
+    decoder found short, answers None and lets the surface say it could not
+    look.
+    """
+
+    from sag.agent.evidence_records import (
+        decode_named_json_record_stream,
+        execute_named_json_record_stream,
+    )
+    from sag.agent.invocation_receipts import RECEIPT_DIR
+
+    try:
+        decoded = decode_named_json_record_stream(
+            execute_named_json_record_stream(orchestrator, RECEIPT_DIR)
+        )
+    except Exception:
+        return None
+    if not decoded.complete or decoded.conflict is not None:
+        return None
+    summaries = [_receipt_summary(record.payload) for record in decoded.records]
+    return [summary for summary in summaries if summary is not None]
+
+
+def _task_cell(snapshot: Any) -> WorkspaceTaskResult | None:
+    """How many of the task's steps completed, when the record counted any.
+
+    A record that named no step stated no denominator, so no fraction is shown
+    for it — `0/0` would read as a measurement nothing measured.
+    """
+
+    completion = getattr(snapshot, "task_completion", None)
+    if completion is None:
+        return None
+    steps = tuple(completion.steps or ())
+    if not steps:
+        return None
+    return WorkspaceTaskResult(
+        status=completion.status,
+        completed=sum(1 for step in steps if step.status == "complete"),
+        required=len(steps),
+    )
+
+
+def _tests_cell(snapshot: Any) -> WorkspaceTestResult | None:
+    stats = getattr(snapshot, "test_stats", None)
+    if stats is None or stats.unique.executed <= 0:
+        return None
+    unique = stats.unique
+    return WorkspaceTestResult(
+        executed=unique.executed,
+        passed=unique.passed,
+        failed=unique.failed,
+        errors=unique.errors,
+        skipped=unique.skipped,
+    )
+
+
+def _workspace_result(card: Any, snapshot: Any) -> WorkspaceResult | None:
+    """The rail's cells: the words off the card, the counts off the record.
+
+    The verdict and the Official CI word are the card's own, already spelled
+    the way the terminal block and the report print them, so the rail cannot
+    read differently from the card it sits above.
+    """
+
+    if not isinstance(card, dict):
+        return None
+    rows = {row.get("key"): row for row in card.get("rows") or () if isinstance(row, dict)}
+    ci_status = _optional_text((rows.get("ci") or {}).get("status"))
+    return WorkspaceResult(
+        verdict=_text(card.get("verdict"), default="unknown"),
+        task=_task_cell(snapshot),
+        tests=_tests_cell(snapshot),
+        ci=WorkspaceCIResult(status=ci_status) if ci_status is not None else None,
+    )
+
+
 def _session_detail(
     item: dict[str, Any],
     workspace_id: str,
     context: ContextTrace | None,
+    receipts: list[ReceiptSummary] | None = None,
 ) -> ExecutionSessionDetail:
     summary = _session_summary(item, workspace_id)
     outcome = _text(item.get("outcome"), default=summary.title)
@@ -625,6 +759,7 @@ def _session_detail(
         snapshot_status=summary.snapshot_status,
         legacy=summary.legacy,
         report_delivery_status=summary.report_delivery_status,
+        receipts=receipts,
     )
 
 
@@ -1053,6 +1188,12 @@ def _setup_artifact_item(
             logger.warning("Result card unavailable for {}: {}", session_id, exc)
             result_card = None
 
+    # Built here because this is the one place that holds both the card and the
+    # record it was built from: the rail states the card's words and the
+    # record's counts, and re-deriving either downstream is how two surfaces
+    # start disagreeing.
+    workspace_result = _workspace_result(result_card, snapshot)
+
     return {
         "id": session_id,
         "workspace": workspace_id,
@@ -1064,6 +1205,9 @@ def _setup_artifact_item(
         "ci_comparison": comparison.model_dump(mode="json") if comparison else None,
         "task_completion": task_completion.model_dump(mode="json") if task_completion else None,
         "result_card": result_card,
+        "result": (
+            workspace_result.model_dump(mode="json") if workspace_result is not None else None
+        ),
         "snapshot_status": snapshot_status,
         "legacy": legacy,
         "verdict_source": verdict_source,

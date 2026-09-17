@@ -170,6 +170,8 @@ class MirrorReader:
     def execute_command(self, command: str, timeout: int | None = None, **_: Any) -> dict[str, Any]:
         if command.startswith("file="):
             return self._named_json_file_stream(command)
+        if command.startswith("count=0; raw_bytes=0;"):
+            return self._named_json_record_stream(command)
         if command.startswith("cat "):
             return self._cat(command)
         if "setup-report-*.md" in command:
@@ -205,6 +207,47 @@ class MirrorReader:
                 records.append((target.name, target.read_bytes()))
             except OSError:
                 return {"output": "", "exit_code": 1, "success": False}
+        return {
+            "output": frame_named_json_record_stream(records),
+            "exit_code": 0,
+            "success": True,
+        }
+
+    def _named_json_record_stream(self, command: str) -> dict[str, Any]:
+        """Answer the same bounded transport for a whole named-record directory.
+
+        The single-file shape above already had a branch; the directory shape
+        did not, so a reader asking this mirror for the run's invocation
+        receipts got exit 1 and the caller could not tell that from a run that
+        recorded none. The command is rebuilt from the directory it names and
+        compared whole, so only the exact transport is answered.
+        """
+
+        from sag.agent.evidence_records import (
+            frame_named_json_record_stream,
+            named_json_record_stream_command,
+        )
+
+        prefix, separator, _ = command.partition("/*.json; do ")
+        _, marker, quoted = prefix.partition("for file in ")
+        if not separator or not marker:
+            return {"output": "", "exit_code": 1, "success": False}
+        try:
+            directories = shlex.split(quoted)
+        except ValueError:
+            return {"output": "", "exit_code": 1, "success": False}
+        if len(directories) != 1 or command != named_json_record_stream_command(directories[0]):
+            return {"output": "", "exit_code": 1, "success": False}
+
+        # A directory that is not mirrored yields no files, which is what the
+        # container's own `for file in <dir>/*.json` loop yields for it too.
+        records: list[tuple[str, bytes]] = []
+        try:
+            for path in sorted(self._host(directories[0]).glob("*.json")):
+                if path.is_file():
+                    records.append((path.name, path.read_bytes()))
+        except OSError:
+            return {"output": "", "exit_code": 1, "success": False}
         return {
             "output": frame_named_json_record_stream(records),
             "exit_code": 0,

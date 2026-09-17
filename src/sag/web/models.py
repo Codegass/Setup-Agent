@@ -534,6 +534,61 @@ class ReportDocument(WebModel):
     blocks: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class WorkspaceTaskResult(WebModel):
+    """How far the run got through the steps the task named."""
+
+    status: str
+    completed: int
+    required: int
+
+
+class WorkspaceTestResult(WebModel):
+    executed: int
+    passed: int
+    failed: int
+    errors: int
+    skipped: int
+
+
+class WorkspaceCIResult(WebModel):
+    #: The word the result card already spelled for the Official CI row, copied
+    #: rather than respelled. One vocabulary, so the rail and the card agree.
+    status: str
+
+
+class WorkspaceResult(WebModel):
+    """The cells the dashboard rail shows for one workspace.
+
+    Read off the run's own result card and record, never recomputed, so the
+    rail cannot state a different number from the card beneath it. A cell the
+    record declined to measure is absent, not zero.
+    """
+
+    verdict: str
+    task: WorkspaceTaskResult | None = None
+    tests: WorkspaceTestResult | None = None
+    ci: WorkspaceCIResult | None = None
+
+
+class ReceiptSummary(WebModel):
+    """One invocation as its receipt recorded it. Copied, never recomputed."""
+
+    receipt_id: str = Field(serialization_alias="receiptId")
+    tool: str
+    argv: str
+    working_directory: str | None = Field(default=None, serialization_alias="workingDirectory")
+    actual_cwd: str | None = Field(default=None, serialization_alias="actualCwd")
+    exit_code: int | None = Field(default=None, serialization_alias="exitCode")
+    outcome: str
+    lifecycle_state: str | None = Field(default=None, serialization_alias="lifecycleState")
+    toolchain: dict[str, str | None] | None = None
+    jdk_major: str | None = Field(default=None, serialization_alias="jdkMajor")
+    jdk_version: str | None = Field(default=None, serialization_alias="jdkVersion")
+    reports_new: int = Field(default=0, serialization_alias="reportsNew")
+    reports_changed: int = Field(default=0, serialization_alias="reportsChanged")
+    tests_reported: int | None = Field(default=None, serialization_alias="testsReported")
+
+
 class ExecutionSessionSummary(WebModel):
     id: str
     workspace: str
@@ -561,6 +616,9 @@ class ExecutionSessionSummary(WebModel):
         validation_alias=AliasChoices("report_delivery_status", "reportDeliveryStatus"),
         serialization_alias="reportDeliveryStatus",
     )
+    #: The rail's cells for the run this session is. None when the run sealed no
+    #: record to read them off.
+    result: WorkspaceResult | None = None
 
 
 class WorkspaceSummary(WebModel):
@@ -585,6 +643,9 @@ class WorkspaceSummary(WebModel):
     active_session: str | None = Field(default=None, serialization_alias="activeSession")
     latest_session: str | None = Field(default=None, serialization_alias="latestSession")
     sessions: list[ExecutionSessionSummary] = Field(default_factory=list)
+    #: Copied from the workspace's latest session so the rail row and the
+    #: session it names cannot disagree.
+    result: WorkspaceResult | None = None
     updated: str = "unknown"
 
 
@@ -819,6 +880,10 @@ class ExecutionSessionDetail(WebModel):
     #: that directory (the timeline) are not offered at all. A real session
     #: never carries this, whatever state it is in.
     demo: bool = False
+    #: Every command the run recorded, as its receipt wrote it down. `[]` means
+    #: the run recorded none; None means the receipts could not be read, which
+    #: is a different thing and is shown as one.
+    receipts: list[ReceiptSummary] | None = None
     #: The one result card the CLI block and the report table also print,
     #: copied rather than re-derived. None when the run sealed no record to
     #: copy from.

@@ -164,6 +164,7 @@ export interface WorkspaceSummary {
   activeSession?: string | null
   latestSession?: string | null
   sessions?: ExecutionSessionSummary[]
+  result?: WorkspaceResult | null
   updated: string
 }
 
@@ -256,12 +257,199 @@ export interface ModuleRollup {
   coverageSource?: string | null
 }
 
-export interface VerdictSummary {
-  tone: "success" | "attention" | "failed"
+// ── the result card ──────────────────────────────────────────────────────────
+// The one card the terminal block and the report table also print, served
+// whole. camelCase like the rest of this file: `src/sag/result_card/models.py`
+// serves it under a camelCase alias generator.
+
+export type RowKey = "setup" | "task" | "build" | "tests" | "coverage" | "ci" | "report"
+/** The card's own four words. Deliberately not `Tone`, which this file already
+ *  uses for the badge palette (`neutral | blue | green | red | amber`). */
+export type CardTone = "success" | "attention" | "failed" | "neutral"
+
+/** One measurement, stated once. `reason` is present exactly when the row has
+ *  nothing to measure, so a blank never has to be guessed at. */
+export interface ResultRow {
+  key: RowKey
+  label: string
+  status: string
+  tone: CardTone
   headline: string
   detail?: string | null
-  verdict?: CanonicalVerdict | null
-  source?: VerdictSource
+  reason?: string | null
+  items?: string[]
+  refs?: string[]
+}
+
+export interface ResultStats {
+  phasesCompleted?: number | null
+  phasesTotal?: number | null
+  turns?: number | null
+  toolCalls?: number | null
+  toolFailures?: number | null
+  tokensIn?: number | null
+  tokensOut?: number | null
+  wallClockSeconds?: number | null
+  model?: string | null
+  advisorModel?: string | null
+}
+
+export interface AttentionItem {
+  kind: "failing_tests" | "task_step" | "blocked_phase" | "ci_finding" | "build_warning" | "report"
+  title: string
+  detail?: string | null
+  refs?: string[]
+}
+
+export interface ResultCard {
+  schemaVersion: 1
+  runId: string
+  project?: string | null
+  goal?: string | null
+  commit?: string | null
+  container?: string | null
+  sessionDir?: string | null
+  verdict: CanonicalVerdict
+  verdictSource: "snapshot" | "legacy" | "unavailable"
+  rows: ResultRow[]
+  stats: ResultStats
+  attention: AttentionItem[]
+  notes: string[]
+}
+
+// ── the records the card is built from ───────────────────────────────────────
+// snake_case, for the same reason the trajectory block below is: these payloads
+// are the run's own records, served unaliased, and a second name for each field
+// would put this file out of step with `verdict.json` and every CLI dump of it.
+
+/** An exact fraction as two integers. A percentage is presentation only. */
+export interface Pair {
+  numerator: number
+  denominator: number
+}
+
+export interface LifecycleParity {
+  status: "equivalent" | "not_equivalent" | "unknown"
+  form: "maven_phases" | "gradle_tasks" | "none"
+  ci_command: string
+  sag_commands: string[]
+  ci_reach?: string | null
+  sag_reach?: string | null
+  missing: string[]
+  extra: string[]
+}
+
+export interface Attainment {
+  verdict: "invalid" | "not_met" | "partial" | "met" | "exceeded"
+  cell_id: string
+  cell_grade: "A" | "B"
+  valid: boolean
+  target_usable: boolean
+  clean: boolean
+  clean_form: "ids" | "counts"
+  built: boolean
+  alpha?: Pair | null
+  alpha_test?: Pair | null
+  alpha_build?: Pair | null
+  executed_observed: number
+  executed_target: number
+  red_observed: number
+  red_target: number
+  modules_matched: number
+  modules_target: number
+  missing_module_ids: string[]
+  build_form: "modules" | "conclusion"
+  modules_basis?: "log" | "declared" | "test_bearing" | null
+  unmatched_observed_module_ids: string[]
+  lifecycle_parity?: LifecycleParity | null
+  unexpected_red_ids: string[]
+  reason_codes: string[]
+}
+
+export interface CIComparison {
+  schema_version: number
+  status: "evaluated" | "no_target" | "no_matched_cell" | "unavailable"
+  run_id: string
+  repo?: string | null
+  target_sha?: string | null
+  target_record_sha256?: string | null
+  attainment?: Attainment | null
+  receipt_ids: string[]
+  commands: string[]
+  acceptance_command?: string | null
+  test_identity_basis?: string | null
+  reasons: string[]
+}
+
+export interface TaskStep {
+  id: string
+  command: string
+  status: "complete" | "failed" | "missing" | "out_of_order" | "unavailable"
+  receipt_id?: string | null
+  exit_code?: number | null
+  reason?: string | null
+}
+
+export interface TaskCompletion {
+  run_id: string
+  task_sha256?: string | null
+  status: "complete" | "incomplete" | "unavailable"
+  steps: TaskStep[]
+  reasons: string[]
+}
+
+/** A grain is one of three shapes: measured, unbounded, or unavailable. */
+export interface GrainRate {
+  band: "fully" | "most" | "half" | "few" | "none" | "unavailable" | "unbounded"
+  rate?: number | null
+  numerator?: number
+  denominator?: number
+  reason?: string
+}
+
+/** Every member is optional: the session detail ships only the grains the run
+ *  measured, which for most runs is `build.modules` alone. A type alias rather
+ *  than an interface, so it still satisfies the `Record<string, unknown>` that
+ *  the build presentation reads it through. */
+export type RunRates = {
+  build?: { modules?: GrainRate; classes?: GrainRate }
+  test?: { cases?: GrainRate; modules?: GrainRate }
+  coverage?:
+    | { status: "collected"; line_rate: number; source: string }
+    | { status: "unavailable"; reason: string }
+}
+
+/** One invocation, as its receipt recorded it. */
+export interface ReceiptSummary {
+  receiptId: string
+  tool: string
+  argv: string
+  workingDirectory?: string | null
+  actualCwd?: string | null
+  exitCode?: number | null
+  outcome: string
+  lifecycleState?: string | null
+  toolchain?: { executable?: string | null; version?: string | null } | null
+  jdkMajor?: string | null
+  jdkVersion?: string | null
+  reportsNew: number
+  reportsChanged: number
+  testsReported?: number | null
+}
+
+/** The cells the dashboard rail shows for one workspace. A cell the run did not
+ *  measure is absent — there is no zero to fall back on. */
+export interface WorkspaceResult {
+  verdict: CanonicalVerdict
+  task?: { status: string; completed: number; required: number } | null
+  tests?: {
+    executed: number
+    passed: number
+    failed: number
+    errors: number
+    skipped: number
+  } | null
+  ci?: { status: string } | null
 }
 
 export interface ExecutionSessionDetail {
@@ -274,20 +462,18 @@ export interface ExecutionSessionDetail {
   finish?: string | null
   duration: string
   outcome: string
-  verdict?: VerdictSummary | null
+  resultCard?: ResultCard | null
   model?: string | null
   steps?: number | null
   stepBudget?: number | null
   evidenceStatus?: string | null
   canonicalVerdict?: CanonicalVerdict
-  rates?: Record<string, unknown> | null
-  ciComparison?: {
-    status: "evaluated" | "no_target" | "no_matched_cell" | "unavailable"
-    attainment?: { verdict: string } | null
-  } | null
-  ciComparisonLines?: string[]
-  taskCompletion?: { status: "complete" | "incomplete" | "unavailable" } | null
-  taskCompletionLines?: string[]
+  rates?: RunRates | null
+  ciComparison?: CIComparison | null
+  taskCompletion?: TaskCompletion | null
+  /** `[]` means the run recorded no commands; `null` means the receipts could
+   *  not be read. The two are shown differently. */
+  receipts?: ReceiptSummary[] | null
   snapshotStatus?: SnapshotStatus
   legacy?: boolean
   reportDeliveryStatus?: ReportDeliveryStatus | null
@@ -299,26 +485,12 @@ export interface ExecutionSessionDetail {
   reportDoc?: ReportDocument | null
   blocker?: { code: string; title: string; detail: string; hint: string } | null
   evidence: EvidenceGroup[]
-  files?: FileChangeDigest | null
   context?: ContextTrace | null
   logs: string[]
   partial?: boolean
   /** A fabricated session (`sag ui --demo`): it stands for no run, so no
    *  control ledger exists for it and no trajectory can be derived. */
   demo?: boolean
-}
-
-export interface FileChangeDigest {
-  snapshot: { base: string; head: string; mode: string }
-  counts: { modified: number; added: number; deleted: number; renamed: number }
-  items: Array<{
-    path: string
-    change: string
-    type: string
-    size: string
-    mtime: string
-    note: string
-  }>
 }
 
 export interface ContextTrace {
@@ -431,6 +603,8 @@ export interface TrajectorySession {
 export interface TrajectoryCall {
   tool: string
   params_ref?: string | null
+  /** What this call asked for, in one line. */
+  summary?: string | null
 }
 
 /** Exact call parameters resolved lazily from one control-ledger envelope. */
@@ -443,11 +617,16 @@ export interface TrajectoryEnvelope {
 
 /** The tool result. `ref` is what the model read; `evidence_ref` is the raw
  *  tool output, when those are not the same bytes. */
+export type ObservationOutcome = "ok" | "failed" | "refused" | "pending" | "cancelled"
+
 export interface TrajectoryObservation {
   ref?: string | null
   evidence_ref?: string | null
   error_code?: string | null
   failure_signature?: string | null
+  outcome?: ObservationOutcome | null
+  /** How this call came out, in one line. */
+  summary?: string | null
 }
 
 export interface TrajectoryGate {
@@ -485,6 +664,9 @@ export interface TrajectoryPhase {
   /** Every grading the phase made, superseded ones included — which is what
    *  makes a supersedes chain walkable from the document alone. */
   gates: TrajectoryGate[]
+  validator_state?: "green" | "partial" | "red" | "unavailable" | null
+  reason?: string | null
+  key_results?: string | null
 }
 
 export interface TrajectoryAnnotation {

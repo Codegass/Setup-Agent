@@ -31,10 +31,12 @@ from sag.web.models import (
     ModuleRollup,
     ModuleSummary,
     ObservationCountSummary,
+    ReceiptSummary,
     ReportDocument,
     TerminalConnectionState,
     TestEvidenceLayers,
     TestSummary,
+    WorkspaceResult,
     WorkspaceSummary,
 )
 
@@ -456,6 +458,65 @@ def _commons_run_record() -> dict[str, Any]:
     }
 
 
+def _commons_receipts() -> list[ReceiptSummary]:
+    """The two commands this demo run would have recorded receipts for.
+
+    Kept in step with the demo record beside it: the same three modules the
+    build row counts, and the same 320 executions the tests row states.
+    """
+
+    return [
+        ReceiptSummary(
+            receipt_id="inv-maven-1-demo0commonscli-0001",
+            tool="maven",
+            argv="/opt/apache-maven-3.9.9/bin/mvn -B clean install -DskipTests",
+            working_directory="/workspace/commons-cli",
+            actual_cwd="/workspace/commons-cli",
+            exit_code=0,
+            outcome="completed",
+            lifecycle_state="finished",
+            toolchain={
+                "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+                "version": "Apache Maven 3.9.9",
+            },
+            jdk_major="17",
+            jdk_version="17.0.20",
+        ),
+        ReceiptSummary(
+            receipt_id="inv-maven-1-demo0commonscli-0002",
+            tool="maven",
+            argv="/opt/apache-maven-3.9.9/bin/mvn -B test",
+            working_directory="/workspace/commons-cli",
+            actual_cwd="/workspace/commons-cli",
+            exit_code=1,
+            outcome="completed",
+            lifecycle_state="finished",
+            toolchain={
+                "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+                "version": "Apache Maven 3.9.9",
+            },
+            jdk_major="17",
+            jdk_version="17.0.20",
+            reports_new=3,
+            tests_reported=320,
+        ),
+    ]
+
+
+def _commons_workspace_result() -> WorkspaceResult:
+    """The rail's cells, built by the same function the live rail uses."""
+
+    from sag.agent.verdict_finalizer import RunVerdictSnapshot
+    from sag.web.session_registry import _workspace_result
+
+    result = _workspace_result(
+        _commons_result_card().model_dump(mode="json"),
+        RunVerdictSnapshot.model_validate(_commons_run_record()),
+    )
+    assert result is not None  # the demo record always builds a card
+    return result
+
+
 def _commons_result_card() -> RunResultCard:
     """The one result card — the CLI block and the report table print this shape."""
 
@@ -530,6 +591,7 @@ def build_demo_dashboard() -> DashboardResponse:
         changed=2,
         active_session=_COMMONS_SESSION_ID,
         latest_session=_COMMONS_SESSION_ID,
+        result=_commons_workspace_result(),
         updated="2026-06-06 02:16",
     )
     return DashboardResponse(docker=docker, workspaces=[workspace])
@@ -568,6 +630,7 @@ def get_demo_session(session_id: str) -> ExecutionSessionDetail:
         # timeline offer a panel that could only answer "unavailable".
         demo=True,
         result_card=_commons_result_card(),
+        receipts=_commons_receipts(),
         rates={
             "build": {
                 "modules": {

@@ -171,6 +171,9 @@ class ReadModelBuilder:
                 "active_session": active.id if active is not None else None,
                 "latest_session": latest.id,
                 "sessions": sessions,
+                # The rail row reads the same cells as the session it names, so
+                # it is copied rather than recomputed from the row's own fields.
+                "result": latest.result,
                 "updated": latest.finish or latest.start,
             }
         )
