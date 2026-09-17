@@ -37,7 +37,36 @@ const detail: ExecutionSessionDetail = {
   start: "now",
   duration: "1m",
   outcome: "All good.",
-  verdict: { tone: "success", headline: "Build passed. 10 tests passing", detail: null },
+  resultCard: {
+    schemaVersion: 1,
+    runId: "CC-1",
+    verdict: "success",
+    verdictSource: "snapshot",
+    rows: [
+      { key: "setup", label: "Setup", status: "success", tone: "success", headline: "4/4 phases" },
+      {
+        key: "task",
+        label: "Required task",
+        status: "not supplied",
+        tone: "neutral",
+        headline: "no required task was supplied",
+      },
+      { key: "build", label: "Build", status: "success", tone: "success", headline: "1/1 modules built" },
+      {
+        key: "tests",
+        label: "Tests",
+        status: "executed",
+        tone: "success",
+        headline: "10 executed · 10 passed · 0 failed · 0 errors · 0 skipped",
+      },
+      { key: "coverage", label: "Coverage", status: "not collected", tone: "neutral", headline: "not collected" },
+      { key: "ci", label: "Official CI", status: "not compared", tone: "neutral", headline: "not compared" },
+      { key: "report", label: "Report", status: "delivered", tone: "neutral", headline: "setup-report.md" },
+    ],
+    stats: {},
+    attention: [],
+    notes: [],
+  },
   build: { state: "success", tool: "Maven", time: "1s", note: "Compiled all modules" },
   test: { state: "pass", pass: 10, fail: 0, skip: 0, total: 10 },
   report: "ready",
@@ -57,11 +86,13 @@ describe("DetailPane", () => {
     cleanup()
   })
 
-  it("renders the header, the verdict band, and the tab bar (Overview active by default)", () => {
+  it("renders the header, the result band, and the tab bar (Overview active by default)", () => {
     render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
     expect(screen.getByRole("heading", { name: "owner/x" })).toBeInTheDocument()
-    // VerdictBand renders the server-composed headline.
-    expect(screen.getByText(/Build passed\. 10 tests passing/)).toBeInTheDocument()
+    // The result band states each of the card's seven rows.
+    expect(screen.getByText("4/4 phases")).toBeInTheDocument()
+    expect(screen.getByText("10 executed · 10 passed · 0 failed · 0 errors · 0 skipped")).toBeInTheDocument()
+    expect(screen.getByText("Official CI")).toBeInTheDocument()
     // Tab bar.
     expect(screen.getByRole("navigation", { name: /detail tabs/i })).toBeInTheDocument()
     const overview = screen.getByRole("button", { name: /^Overview/ })

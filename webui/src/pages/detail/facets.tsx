@@ -82,14 +82,20 @@ export function FacetBody({ id, detail }: { id: FacetId; detail: ExecutionSessio
 
 // ── Tab model (replaces the facet/scroll-spy nav; wired in DetailPane in Task 12) ──
 
+// `trajectory` and `ci` are the two names the result band links to that this
+// builder does not yet emit; Task 6 adds them here and retires `timeline`,
+// `flow` and `files` along with their bodies. Until then a row pointed at one
+// of them renders as plain text rather than a button that goes nowhere.
 export type TabId =
   | "overview"
   | "timeline"
+  | "trajectory"
   | "flow"
   | "tests"
   | "build"
   | "files"
   | "evidence"
+  | "ci"
   | "logs"
   | "report"
 
