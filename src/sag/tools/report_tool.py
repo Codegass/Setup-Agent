@@ -35,7 +35,6 @@ _MODULE_METRICS_UNSET = object()
 _RECEIPT_RECORDS_UNSET = object()
 _OBLIGATION_RECORDS_UNSET = object()
 _REPORT_METRICS_PUBLICATION_LOCK = threading.RLock()
-from sag.ui.events import EventType, UIEventEmitter
 from sag.verdict import (
     ADJUDICATED_CONFLICTS,
     COUNT_DERIVED_CONFLICTS,
@@ -273,7 +272,7 @@ REPORT_LEGACY_STATUS_TO_EVIDENCE_STATUS = {
 }
 
 
-class ReportTool(BaseTool, UIEventEmitter):
+class ReportTool(BaseTool):
     """
     Tool for generating comprehensive project setup reports and marking task completion.
 
@@ -305,7 +304,6 @@ class ReportTool(BaseTool, UIEventEmitter):
             "Creates both console output and a Markdown file in /workspace. "
             "Use this tool when all main tasks are finished to summarize the work done.",
         )
-        UIEventEmitter.__init__(self)
         self.docker_orchestrator = docker_orchestrator
         self.execution_history_callback = execution_history_callback
         self.context_manager = context_manager
@@ -563,40 +561,6 @@ class ReportTool(BaseTool, UIEventEmitter):
                         result_test_stats,
                         result_conflicts,
                     )
-
-                if self.workflow_mode == "setup":
-                    snapshot_status = report_snapshot.get("status") or {}
-                    snapshot_phases = report_snapshot.get("phases") or {}
-                    ui_total_tests = int(snapshot_status.get("tests_total") or 0)
-                    ui_passed_tests = int(snapshot_status.get("tests_passed") or 0)
-                    ui_flaky_tests = int(snapshot_status.get("tests_flaky") or 0)
-                    ui_build_success = snapshot_phases.get("build") is True
-                    ui_test_success = snapshot_status.get("test_judgment") == "success"
-                    ui_test_pass_rate = float(snapshot_status.get("pass_pct") or 0)
-                else:
-                    test_analysis = actual_accomplishments.get("physical_validation", {}).get(
-                        "test_analysis", {}
-                    )
-                    ui_build_success = actual_accomplishments.get("build_success", False)
-                    ui_test_success = actual_accomplishments.get("test_success", False)
-                    ui_test_pass_rate = test_analysis.get("pass_rate", 0)
-                    ui_total_tests = test_analysis.get("total_tests", 0)
-                    ui_passed_tests = test_analysis.get("passed_tests", 0)
-                    ui_flaky_tests = test_analysis.get("flaky_count", 0)
-
-                # Emit UI event for report generation
-                self.emit(
-                    EventType.REPORT_GENERATED,
-                    message=f"Report generated: {report_filename}",
-                    report_path=f"/workspace/{report_filename}",
-                    status=verified_status,
-                    build_success=ui_build_success,
-                    test_success=ui_test_success,
-                    test_pass_rate=ui_test_pass_rate,
-                    total_tests=ui_total_tests,
-                    passed_tests=ui_passed_tests,
-                    flaky_count=ui_flaky_tests,
-                )
 
                 return ToolResult.completed_success(
                     output=condensed_output,

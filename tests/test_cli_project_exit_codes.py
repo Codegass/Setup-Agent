@@ -205,6 +205,51 @@ def test_the_live_display_is_gone():
             importlib.import_module(module_name)
 
 
+def test_the_display_event_package_is_gone():
+    """The event plumbing that fed the deleted display goes with it.
+
+    A bare directory still imports as a namespace package, so this also
+    catches a `git rm` that left `src/sag/ui/` on disk.
+    """
+
+    import importlib
+
+    import pytest
+
+    for module_name in ("sag.ui", "sag.ui.events", "sag.ui.state"):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(module_name)
+
+
+def test_the_agent_and_report_tool_no_longer_emit_display_events():
+    """Nothing reads those events any more; the run is shown from the ledger."""
+
+    from sag.agent.react_engine import ReActEngine
+    from sag.tools.report_tool import ReportTool
+
+    checked = []
+    for cls in (ReActEngine, ReportTool):
+        checked.append(cls.__name__)
+        base_names = [base.__name__ for base in cls.__mro__]
+        assert "UIEventEmitter" not in base_names
+        for attribute in ("emit", "emit_event", "set_ui_manager", "_ui_manager"):
+            assert not hasattr(cls, attribute), f"{cls.__name__} still has {attribute}"
+
+    assert checked == ["ReActEngine", "ReportTool"]
+    assert not hasattr(ReActEngine, "_handle_tool_lifecycle_event")
+
+
+def test_the_web_evidence_index_is_gone():
+    """`EvidenceIndex` only ever grouped display records; nothing called it."""
+
+    import importlib
+
+    import pytest
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("sag.web.evidence")
+
+
 def test_project_command_success_ignores_report_delivery_failure(monkeypatch, tmp_path):
     result = invoke_project(monkeypatch, tmp_path, ReportFailingSuccessfulAgent)
 

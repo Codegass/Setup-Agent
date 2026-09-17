@@ -25,7 +25,6 @@ from sag.tools.base import (
     is_output_storage_ref,
     new_execution_id,
 )
-from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
 from .action_intents import (
     ActionIntent,
@@ -167,7 +166,6 @@ from .tool_orchestration import (
     ToolCall,
     ToolExecution,
     ToolExecutionRecord,
-    ToolLifecycleEvent,
     ToolOrchestrator,
     format_tool_result,
 )
@@ -494,7 +492,7 @@ _CONTAINED_CONTROL_PERSIST_CODES = frozenset(
 )
 
 
-class ReActEngine(UIEventEmitter):
+class ReActEngine:
     """Core ReAct (Reasoning and Acting) engine with dual model support."""
 
     def __init__(
@@ -515,7 +513,6 @@ class ReActEngine(UIEventEmitter):
         pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None,
         physical_validator: PhysicalValidator | None = None,
     ):
-        super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
         self.tools = {tool.name: tool for tool in tools}
         self.config = get_config()
@@ -6827,36 +6824,9 @@ class ReActEngine(UIEventEmitter):
             update_successful_states=self._update_successful_states,
             add_system_guidance=self._add_system_guidance,
             get_timestamp=self._get_timestamp,
-            event_sink=self._handle_tool_lifecycle_event,
             before_tool_execute=self._prepare_control_action,
             output_storage=self.output_storage,
             logger=logger,
-        )
-
-    def _handle_tool_lifecycle_event(self, event: ToolLifecycleEvent) -> None:
-        """Map orchestration lifecycle events into typed UI events."""
-        lifecycle_event_map = {
-            "tool_start": EventType.TOOL_START,
-            "tool_parameters_fixed": EventType.TOOL_PARAMETERS_FIXED,
-            "tool_result": EventType.TOOL_RESULT,
-            "tool_error": EventType.TOOL_ERROR,
-        }
-        event_type = lifecycle_event_map.get(event.event_type)
-        if event_type is None:
-            return None
-
-        metadata = dict(event.metadata)
-        metadata.setdefault("tool_name", event.call.name)
-        metadata.setdefault("tool_params", event.call.validated_params or event.call.raw_params)
-        metadata.setdefault("tool_message", event.message)
-
-        self.emit_event(
-            UIEvent(
-                event_type,
-                event.message,
-                level=event.level,
-                metadata=metadata,
-            )
         )
 
     def _build_tool_call_from_step(self, step: ReActStep) -> ToolCall:
@@ -8745,15 +8715,6 @@ class ReActEngine(UIEventEmitter):
         # reaches agent_execution.log and main.log. The terminal shows the turn.
         self.agent_logger.info(f"🔧 ACTION: {step.content}")
 
-        # Emit UI event for action with parameters
-        self.emit(
-            EventType.AGENT_ACTION,
-            message=f"Using {step.tool_name or 'tool'}",
-            step_num=self.current_iteration,
-            tool_name=step.tool_name or "unknown",
-            tool_params=step.tool_params or {},
-        )
-
         # Update token tracker with actual tool name for the last action token record
         if step.tool_name:
             self.token_tracker.update_last_tool_name(step.tool_name)
@@ -9607,14 +9568,6 @@ class ReActEngine(UIEventEmitter):
 
         # The whole observation belongs in a file, not on a terminal.
         logger.debug(f"👁️ OBSERVATION: {observation}")
-
-        # Emit UI event for observation
-        self.emit(
-            EventType.AGENT_OBSERVATION,
-            message=observation[:200]
-            + ("..." if len(observation) > 200 else ""),  # Truncate for display
-            step_num=self.current_iteration,
-        )
 
         return obs_step
 
