@@ -184,8 +184,14 @@ class SessionLogger:
             )
             return self._control_event_sink
 
-        if mirror is not None:
-            self._control_event_sink.attach_mirror(mirror)
+        if mirror is not None and not self._control_event_sink.attach_mirror(mirror):
+            # Declining in silence is the exact shape of the defect this
+            # method exists to end: a container ledger that is simply never
+            # written, discoverable only once the container is gone.
+            logger.warning(
+                "This session's control stream already has a container mirror; "
+                "the second one was declined and will record nothing."
+            )
         for observer in observers:
             self._control_event_sink.add_observer(observer)
         return self._control_event_sink
@@ -268,12 +274,15 @@ def setup_console_logging(config) -> None:
 
     logger.remove()
 
+    # No `filter=`: `level` is the whole rule. `console_level` can only yield
+    # WARNING, ERROR, or DEBUG-when-verbose, so a record that clears the sink's
+    # level is a record the console wants, and a second gate saying the same
+    # thing only reads as though some case still needed it.
     logger.add(
         sys.stderr,
         level=console_level(config),
         format=_get_console_format(config),
         colorize=True,
-        filter=lambda record: _console_filter(config, record),
     )
 
 
@@ -291,17 +300,6 @@ def _get_console_format(config) -> str:
         "<level>{level: <8}</level> | "
         "<level>{message}</level>"
     )
-
-
-def _console_filter(config, record) -> bool:
-    """Filter console output based on verbose setting."""
-    if record["level"].no >= 20:
-        return True
-
-    if config.verbose and record["level"].no >= 10:
-        return True
-
-    return False
 
 
 def get_session_logger() -> Optional[SessionLogger]:

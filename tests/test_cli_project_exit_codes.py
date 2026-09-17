@@ -187,6 +187,11 @@ def test_the_ui_flag_is_gone():
     assert "--verbose and --ui flags cannot be used together" not in source
     assert "ui_mode" not in source
 
+    # The env var outlived the field it set: `Config.from_env` stopped reading
+    # it, so an operator following the example would be configuring nothing.
+    example = Path(__file__).resolve().parents[1] / ".env.example"
+    assert "SAG_UI_MODE" not in example.read_text(encoding="utf-8")
+
 
 def test_the_live_display_is_gone():
     """The flag's screen-painting half is deleted, not merely unreachable."""

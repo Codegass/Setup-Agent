@@ -869,7 +869,6 @@ class SetupAgent:
             # Step 1.6: Set repository URL for ReAct engine
             self.react_engine.set_repository_url(project_url, repository_ref=project_ref)
 
-
             # Step 2: Initialize trunk context mirroring the engine-owned phase
             # plan. Trunk tasks use phase_<name> ids so phase history persists
             # exactly like task history (phase_<name>.json — the webui keeps
@@ -1291,18 +1290,19 @@ START by working toward the current phase objective shown in my context.
 
         self.console.print("[dim]🚀 Starting intelligent project setup process...[/dim]")
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console,
-        ) as progress:
-            task = progress.add_task("Running setup process...", total=None)
-
-            termination = self.react_engine.run_setup_loop(
-                initial_prompt=setup_prompt, max_iterations=self.max_iterations
-            )
-            self.run_termination = termination
-            progress.update(task, description="Setup flow completed")
+        # No spinner over the loop: the turn stream IS the progress display now.
+        # A `Progress` is a live region that repaints its own row ten times a
+        # second, and it is bound to this console while the stream writes
+        # through the CLI's — a different `Console` on the same stdout, which
+        # Rich cannot hoist above a region it does not own. It erased every
+        # turn line as it was written. A spinner reading "Running setup
+        # process..." for the whole run said less than any one of those lines,
+        # and a long silence during a build is already spoken for by the job
+        # progress notes the stream itself carries.
+        termination = self.react_engine.run_setup_loop(
+            initial_prompt=setup_prompt, max_iterations=self.max_iterations
+        )
+        self.run_termination = termination
 
         self._finalize_run_pin()
         return termination

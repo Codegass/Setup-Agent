@@ -220,6 +220,34 @@ def _attach_turn_stream() -> Optional[TurnStreamRenderer]:
     return renderer
 
 
+def _close_turn_stream(renderer: Optional[TurnStreamRenderer]) -> None:
+    """End the stream: stop watching, then flush. Never raises.
+
+    Both halves matter. The renderer comes off the sink first because the sink
+    outlives it and a finished renderer refuses to be fed — that refusal would
+    travel through stdlib `logging`, which nothing here routes, and land on the
+    console this layer just quieted. And nothing in here may raise: this runs
+    from the `finally` of a command that ends in a broad `except`, so a write
+    that fails while closing — a closed terminal, a `BrokenPipeError` from
+    `sag project … | head` — would otherwise replace whatever the run actually
+    died of with a rendering error. The run's own exception outranks any
+    renderer, exactly as the ledger's append outranks any observer.
+    """
+
+    if renderer is None:
+        return
+    session_logger = get_session_logger()
+    if session_logger is not None:
+        try:
+            session_logger.get_control_event_sink().remove_observer(renderer.feed)
+        except Exception as exc:
+            logger.warning(f"Could not detach the turn stream from the control stream: {exc}")
+    try:
+        renderer.close()
+    except Exception as exc:
+        logger.warning(f"The turn stream failed to finish its last line: {exc}")
+
+
 def _execute_control(orchestrator, command: str, **kwargs):
     """Run mechanical container I/O without requiring a project runtime."""
 
@@ -773,8 +801,7 @@ def project(
                 ),
             )
         finally:
-            if turn_stream is not None:
-                turn_stream.close()
+            _close_turn_stream(turn_stream)
 
         snapshot = read_live_verdict_snapshot(orchestrator)
         session_logger = get_session_logger()
@@ -865,9 +892,7 @@ def run(ctx, docker_name, task, max_iterations, record, coverage):
         else:
             actual_project_name = detected or docker_label
 
-        console.print(
-            f"[bold green]🔧 Running task on project: {actual_project_name}[/bold green]"
-        )
+        console.print(f"[bold green]🔧 Running task on project: {actual_project_name}[/bold green]")
         console.print(f"[dim]Docker:[/dim] {docker_name}")
         console.print(f"[dim]Task:[/dim] {task}")
         if record:
@@ -890,8 +915,7 @@ def run(ctx, docker_name, task, max_iterations, record, coverage):
             # Run the task with the actual project name
             success = agent.run_task(project_name=actual_project_name, task_description=task)
         finally:
-            if turn_stream is not None:
-                turn_stream.close()
+            _close_turn_stream(turn_stream)
 
         # Save artifacts if recording is enabled
         if record:

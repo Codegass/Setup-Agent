@@ -23,9 +23,9 @@ def _config(*, verbose=False, log_level="INFO"):
 
 def test_there_is_one_console_implementation():
     source = inspect.getsource(logger_module.SessionLogger._setup_loggers)
-    assert "sys.stderr" not in source, (
-        "the session logger must delegate its console sink, not add a second one"
-    )
+    assert (
+        "sys.stderr" not in source
+    ), "the session logger must delegate its console sink, not add a second one"
     assert "setup_console_logging" in source
 
 
@@ -85,6 +85,6 @@ def test_the_console_sink_replaces_the_default_instead_of_stacking_on_it():
     assert result.returncode == 0, result.stderr
     assert "PROBE-DEBUG" not in result.stderr
     assert "PROBE-INFO" not in result.stderr
-    assert result.stderr.count("PROBE-WARNING") == 1, (
-        "a warning printed twice means two stderr sinks are open"
-    )
+    assert (
+        result.stderr.count("PROBE-WARNING") == 1
+    ), "a warning printed twice means two stderr sinks are open"

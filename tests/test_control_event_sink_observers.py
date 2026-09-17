@@ -26,18 +26,25 @@ console narrower than the renderer's 60-column floor, and the observer snapshot
 only bites when an observer registers another mid-delivery.
 """
 
+import ast
+import inspect
 import io
 import json
+import logging
 import re
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
+from loguru import logger as loguru_logger
 from rich.console import Console
 
 import sag.config as config_module
 import sag.config.logger as logger_module
 import sag.main as main_module
+from sag.agent.agent import SetupAgent
 from sag.agent.control_events import ControlEventSink
 from sag.config import Config
 from sag.config.logger import SessionLogger
@@ -51,6 +58,18 @@ MARKUP_TAGS = re.compile(r"\[/?(?:bold|green|red|yellow|cyan|dim)\]")
 
 def _sink(tmp_path, **kwargs) -> ControlEventSink:
     return ControlEventSink(tmp_path / "control_events.jsonl", run_id="run-1", **kwargs)
+
+
+@pytest.fixture
+def warnings_said():
+    """Everything the run said to its user at WARNING or above, as text."""
+
+    said: list[str] = []
+    sink_id = loguru_logger.add(said.append, level="WARNING", format="{message}")
+    try:
+        yield said
+    finally:
+        loguru_logger.remove(sink_id)
 
 
 def _session_logger(tmp_path, monkeypatch) -> SessionLogger:
@@ -200,6 +219,82 @@ def test_attach_mirror_reports_that_it_filled_an_absence(tmp_path):
     assert sink.attach_mirror(mirrored.append) is True
     sink.emit("evidence_close", {"reason": "aborted"})
     assert len(mirrored) == 1
+
+
+def test_a_mirror_that_arrives_late_is_given_what_it_missed(tmp_path):
+    """The container copy starts where the host copy starts.
+
+    Nothing emits between the CLI's early sink request and the agent's mirror
+    today, but that is an ordering held by luck, not by anything that would
+    complain if it changed. An archived ledger beginning at sequence 3 is the
+    same after-the-container-is-gone failure in a smaller size.
+    """
+
+    mirrored: list[str] = []
+    sink = _sink(tmp_path)
+    sink.emit("evidence_close", {"reason": "aborted"})
+    sink.emit("evidence_close", {"reason": "cancelled"})
+
+    assert sink.attach_mirror(mirrored.append) is True
+    sink.emit("evidence_close", {"reason": "test_terminated"})
+
+    sequences = [json.loads(line)["sequence"] for line in mirrored]
+    assert sequences == [1, 2, 3]
+    assert (tmp_path / "control_events.jsonl").read_text().splitlines() == [
+        line.rstrip("\n") for line in mirrored
+    ]
+
+
+def test_a_sink_opened_on_an_existing_ledger_replays_none_of_it(tmp_path):
+    """Backfill re-sends this sink's own appends, not an earlier process's."""
+
+    first = _sink(tmp_path)
+    first.emit("evidence_close", {"reason": "aborted"})
+    first.emit("evidence_close", {"reason": "cancelled"})
+
+    mirrored: list[str] = []
+    resumed = _sink(tmp_path)
+    # Its own append comes first, so the backfill has something to replay and
+    # the choice of where to start is the thing under test -- not an early
+    # return that would make any starting point look right.
+    resumed.emit("evidence_close", {"reason": "test_terminated"})
+    resumed.attach_mirror(mirrored.append)
+
+    assert [json.loads(line)["sequence"] for line in mirrored] == [3]
+
+    resumed.emit("evidence_close", {"reason": "aborted"})
+    assert [json.loads(line)["sequence"] for line in mirrored] == [3, 4]
+
+
+def test_a_failing_backfill_never_breaks_the_ledger(tmp_path):
+    def explode(_: str) -> None:
+        raise RuntimeError("container is gone")
+
+    sink = _sink(tmp_path)
+    sink.emit("evidence_close", {"reason": "aborted"})
+    assert sink.attach_mirror(explode) is True
+    assert sink.emit("evidence_close", {"reason": "cancelled"}).sequence == 2
+    assert len((tmp_path / "control_events.jsonl").read_text().strip().splitlines()) == 2
+
+
+def test_a_declined_mirror_says_so_out_loud(tmp_path, monkeypatch, warnings_said):
+    """Silence is the shape of the defect this whole task exists to end."""
+
+    session_logger = _session_logger(tmp_path, monkeypatch)
+    session_logger.get_control_event_sink(mirror=lambda line: None)
+    session_logger.get_control_event_sink(mirror=lambda line: None)
+
+    assert any("declined" in said for said in warnings_said), warnings_said
+
+
+def test_remove_observer_reports_whether_it_was_watching(tmp_path):
+    seen: list[str] = []
+    sink = _sink(tmp_path, observers=(seen.append,))
+
+    assert sink.remove_observer(seen.append) is True
+    assert sink.remove_observer(seen.append) is False
+    sink.emit("evidence_close", {"reason": "aborted"})
+    assert seen == []
 
 
 def test_observers_offered_to_a_cached_sink_still_reach_it(tmp_path, monkeypatch):
@@ -389,6 +484,27 @@ class _RecordingRenderer:
         self.closed = True
 
 
+def test_a_closed_stream_stops_watching_the_ledger(tmp_path, monkeypatch, caplog):
+    """A finished renderer must come off the sink, not sit on it refusing.
+
+    `feed()` after `close()` raises, the sink catches it and logs through
+    stdlib `logging` — which nothing in this repo routes, so it reaches stderr
+    through `lastResort` and lands on the console this layer quieted.
+    """
+
+    _terminal(monkeypatch)
+    session_logger = _session_logger(tmp_path, monkeypatch)
+    monkeypatch.setattr(logger_module, "_session_logger", session_logger)
+    renderer = main_module._attach_turn_stream()
+    sink = session_logger.get_control_event_sink()
+
+    main_module._close_turn_stream(renderer)
+
+    with caplog.at_level(logging.WARNING, logger="sag.agent.control_events"):
+        sink.emit("evidence_close", {"reason": "aborted"})
+    assert [record.getMessage() for record in caplog.records] == []
+
+
 class _CrashingAgent:
     def __init__(self, config, orchestrator, **kwargs):
         self.config = config
@@ -449,6 +565,226 @@ def test_a_crashing_run_still_closes_its_stream(monkeypatch, tmp_path, recording
     assert result.exit_code == 1
     assert len(recording_renderer.instances) == 1
     assert recording_renderer.instances[0].closed is True
+
+
+def test_a_renderer_that_dies_closing_never_replaces_the_run_s_own_error(
+    monkeypatch, tmp_path, recording_renderer
+):
+    """The run's exception outranks any renderer, as the ledger's append does.
+
+    `close()` runs from a `finally` inside a command that ends in a broad
+    `except Exception`, and it writes to the terminal — so a closed terminal or
+    a `BrokenPipeError` from `sag project ... | head` would otherwise be
+    reported to the user as the reason the run failed.
+    """
+
+    class _CloseFails(_RecordingRenderer):
+        def close(self) -> None:
+            raise RuntimeError("the terminal went away")
+
+    monkeypatch.setattr(main_module, "TurnStreamRenderer", _CloseFails)
+    monkeypatch.setattr(config_module, "_config", None)
+    monkeypatch.setattr(logger_module, "_session_logger", None)
+    monkeypatch.setattr(SessionLogger, "_setup_loggers", lambda self: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_module, "DockerOrchestrator", _FakeOrchestrator)
+    monkeypatch.setattr(main_module, "SetupAgent", _CrashingAgent)
+
+    result = CliRunner().invoke(
+        main_module.cli, ["project", "https://github.com/apache/commons-cli.git"]
+    )
+
+    assert result.exit_code == 1
+    assert "Setup failed: the run died mid-build" in result.output
+    assert "Setup failed: the terminal went away" not in result.output
+    # The renderer's own failure is still stated -- as a warning, in its place.
+    assert "turn stream failed to finish its last line: the terminal went away" in result.output
+
+
+# --- the stream survives the loop it is narrating ------------------------
+
+
+class _Screen:
+    """What a terminal SHOWS, as opposed to what was written to it.
+
+    A live region does not delete its bytes from the stream — it writes them,
+    then returns the cursor and erases the row. So `buffer.getvalue()` still
+    contains every turn line even when a user can read none of them, and any
+    assertion over the raw stream is blind to this entire class of defect. This
+    replays the control bytes Rich actually emits — `\\r`, `\\n`, `ESC[2K`,
+    `ESC[K`, `ESC[nA` — and reports the rows that are left.
+    """
+
+    _CSI = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])")
+
+    def __init__(self) -> None:
+        self.rows: list[str] = [""]
+        self.row = 0
+        self.col = 0
+
+    def _put(self, text: str) -> None:
+        row = self.rows[self.row].ljust(self.col)
+        self.rows[self.row] = row[: self.col] + text + row[self.col + len(text) :]
+        self.col += len(text)
+
+    def _newline(self) -> None:
+        self.row += 1
+        self.col = 0
+        while len(self.rows) <= self.row:
+            self.rows.append("")
+
+    def write(self, stream: str) -> "_Screen":
+        index = 0
+        while index < len(stream):
+            match = self._CSI.match(stream, index)
+            if match:
+                params, final = match.group(1), match.group(2)
+                if final == "K":
+                    mode = params or "0"
+                    if mode == "2":
+                        self.rows[self.row] = ""
+                    elif mode == "1":
+                        self.rows[self.row] = " " * self.col + self.rows[self.row][self.col :]
+                    else:
+                        self.rows[self.row] = self.rows[self.row][: self.col]
+                elif final == "A":
+                    self.row = max(0, self.row - int(params or 1))
+                elif final == "B":
+                    for _ in range(int(params or 1)):
+                        self._newline()
+                index = match.end()
+                continue
+            char = stream[index]
+            if char == "\r":
+                self.col = 0
+            elif char == "\n":
+                self._newline()
+            elif char == "\x1b":  # a control sequence this screen does not model
+                index += 1
+                continue
+            else:
+                self._put(char)
+            index += 1
+        return self
+
+    def text(self) -> str:
+        return "\n".join(row.rstrip() for row in self.rows)
+
+
+def test_a_screen_shows_what_a_live_region_left_behind():
+    """The emulator itself, or the fence below proves nothing.
+
+    A row written and then cleared is gone; a row above the cleared one stays.
+    """
+
+    assert _Screen().write("gone\r\x1b[2Kspinner").text() == "spinner"
+    assert _Screen().write("kept\ngone\r\x1b[2Kspinner").text() == "kept\nspinner"
+    assert _Screen().write("  #1   bash   clone").text() == "  #1   bash   clone"
+
+
+def test_every_turn_of_a_real_run_is_still_on_screen_when_the_loop_ends(tmp_path, monkeypatch):
+    """The whole point of this task, on the terminal it was built for.
+
+    `_run_unified_setup` is driven for real; only the engine it calls is a
+    stand-in, and that stand-in does what the live engine does — control events
+    land while the loop runs, and the renderer writes them out. The agent's
+    console and the CLI's console are two `Console` instances on one stdout,
+    which is the live arrangement: Rich hoists writes above a live region only
+    for the console that owns it, so a live region held across the loop repaints
+    over every turn line the stream just wrote.
+
+    Offline replays and `StringIO` assertions cannot see this — Rich does no
+    cursor work on a non-TTY, and the erased bytes are still in the buffer.
+    """
+
+    buffer = io.StringIO()
+    monkeypatch.setattr(
+        main_module, "console", Console(file=buffer, force_terminal=True, width=100)
+    )
+    agent_console = Console(file=buffer, force_terminal=True, width=100)
+
+    session_logger = _session_logger(tmp_path, monkeypatch)
+    monkeypatch.setattr(logger_module, "_session_logger", session_logger)
+    renderer = main_module._attach_turn_stream()
+    assert renderer is not None
+
+    # A live region erases the row the cursor is on, and a dispatch line sits
+    # open on that row for the whole duration of a tool call — 15m08s on one
+    # recorded run. Replaying a fixture takes milliseconds, so the wait that a
+    # real tool call supplies is supplied here instead, at exactly the moments
+    # it happens live: a line is open and the next refresh is about to land.
+    pending: list[str] = []
+    renderer._write = _tee(renderer._write, pending)
+
+    def run_setup_loop(*, initial_prompt, max_iterations):
+        naps = 0
+        for line in FIXTURE.open(encoding="utf-8"):
+            before = len(pending)
+            renderer.feed(line)
+            if naps < 3 and len(pending) > before and not pending[-1].endswith("\n"):
+                naps += 1
+                time.sleep(0.15)
+        return "termination"
+
+    stand_in = SimpleNamespace(
+        console=agent_console,
+        react_engine=SimpleNamespace(run_setup_loop=run_setup_loop),
+        max_iterations=5,
+        run_termination=None,
+        _finalize_run_pin=lambda: None,
+    )
+    SetupAgent._run_unified_setup(
+        stand_in, project_url="https://example.invalid/x.git", project_name="x", goal="build it"
+    )
+    renderer.close()
+
+    # What the renderer WROTE is the claim; what the screen SHOWS is the test.
+    # Taking the expected ids from the renderer's own chunks rather than from a
+    # ledger kind keeps this from going vacuous if a fixture does not carry
+    # that kind — an empty expectation is a test that cannot fail.
+    written = sorted({int(turn) for turn in re.findall(r"^  #(\d+) ", "".join(pending), re.M)})
+    assert len(written) > 10, "the stand-in loop rendered almost nothing"
+
+    screen = _Screen().write(buffer.getvalue()).text()
+    shown = sorted({int(turn) for turn in re.findall(r"^  #(\d+) ", screen, re.M)})
+    erased = [turn for turn in written if turn not in shown]
+    assert erased == [], f"turns erased from the screen: {erased}\n--- screen ---\n{screen}"
+
+
+def test_the_setup_loop_runs_under_no_live_region():
+    """The backstop: the turn stream IS the progress display now.
+
+    A source check as well as the behavioural one above, because the defect is
+    a `with` block that a future edit could reintroduce anywhere in the method.
+    """
+
+    module = ast.parse(Path(inspect.getfile(SetupAgent)).read_text(encoding="utf-8"))
+    bodies = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_unified_setup"
+    ]
+    assert len(bodies) == 1, "located the wrong method"
+    body = bodies[0]
+
+    def calls(node) -> set[str]:
+        names = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                func = sub.func
+                names.add(func.id if isinstance(func, ast.Name) else getattr(func, "attr", ""))
+        return names
+
+    assert "run_setup_loop" in calls(body), "the method stopped running the loop"
+    for node in ast.walk(body):
+        if isinstance(node, ast.With) and "run_setup_loop" in calls(node):
+            opened = {
+                item.context_expr.func.id
+                for item in node.items
+                if isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+            }
+            assert "Progress" not in opened, "the ReAct loop is inside a live region again"
 
 
 def test_a_crashing_task_still_closes_its_stream(monkeypatch, tmp_path, recording_renderer):
