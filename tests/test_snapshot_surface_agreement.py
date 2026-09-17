@@ -49,7 +49,6 @@ from sag.result_card.markdown import render_result_card_markdown
 from sag.result_card.models import ROW_LABELS, ROW_ORDER, RunResultCard
 from sag.result_card.rows import _CI_STATUS_WORD, _CI_TONE
 from sag.tools.report_tool import ReportTool
-from sag.ui.ui_manager import UIManager
 from sag.web.session_registry import _session_detail, _setup_artifact_item
 
 VERDICT_PATH = "/workspace/.setup_agent/verdict.json"
@@ -557,36 +556,6 @@ def test_setup_report_evidence_summary_keeps_failures_and_errors_distinct(tvm_sn
     assert result.test_stats.errors == 328
     assert "failed 0 · errors 328" in result.output
     assert "328 failed" not in result.output
-
-
-def test_setup_report_terminal_ui_uses_sealed_build_and_unique_test_stats(
-    snapshot_factory,
-):
-    snapshot = snapshot_factory(
-        verdict="success",
-        unique_total=5,
-        unique_passed=5,
-        unique_failed=0,
-        unique_errors=0,
-        raw_executions=7,
-    )
-    orchestrator = SnapshotOrchestrator({VERDICT_PATH: snapshot.model_dump_json()})
-    console = Console(record=True, width=100)
-    manager = UIManager(project_name="tvm", console=console)
-    tool = ReportTool(orchestrator, workflow_mode="setup")
-    tool.set_ui_manager(manager)
-
-    result = tool.execute(summary="TVM setup", status="success")
-    console.print(manager._format_report_summary())
-    rendered = console.export_text()
-
-    assert result.succeeded is True
-    assert manager.report_data["build_success"] is True
-    assert manager.report_data["total_tests"] == 5
-    assert manager.report_data["passed_tests"] == 5
-    assert manager.report_data["test_pass_rate"] == 100.0
-    assert "Build: SUCCESS" in rendered
-    assert "Tests: 5/5 passed (100.0%)" in rendered
 
 
 def test_renderers_keep_observation_execution_grain_explicit(surface_harness, snapshot_factory):

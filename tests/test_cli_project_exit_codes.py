@@ -173,10 +173,31 @@ def test_project_command_returns_nonzero_for_partial_snapshot(monkeypatch, tmp_p
     assert "2 failed" in result.output
 
 
-def test_project_command_returns_nonzero_for_partial_snapshot_in_ui(monkeypatch, tmp_path):
-    result = invoke_project(monkeypatch, tmp_path, PartialSetupAgent, "--ui")
+def test_the_ui_flag_is_gone():
+    """Every command that offered the live display has stopped offering it."""
 
-    assert result.exit_code == 1
+    for argv in (["--help"], ["project", "--help"], ["run", "--help"]):
+        result = CliRunner().invoke(main_module.cli, argv)
+        assert result.exit_code == 0, result.output
+        assert "--ui" not in result.output
+
+    import inspect
+
+    source = inspect.getsource(main_module)
+    assert "--verbose and --ui flags cannot be used together" not in source
+    assert "ui_mode" not in source
+
+
+def test_the_live_display_is_gone():
+    """The flag's screen-painting half is deleted, not merely unreachable."""
+
+    import importlib
+
+    import pytest
+
+    for module_name in ("sag.ui.ui_manager", "sag.ui.state_aggregator", "sag.ui.diagnosis"):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(module_name)
 
 
 def test_project_command_success_ignores_report_delivery_failure(monkeypatch, tmp_path):

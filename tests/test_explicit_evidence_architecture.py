@@ -2,7 +2,6 @@ from engine_driver import execute_action_steps
 from types import SimpleNamespace
 
 import pytest
-from rich.console import Console
 from test_build_tool_preflight_integration import (
     ENFORCER_FAIL,
     ScriptedBackendTool,
@@ -29,7 +28,6 @@ from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome, Tes
 from sag.tools.base import BaseTool, OutputPersistenceError, ToolResult
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.report_tool import ReportTool
-from sag.ui.ui_manager import UIManager
 
 
 def _orchestrator(engine, tools, *, recent_tool_executions=None, successful_states=None):
@@ -454,7 +452,7 @@ def test_construction_persistence_failure_ingests_bounded_draft_once(
         ),
     ],
 )
-def test_sealed_test_judgment_owns_report_and_terminal_ui(
+def test_sealed_test_judgment_owns_the_report(
     tmp_path,
     build_outcome,
     build_green,
@@ -519,15 +517,11 @@ def test_sealed_test_judgment_owns_report_and_terminal_ui(
         EvidenceCloseReason.TEST_TERMINATED,
     )
     orchestrator = SnapshotOrchestrator({VERDICT_PATH: snapshot.model_dump_json()})
-    console = Console(record=True, width=100)
-    manager = UIManager(project_name="demo", console=console)
     report = ReportTool(orchestrator, workflow_mode="setup")
-    report.set_ui_manager(manager)
 
     result = report.execute(summary="Demo setup", status=expected_overall)
 
     assert result.succeeded is True
-    assert manager.report_data["test_success"] is (expected_judgment == "success")
     assert snapshot.test_stats.model_dump().get("judgment") == expected_judgment
     assert snapshot.verdict == expected_overall
     report_status = result.metadata["report_snapshot"]["status"]

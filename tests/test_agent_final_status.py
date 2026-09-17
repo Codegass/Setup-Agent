@@ -792,7 +792,7 @@ def _termination(delivery=ReportDeliveryStatus.DELIVERED):
 def _agent_for_unified_setup(termination):
     output = StringIO()
     agent = object.__new__(SetupAgent)
-    agent.config = SimpleNamespace(ui_mode=False)
+    agent.config = SimpleNamespace()
     agent.console = Console(file=output, force_terminal=False)
     agent.max_iterations = 5
     agent.react_engine = SimpleNamespace(run_setup_loop=lambda **kwargs: termination)

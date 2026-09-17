@@ -8741,8 +8741,9 @@ class ReActEngine(UIEventEmitter):
         None. When the step carries a native `tool_call_id`, its observation is
         stamped with the same id so the two render as a tool_use/tool_result
         pair."""
+        # agent_logger already binds AGENT_TRACE and context_id, so the line
+        # reaches agent_execution.log and main.log. The terminal shows the turn.
         self.agent_logger.info(f"🔧 ACTION: {step.content}")
-        logger.info(f"🔧 ACTION: {step.content}")
 
         # Emit UI event for action with parameters
         self.emit(
@@ -9604,9 +9605,8 @@ class ReActEngine(UIEventEmitter):
         )
         self.steps.append(obs_step)
 
-        # FIXED: Only log once to prevent duplicate output in logs
-        # Use logger.info for main logging, agent_logger for internal tracking only
-        logger.info(f"👁️ OBSERVATION: {observation}")
+        # The whole observation belongs in a file, not on a terminal.
+        logger.debug(f"👁️ OBSERVATION: {observation}")
 
         # Emit UI event for observation
         self.emit(

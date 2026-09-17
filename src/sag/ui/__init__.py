@@ -1,10 +1,10 @@
 """
-UI Module for Setup Agent
+UI event types shared by the agent's tools.
 
-Provides enhanced CLI UI with Rich components, live displays, and event-driven updates.
+The live terminal display this package once painted has been retired; the run
+is now shown one line per turn, derived from the control ledger.
 """
 
 from sag.ui.events import EventType, PhaseType, UIEvent
-from sag.ui.ui_manager import UIManager
 
-__all__ = ["UIEvent", "EventType", "PhaseType", "UIManager"]
+__all__ = ["UIEvent", "EventType", "PhaseType"]

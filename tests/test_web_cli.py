@@ -69,22 +69,30 @@ def test_ui_command_replaces_existing_debug_log_sink_without_session_logs(monkey
     assert not (tmp_path / "logs").exists()
 
 
-def test_ui_command_respects_explicit_log_level_without_session_logs(monkeypatch, tmp_path):
-    reset_config_state(monkeypatch)
+def test_ui_command_shows_detail_only_when_asked_without_session_logs(monkeypatch, tmp_path):
+    """`--verbose` opens the console; `--log-level INFO` only sets the files."""
 
-    def fake_run_server(**kwargs):
-        logger.info("explicit info log")
+    def run(*flags):
+        reset_config_state(monkeypatch)
 
-    monkeypatch.setattr("sag.main.run_web_server", fake_run_server)
-    monkeypatch.chdir(tmp_path)
+        def fake_run_server(**kwargs):
+            logger.info("explicit info log")
 
-    try:
-        result = CliRunner().invoke(cli, ["--log-level", "INFO", "ui"])
-    finally:
-        logger.remove()
+        monkeypatch.setattr("sag.main.run_web_server", fake_run_server)
+        monkeypatch.chdir(tmp_path)
+        try:
+            return CliRunner().invoke(cli, [*flags, "ui"])
+        finally:
+            logger.remove()
 
-    assert result.exit_code == 0
-    assert "explicit info log" in result.output
+    quiet = run("--log-level", "INFO")
+    assert quiet.exit_code == 0
+    assert "explicit info log" not in quiet.output
+
+    asked = run("--verbose")
+    assert asked.exit_code == 0
+    assert "explicit info log" in asked.output
+
     assert not (tmp_path / "logs").exists()
 
 

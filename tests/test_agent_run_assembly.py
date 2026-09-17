@@ -17,7 +17,7 @@ from sag.config import Config
 
 @pytest.fixture
 def assembled_agent(monkeypatch):
-    config = Config(workspace_path="/workspace", ui_mode=False)
+    config = Config(workspace_path="/workspace")
     monkeypatch.setattr(engine_module, "get_config", lambda: config)
     monkeypatch.setattr(
         engine_module, "ReactLLMClient", lambda **kwargs: SimpleNamespace(setup=lambda: None)

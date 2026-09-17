@@ -20,7 +20,6 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from sag.config import Config, create_agent_logger, create_command_logger, get_session_logger
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.reporting import format_percentage
-from sag.ui import EventType, PhaseType, UIEvent, UIManager
 from sag.verdict_rates import execution_sentence
 
 from .ci_comparison import PinnedCITarget
@@ -84,9 +83,6 @@ class SetupAgent:
         )
         self.console = Console()
 
-        # UI Manager for enhanced UI mode
-        self.ui_manager: Optional[UIManager] = None
-
         self.workflow_mode = "idle"
         self.pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None
         self._run_pin_write_lock = threading.RLock()
@@ -116,7 +112,6 @@ class SetupAgent:
         self._run_pin_host_path = None
         self._run_pin_mirror = None
         self._observed_target_repo_sha = None
-        self.ui_manager = None
         # Tools and legacy summaries create these lazily. Their previous values
         # must not survive when startup stops before tool assembly.
         for name in (
@@ -154,32 +149,6 @@ class SetupAgent:
             self.evidence_publication_authority, orchestrator=self.orchestrator
         )
         return self.run_id
-
-    def _emit(
-        self,
-        event_type: "EventType",
-        message: str,
-        *,
-        phase: "Optional[PhaseType]" = None,
-        details: Optional[str] = None,
-        level: str = "info",
-    ) -> None:
-        """Emit a UI event when UI mode is active; no-op otherwise.
-
-        Replaces the repeated `if self.config.ui_mode: self.ui_manager.handle_event(UIEvent(...))`
-        pattern so call sites stay focused on event intent, not lifecycle.
-        """
-        if not (self.config.ui_mode and self.ui_manager):
-            return
-        self.ui_manager.handle_event(
-            UIEvent(
-                event_type=event_type,
-                message=message,
-                phase=phase,
-                details=details,
-                level=level,
-            )
-        )
 
     def _initialize_context_and_tools(self, workflow_mode: str = "setup"):
         """Initialize context manager, tools, and react engine after Docker is ready.
@@ -265,18 +234,6 @@ class SetupAgent:
         # consult exists; bind it before the first iteration can call it.
         self._bind_advisor_consult()
         self._initialize_run_pin_template()
-
-        # Pass UIManager to ReActEngine if in UI mode
-        if self.config.ui_mode and self.ui_manager:
-            self.react_engine.set_ui_manager(self.ui_manager)
-
-            # Also set UI manager for all tools that support it
-            from sag.ui.events import UIEventEmitter
-
-            for tool in self.tools:
-                if isinstance(tool, UIEventEmitter):
-                    tool.set_ui_manager(self.ui_manager)
-                    logger.debug(f"Set UI manager for tool: {tool.name}")
 
         self.agent_logger.info("Context manager, tools, and ReAct engine initialized")
 
@@ -863,37 +820,22 @@ class SetupAgent:
         cmd_logger.info(f"Starting project setup: {project_name} (docker_label={docker_label})")
 
         try:
-            # Initialize UI Manager if in UI mode
-            if self.config.ui_mode:
-                self.ui_manager = UIManager(project_name=project_name, console=self.console)
-                self.ui_manager.start()
-            else:
-                ref_line = f"\n[dim]Repository Ref: {project_ref}[/dim]" if project_ref else ""
-                self.console.print(
-                    Panel.fit(
-                        f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
-                        f"[dim]Repository: {project_url}[/dim]\n"
-                        f"[dim]Goal: {goal}[/dim]"
-                        f"{ref_line}",
-                        border_style="blue",
-                    )
+            ref_line = f"\n[dim]Repository Ref: {project_ref}[/dim]" if project_ref else ""
+            self.console.print(
+                Panel.fit(
+                    f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
+                    f"[dim]Repository: {project_url}[/dim]\n"
+                    f"[dim]Goal: {goal}[/dim]"
+                    f"{ref_line}",
+                    border_style="blue",
                 )
+            )
 
             # Step 1: Setup Docker environment
-            self._emit(EventType.PHASE_START, "Setting up environment", phase=PhaseType.SETUP)
-
             if not self._setup_docker_environment(project_name):
                 return self._close_open_setup_run("docker environment setup failed")
 
             # Step 1.5: Initialize context manager and tools now that Docker is ready
-            self._emit(
-                EventType.STEP_START,
-                "Context Initialization",
-                phase=PhaseType.SETUP,
-                details="Initializing context system...",
-            )
-            self._emit(EventType.STATUS_UPDATE, "Loading tools...", phase=PhaseType.SETUP)
-
             # Engine-owned phase plan for setup runs (spec §3.1): the machine
             # and the in-container context journal exist for the whole run and
             # are handed to the tools + engine at initialization. The journal
@@ -927,16 +869,6 @@ class SetupAgent:
             # Step 1.6: Set repository URL for ReAct engine
             self.react_engine.set_repository_url(project_url, repository_ref=project_ref)
 
-            self._emit(
-                EventType.STATUS_UPDATE, "Configuring ReAct engine...", phase=PhaseType.SETUP
-            )
-            self._emit(
-                EventType.STEP_COMPLETE,
-                "Context Initialization",
-                phase=PhaseType.SETUP,
-                details="Context manager ready",
-                level="success",
-            )
 
             # Step 2: Initialize trunk context mirroring the engine-owned phase
             # plan. Trunk tasks use phase_<name> ids so phase history persists
@@ -995,14 +927,6 @@ class SetupAgent:
                 self.console.print(f"[bold red]❌ Failed to create project context: {e}[/bold red]")
                 return self.run_termination
 
-            # Step 2.5: Complete setup phase
-            self._emit(
-                EventType.PHASE_COMPLETE,
-                "Setup phase completed",
-                phase=PhaseType.SETUP,
-                level="success",
-            )
-
             # Step 3: Run the unified setup process
             termination = self._run_unified_setup(
                 project_url,
@@ -1023,29 +947,6 @@ class SetupAgent:
                 # immutable verdict remains the judge's fact; CLI/web fall back
                 # to an explicitly non-campaign display projection.
                 self.agent_logger.error(f"Final metrics-v2 artifact rejected: {exc}")
-            if self.config.ui_mode:
-                if snapshot.verdict == "success":
-                    self._emit(
-                        EventType.SUCCESS,
-                        "Project setup completed successfully",
-                        level="success",
-                    )
-                elif snapshot.verdict == "partial":
-                    self._emit(
-                        EventType.SUCCESS,
-                        "Project setup partially completed",
-                        level="warning",
-                    )
-                else:
-                    self._emit(EventType.FAILURE, "Project setup incomplete", level="error")
-                if termination.report_delivery_status is ReportDeliveryStatus.FAILED:
-                    self._emit(
-                        EventType.ERROR,
-                        "Setup report delivery failed; verdict is unchanged",
-                        level="warning",
-                    )
-                self.ui_manager.display_final_summary()
-
             cmd_logger.info(
                 "Project setup completed: "
                 f"verdict={snapshot.verdict}, "
@@ -1067,20 +968,6 @@ class SetupAgent:
             return termination
 
         finally:
-            # Tear down the live UI on every exit path. display_final_summary
-            # is idempotent and abort_running_phases is a no-op if everything
-            # already completed, so the happy path tolerates this too.
-            if self.ui_manager:
-                try:
-                    self.ui_manager.abort_running_phases("Phase aborted")
-                    self.ui_manager.display_final_summary()
-                except Exception as e:
-                    logger.warning(f"UI teardown failed during setup_project cleanup: {e}")
-                    try:
-                        self.ui_manager.stop()
-                    except Exception as inner:
-                        logger.warning(f"UIManager.stop() also failed: {inner}")
-
             # Always release the command-specific loguru handler.
             session_logger = get_session_logger()
             if session_logger:
@@ -1162,22 +1049,15 @@ class SetupAgent:
         cmd_logger.info(f"Starting task execution: {task_description}")
 
         try:
-            # Initialize UI Manager if in UI mode
-            if self.config.ui_mode:
-                self.ui_manager = UIManager(project_name=project_name, console=self.console)
-                self.ui_manager.start()
-            else:
-                self.console.print(
-                    Panel.fit(
-                        f"[bold cyan]Running task on: {project_name}[/bold cyan]\n"
-                        f"[dim]Task: {task_description}[/dim]",
-                        border_style="cyan",
-                    )
+            self.console.print(
+                Panel.fit(
+                    f"[bold cyan]Running task on: {project_name}[/bold cyan]\n"
+                    f"[dim]Task: {task_description}[/dim]",
+                    border_style="cyan",
                 )
+            )
 
             # Step 1: Ensure Docker container is running
-            self._emit(EventType.PHASE_START, "Preparing environment", phase=PhaseType.SETUP)
-
             if not self._ensure_container_running(project_name):
                 return False
 
@@ -1233,22 +1113,11 @@ class SetupAgent:
             # Clear in place because ToolOrchestrator holds this list reference.
             self.react_engine.recent_tool_executions.clear()
 
-            # Step 2.5: Complete setup phase
-            self._emit(
-                EventType.PHASE_COMPLETE,
-                "Environment ready",
-                phase=PhaseType.SETUP,
-                level="success",
-            )
-
             # Step 3: Create task-specific prompt
             task_prompt = self._build_run_task_prompt(project_name, task_description)
 
             # Step 5: Execute task
-            if self.config.ui_mode:
-                self._emit(EventType.PHASE_START, "Executing task", phase=PhaseType.BUILD)
-            else:
-                self.console.print(f"[dim]🔧 Executing task: {task_description}[/dim]")
+            self.console.print(f"[dim]🔧 Executing task: {task_description}[/dim]")
 
             # Run the task execution loop
             success = self.react_engine.run_react_loop(
@@ -1261,49 +1130,16 @@ class SetupAgent:
             cancelled = bool(getattr(self.react_engine, "last_run_cancelled", False))
             if cancelled:
                 self.orchestrator.update_last_comment(f"Task cancelled: {task_description}")
-                if self.config.ui_mode:
-                    self._emit(
-                        EventType.PHASE_ERROR,
-                        "Task cancelled",
-                        phase=PhaseType.BUILD,
-                        level="warning",
-                    )
-                else:
-                    self.console.print("[bold yellow]Task cancelled.[/bold yellow]")
+                self.console.print("[bold yellow]Task cancelled.[/bold yellow]")
             elif success:
                 self.orchestrator.update_last_comment(f"Task completed: {task_description}")
-                if self.config.ui_mode:
-                    self._emit(
-                        EventType.PHASE_COMPLETE,
-                        "Task completed",
-                        phase=PhaseType.BUILD,
-                        level="success",
-                    )
-                    self._emit(
-                        EventType.SUCCESS, f"Task completed: {task_description}", level="success"
-                    )
-                else:
-                    self.console.print(f"[bold green]✅ Task completed successfully![/bold green]")
+                self.console.print(f"[bold green]✅ Task completed successfully![/bold green]")
             else:
                 self.orchestrator.update_last_comment(f"Task in progress: {task_description}")
-                if self.config.ui_mode:
-                    self._emit(
-                        EventType.PHASE_ERROR,
-                        "Task incomplete",
-                        phase=PhaseType.BUILD,
-                        level="error",
-                    )
-                    self._emit(
-                        EventType.FAILURE, f"Task incomplete: {task_description}", level="error"
-                    )
-                else:
-                    self.console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
+                self.console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
 
             # Step 7: Provide execution summary
-            if self.config.ui_mode:
-                self.ui_manager.display_final_summary()
-            else:
-                self._provide_task_summary(success, task_description)
+            self._provide_task_summary(success, task_description)
 
             cmd_logger.info(f"Task execution completed: success={success}, cancelled={cancelled}")
             return success
@@ -1322,17 +1158,6 @@ class SetupAgent:
             return False
 
         finally:
-            if self.ui_manager:
-                try:
-                    self.ui_manager.abort_running_phases("Phase aborted")
-                    self.ui_manager.display_final_summary()
-                except Exception as e:
-                    logger.warning(f"UI teardown failed during run_task cleanup: {e}")
-                    try:
-                        self.ui_manager.stop()
-                    except Exception as inner:
-                        logger.warning(f"UIManager.stop() also failed: {inner}")
-
             session_logger = get_session_logger()
             if session_logger:
                 try:
@@ -1365,79 +1190,30 @@ Do not generate a final setup report unless the TASK explicitly asks for one.
     def _setup_docker_environment(self, project_name: str) -> bool:
         """Setup the Docker environment for the project."""
 
-        if self.config.ui_mode:
-            self._emit(
-                EventType.STEP_START,
-                "Docker Environment",
-                phase=PhaseType.SETUP,
-                details="Checking Docker availability...",
-            )
-            self._emit(EventType.STATUS_UPDATE, "Creating container...", phase=PhaseType.SETUP)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console,
+        ) as progress:
+            task = progress.add_task("Setting up Docker environment...", total=None)
 
             try:
+                # Create and start container
                 success = self.orchestrator.create_and_start_container()
 
                 if success:
-                    self._emit(
-                        EventType.STATUS_UPDATE,
-                        "Configuring environment...",
-                        phase=PhaseType.SETUP,
-                    )
-                    self._emit(
-                        EventType.STEP_COMPLETE,
-                        "Docker Environment",
-                        phase=PhaseType.SETUP,
-                        details="Container ready",
-                        level="success",
-                    )
+                    progress.update(task, description="✅ Docker environment ready")
                     logger.info("Docker environment setup completed")
                     return True
                 else:
-                    self._emit(
-                        EventType.STEP_ERROR,
-                        "Docker Environment",
-                        phase=PhaseType.SETUP,
-                        details="Failed to create container",
-                        level="error",
-                    )
+                    progress.update(task, description="❌ Docker environment setup failed")
                     logger.error("Docker environment setup failed")
                     return False
 
             except Exception as e:
-                self._emit(
-                    EventType.ERROR,
-                    f"Docker setup error: {e}",
-                    phase=PhaseType.SETUP,
-                    level="error",
-                )
+                progress.update(task, description=f"❌ Docker setup error: {e}")
                 logger.error(f"Docker setup error: {e}")
                 return False
-        else:
-            # Normal Mode: use Rich Progress
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=self.console,
-            ) as progress:
-                task = progress.add_task("Setting up Docker environment...", total=None)
-
-                try:
-                    # Create and start container
-                    success = self.orchestrator.create_and_start_container()
-
-                    if success:
-                        progress.update(task, description="✅ Docker environment ready")
-                        logger.info("Docker environment setup completed")
-                        return True
-                    else:
-                        progress.update(task, description="❌ Docker environment setup failed")
-                        logger.error("Docker environment setup failed")
-                        return False
-
-                except Exception as e:
-                    progress.update(task, description=f"❌ Docker setup error: {e}")
-                    logger.error(f"Docker setup error: {e}")
-                    return False
 
     def _ensure_container_running(self, project_name: str) -> bool:
         """Ensure the Docker container is running."""
@@ -1451,9 +1227,7 @@ Do not generate a final setup report unless the TASK explicitly asks for one.
                 return False
 
             if not self.orchestrator.is_container_running():
-                # Show container starting message in non-UI mode only
-                if not self.config.ui_mode:
-                    self.console.print("[yellow]⚠️ Container is not running. Starting...[/yellow]")
+                self.console.print("[yellow]⚠️ Container is not running. Starting...[/yellow]")
                 return self.orchestrator.start_container()
 
             return True
@@ -1515,40 +1289,23 @@ The repository URL is already provided: {project_url}
 START by working toward the current phase objective shown in my context.
 """
 
-        if self.config.ui_mode:
-            self._emit(EventType.PHASE_START, "Running project setup", phase=PhaseType.BUILD)
+        self.console.print("[dim]🚀 Starting intelligent project setup process...[/dim]")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console,
+        ) as progress:
+            task = progress.add_task("Running setup process...", total=None)
 
             termination = self.react_engine.run_setup_loop(
                 initial_prompt=setup_prompt, max_iterations=self.max_iterations
             )
             self.run_termination = termination
-            self._finalize_run_pin()
-            self._emit(
-                EventType.PHASE_COMPLETE,
-                "Setup flow completed",
-                phase=PhaseType.BUILD,
-                level="success",
-            )
-            return termination
-        else:
-            # Normal Mode: use Rich Progress
-            self.console.print("[dim]🚀 Starting intelligent project setup process...[/dim]")
+            progress.update(task, description="Setup flow completed")
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=self.console,
-            ) as progress:
-                task = progress.add_task("Running setup process...", total=None)
-
-                termination = self.react_engine.run_setup_loop(
-                    initial_prompt=setup_prompt, max_iterations=self.max_iterations
-                )
-                self.run_termination = termination
-                progress.update(task, description="Setup flow completed")
-
-            self._finalize_run_pin()
-            return termination
+        self._finalize_run_pin()
+        return termination
 
     def _close_open_setup_run(self, reason: str, *, cancelled: bool = False) -> RunTermination:
         """Create typed closure for failures outside the active ReAct loop."""

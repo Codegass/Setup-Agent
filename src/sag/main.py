@@ -33,7 +33,6 @@ from sag.config import (
     get_config,
     get_session_logger,
     set_config,
-    suppress_console_logging,
 )
 from sag.console.result_block import render_result_block
 from sag.coverage.runner import apply_coverage
@@ -502,20 +501,9 @@ def _run_coverage_evidence_pass(
 )
 @click.option("--log-file", type=click.Path(), help="Path to log file")
 @click.option("--verbose", is_flag=True, help="Enable verbose debugging output with detailed logs")
-@click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.pass_context
-def cli(ctx, log_level, log_file, verbose, ui):
+def cli(ctx, log_level, log_file, verbose):
     """SAG: Setup-Agent - LLM Powered project setup automation."""
-
-    # Check for mutually exclusive flags
-    if verbose and ui:
-        console.print(
-            "[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]"
-        )
-        console.print("[dim]Please choose one:[/dim]")
-        console.print("  --verbose : Detailed console logs for debugging")
-        console.print("  --ui      : Clean interactive UI with live updates")
-        sys.exit(1)
 
     # Create configuration
     config = Config.from_env()
@@ -527,25 +515,19 @@ def cli(ctx, log_level, log_file, verbose, ui):
         config.log_file = log_file
     if verbose:
         config.verbose = verbose
-    if ui:
-        config.ui_mode = ui
 
     # Set global config without opening a session log. Session logs are for
     # agent executions only; read-only CLI commands should not create
     # logs/session_* directories.
-    set_config(config, initialize_logging=False, quiet_console=log_level is None)
+    set_config(config, initialize_logging=False)
 
     # Ensure context object exists
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
 
-    # Display welcome message for main commands (skip in UI mode, will be shown by UIManager).
+    # Display welcome message for main commands.
     # `trajectory` is excluded because its stdout is JSON somebody parses.
-    if (
-        ctx.invoked_subcommand not in ["list", "trajectory"]
-        and not config.verbose
-        and not config.ui_mode
-    ):
+    if ctx.invoked_subcommand not in ["list", "trajectory"] and not config.verbose:
         console.print(
             Panel.fit(
                 "[bold blue]SAG[/bold blue] - [dim]Setup Agent[/dim]\n"
@@ -623,7 +605,6 @@ def list():
     is_flag=True,
     help="Run an isolated JaCoCo coverage pass before verdict close (best-effort)",
 )
-@click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.option(
     "--ref",
     "project_ref",
@@ -651,7 +632,6 @@ def project(
     goal,
     record,
     coverage,
-    ui,
     project_ref,
     ci_target_file,
     acceptance_command,
@@ -689,21 +669,6 @@ def project(
         except (OSError, ValueError) as exc:
             raise click.ClickException(f"Invalid CI target: {exc}") from exc
 
-    # Override ui_mode from command-line flag if provided
-    if ui:
-        # Check for mutual exclusion with verbose
-        if config.verbose:
-            console.print(
-                "[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]"
-            )
-            console.print("[dim]Please choose one:[/dim]")
-            console.print("  --verbose : Detailed console logs for debugging")
-            console.print("  --ui      : Clean interactive UI with live updates")
-            sys.exit(1)
-        config.ui_mode = ui
-        # Suppress console logging for UI mode
-        suppress_console_logging()
-
     try:
         # ALWAYS extract project_name from URL - this is the actual directory name
         # The --name flag only affects Docker container/volume naming
@@ -718,26 +683,23 @@ def project(
 
         docker_name = f"sag-{docker_label}"
 
-        # Only show project setup details in non-UI mode
-        if not config.ui_mode:
-            console.print(f"[bold green]🚀 Setting up new project[/bold green]")
-            console.print(f"[dim]Repository:[/dim] {repo_url}")
-            if project_ref:
-                console.print(f"[dim]Repository Ref:[/dim] {project_ref}")
-            console.print(f"[dim]Project Name:[/dim] {project_name}")
-            console.print(f"[dim]Docker Name:[/dim] {docker_name}")
-            if name and name != project_name:
-                console.print(
-                    f"[dim]Note:[/dim] Using custom Docker name, project directory will be /workspace/{project_name}"
-                )
-            console.print(f"[dim]Goal:[/dim] {goal}")
-            if record:
-                console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
+        console.print(f"[bold green]🚀 Setting up new project[/bold green]")
+        console.print(f"[dim]Repository:[/dim] {repo_url}")
+        if project_ref:
+            console.print(f"[dim]Repository Ref:[/dim] {project_ref}")
+        console.print(f"[dim]Project Name:[/dim] {project_name}")
+        console.print(f"[dim]Docker Name:[/dim] {docker_name}")
+        if name and name != project_name:
+            console.print(
+                f"[dim]Note:[/dim] Using custom Docker name, project directory will be /workspace/{project_name}"
+            )
+        console.print(f"[dim]Goal:[/dim] {goal}")
+        if record:
+            console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
 
         # Check if project already exists (using docker_label for container naming)
         orchestrator = DockerOrchestrator(project_name=docker_label)
         if orchestrator.container_exists():
-            # Always show critical errors/warnings, even in UI mode
             console.print(
                 f"[bold yellow]⚠️ Container '{docker_name}' already exists![/bold yellow]"
             )
@@ -808,7 +770,6 @@ def project(
 
     except Exception as e:
         logger.error(f"Project setup failed: {e}")
-        # Always show critical errors, even in UI mode
         console.print(f"[bold red]❌ Setup failed: {e}[/bold red]")
         sys.exit(1)
 
@@ -825,27 +786,11 @@ def project(
     is_flag=True,
     help="Run an isolated JaCoCo coverage pass after setup (best-effort)",
 )
-@click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.pass_context
-def run(ctx, docker_name, task, max_iterations, record, coverage, ui):
+def run(ctx, docker_name, task, max_iterations, record, coverage):
     """Run a specific task on an existing SAG project."""
 
     config = ctx.obj["config"]
-
-    # Override ui_mode from command-line flag if provided
-    if ui:
-        # Check for mutual exclusion with verbose
-        if config.verbose:
-            console.print(
-                "[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]"
-            )
-            console.print("[dim]Please choose one:[/dim]")
-            console.print("  --verbose : Detailed console logs for debugging")
-            console.print("  --ui      : Clean interactive UI with live updates")
-            sys.exit(1)
-        config.ui_mode = ui
-        # Suppress console logging for UI mode
-        suppress_console_logging()
 
     try:
         # Extract docker_label from docker name (this is the container identifier)
@@ -882,15 +827,13 @@ def run(ctx, docker_name, task, max_iterations, record, coverage, ui):
         else:
             actual_project_name = detected or docker_label
 
-        # Only show task info in non-UI mode (UI manager handles this)
-        if not config.ui_mode:
-            console.print(
-                f"[bold green]🔧 Running task on project: {actual_project_name}[/bold green]"
-            )
-            console.print(f"[dim]Docker:[/dim] {docker_name}")
-            console.print(f"[dim]Task:[/dim] {task}")
-            if record:
-                console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
+        console.print(
+            f"[bold green]🔧 Running task on project: {actual_project_name}[/bold green]"
+        )
+        console.print(f"[dim]Docker:[/dim] {docker_name}")
+        console.print(f"[dim]Task:[/dim] {task}")
+        if record:
+            console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
 
         _start_agent_session_logging(config)
 
@@ -912,13 +855,11 @@ def run(ctx, docker_name, task, max_iterations, record, coverage, ui):
         if coverage:
             _run_coverage_pass(orchestrator, actual_project_name)
 
-        # Only show completion messages in non-UI mode (UI manager handles this)
-        if not config.ui_mode:
-            if success:
-                console.print(f"[bold green]✅ Task completed successfully![/bold green]")
-            else:
-                console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
-                console.print(f"[dim]Check logs for details or run another task to continue.[/dim]")
+        if success:
+            console.print(f"[bold green]✅ Task completed successfully![/bold green]")
+        else:
+            console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
+            console.print(f"[dim]Check logs for details or run another task to continue.[/dim]")
 
     except Exception as e:
         logger.error(f"Task execution failed: {e}")
