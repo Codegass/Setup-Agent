@@ -41,6 +41,41 @@ describe("needsAttention", () => {
     expect(needsAttention(ws({ build: "success" }))).toBe(false)
   })
 
+  it("flags a run whose card recorded a failing or erroring test", () => {
+    // The legacy facet calls this run a success; the card counted one failure.
+    // 29 archived runs under `logs/` are exactly this shape — red tests, no
+    // failed verdict, no incomplete task — and were never flagged.
+    const healthyFacet = { state: "success", pass: 41, fail: 1, skip: 0, total: 42 }
+    expect(
+      needsAttention(
+        ws({
+          test: healthyFacet,
+          result: { verdict: "success", tests: { executed: 42, passed: 41, failed: 1, errors: 0, skipped: 0 } },
+        }),
+      ),
+    ).toBe(true)
+    expect(
+      needsAttention(
+        ws({
+          test: healthyFacet,
+          result: { verdict: "success", tests: { executed: 42, passed: 41, failed: 0, errors: 1, skipped: 0 } },
+        }),
+      ),
+    ).toBe(true)
+  })
+
+  it("does not flag a run whose card counted no red tests, or counted none at all", () => {
+    expect(
+      needsAttention(
+        ws({
+          result: { verdict: "success", tests: { executed: 42, passed: 42, failed: 0, errors: 0, skipped: 0 } },
+        }),
+      ),
+    ).toBe(false)
+    // Absence is not a finding: a run that measured no tests says so elsewhere.
+    expect(needsAttention(ws({ result: { verdict: "success", tests: null } }))).toBe(false)
+  })
+
   it("keeps a healthy workspace quiet", () => {
     expect(needsAttention(ws({}))).toBe(false)
   })

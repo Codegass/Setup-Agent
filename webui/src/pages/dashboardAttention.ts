@@ -24,8 +24,9 @@ function buildState(build: WorkspaceSummary["build"]): string {
 const CI_ATTENTION = new Set(["not met"])
 
 /** A workspace needs attention if its run failed, a required task step did not
- *  finish, its Official CI comparison was not met, its build failed, its tests
- *  failed, or its container stopped unexpectedly. */
+ *  finish, its Official CI comparison was not met, the run recorded a failing
+ *  or erroring test, its build failed, its legacy test facet failed, or its
+ *  container stopped unexpectedly. */
 export function needsAttention(workspace: WorkspaceSummary): boolean {
   const build = buildState(workspace.build)
   const test = normalize(workspace.test.state)
@@ -45,11 +46,18 @@ export function needsAttention(workspace: WorkspaceSummary): boolean {
   const runFailed = result?.verdict === "failed"
   const taskUnfinished = normalize(result?.task?.status) === "incomplete"
   const ciFinding = CI_ATTENTION.has(normalize(result?.ci?.status))
+  // A count, not a word. The legacy `test.state` above says "success" on a run
+  // that recorded a failing test — `sag-rocketmq` serves `state: "success",
+  // fail: 1` — so 29 archived runs carried red tests while being neither
+  // failed nor task-incomplete, and nothing told a reader to look at them.
+  // The rail already prints the red `+N`; this is what flags the row beside it.
+  const redTests = (result?.tests?.failed ?? 0) + (result?.tests?.errors ?? 0) > 0
 
   return (
     runFailed ||
     taskUnfinished ||
     ciFinding ||
+    redTests ||
     buildFailed ||
     testFailed ||
     containerDown
