@@ -1,0 +1,14 @@
+iteration,timestamp,type,tool_name,model,total_tokens,prompt_tokens,completion_tokens,reasoning_tokens,actual_output_tokens
+1,2026-09-10T03:03:24.279957,executor,project,gpt-5.4-mini,6671,6566,105,0,105
+2,2026-09-10T03:03:34.389758,executor,project,gpt-5.4-mini,7000,6938,62,0,62
+3,2026-09-10T03:04:41.497132,executor,phase,gpt-5.4-mini,7621,7374,247,0,247
+4,2026-09-10T03:05:10.189500,executor,file_io,gpt-5.4-mini,8275,8083,192,0,192
+5,2026-09-10T03:05:21.025703,executor,file_io,gpt-5.4-mini,10405,10357,48,0,48
+6,2026-09-10T03:05:25.548835,executor,file_io,gpt-5.4-mini,10510,10464,46,0,46
+7,2026-09-10T03:05:36.396715,executor,phase,gpt-5.4-mini,11713,10549,1164,0,1164
+7,2026-09-10T03:05:48.648635,advisor,Unknown,gpt-5.4-mini,2132,1984,148,0,148
+8,2026-09-10T03:05:52.968846,executor,bash,gpt-5.4-mini,7751,7688,63,0,63
+9,2026-09-10T03:07:02.214157,executor,search,gpt-5.4-mini,9399,9218,181,0,181
+10,2026-09-10T03:07:13.784956,executor,phase,gpt-5.4-mini,12767,12540,227,0,227
+10,2026-09-10T03:07:30.069091,advisor,Unknown,gpt-5.4-mini,2777,2652,125,0,125
+11,2026-09-10T03:07:34.965489,executor,search,gpt-5.4-mini,8207,8034,173,0,173

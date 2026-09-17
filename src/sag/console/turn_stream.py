@@ -39,12 +39,11 @@ Three things a live renderer has to get right that a batch one does not:
 from __future__ import annotations
 
 import json
+import re
 import textwrap
 import time
 from collections import Counter
 from typing import Callable, Iterable
-
-from rich.markup import escape as rich_escape
 
 from sag.trajectory.reducer import UNKNOWN_PHASE, TrajectoryReducer, elapsed
 from sag.trajectory.schema import SUMMARY_MAX_CHARS, Turn, Warning, warning_order
@@ -67,6 +66,12 @@ _OUTCOME_ROOM = 38
 #: to the full width of its column would otherwise sit one space from the
 #: outcome and read as a single run-on string.
 _GUTTER = 2
+#: The column a short call's outcome still lines up at. A fixed column the whole
+#: width of the terminal freezes the outcome's room and pads ten-character calls
+#: across forty blanks; no column at all makes every row ragged and there is
+#: nothing left to scan down. This is the floor: calls shorter than it align,
+#: longer ones run on and take the space with them.
+_ALIGN_CALL = 26
 _MIN_WIDTH = 60
 _JOB_NOTE_INTERVAL_SECONDS = 60.0
 _ENGINE_ACTOR = "⚙ engine"
@@ -79,13 +84,10 @@ _HOLE = "  ! "
 #: Wrapped hole text hangs four columns in, not under its own code: a 28-column
 #: hanging indent eats a third of an 80-column line.
 _HOLE_HANG = "    "
-#: The label the derivation puts on a phase gate's reason code
-#: (`summaries._phase_observation`). This layer says `gate:` on the grading line
-#: already, and one word over two different facts on adjacent lines is what
-#: makes both unreadable — so the reason code is rendered bare here, the way
-#: every other reason code in this stream is rendered.
-_GATE_LABEL = "gate "
-#: The word a gate delivered, marked as the gate's own answer.
+#: The word a gate delivered, marked as the gate's own answer. The reason code
+#: it sits beside used to be labelled `gate <code>` too; that is fixed at its
+#: source now (`summaries._phase_observation`), so nothing here has to take a
+#: label off a neighbour's string.
 _GATE = "gate:"
 #: Where to read the counted notes in full.
 _TRAJECTORY_COMMAND = "uv run sag trajectory <session>"
@@ -120,6 +122,11 @@ _TRANSITION_GLYPH = {
     "flow_close": "✓",
     "repair": "→",
 }
+
+#: What Rich reads as a style tag, and a bracket with whatever backslashes run
+#: up to it. `_escape` needs to tell the two apart because Rich's parser does.
+_TAG_SHAPED = re.compile(r"\[[a-z#/@][^\[]*?]")
+_BRACKET_RUN = re.compile(r"(\\*)(\[)")
 
 _BAND_STYLE = "bold"
 _HOLE_STYLE = "yellow"
@@ -157,17 +164,29 @@ def _clip(text: str, width: int) -> str:
 
 
 def _escape(text: str) -> str:
-    r"""Keep a bracket a reader typed from being read as a style tag.
+    r"""Keep a bracket, or a backslash before one, from being eaten as markup.
 
-    Real calls carry brackets — a search pattern, an `[INFO]` prefix in an error
-    line, a Java generic. Rich would eat them and the reader would never know a
-    character had gone missing. Rich's own escape is used rather than a local
-    one: the rule is "what Rich would have read as a tag", and only Rich knows
-    it — a blanket backslash-doubling corrupts the `\s` of every search pattern
-    in the corpus.
+    Rich's parser has two rules and `rich.markup.escape` implements one of them.
+    A TAG-shaped bracket — `[` then one of `a-z # / @` — is literal when an ODD
+    number of backslashes precedes it, and the run is halved. Every OTHER `\[`
+    simply loses its backslash. So `rich.markup.escape` leaves
+    `\[INFO\] Building` untouched and the sink prints `[INFO\] Building`: two
+    characters gone from a regex the reader would copy, which is exactly what
+    this function exists to prevent. ignite `#18` carries that pattern.
+
+    Both rules, applied to the text as it will be read: a run of N backslashes
+    before a tag-shaped bracket becomes 2N+1, and before any other bracket, N+1.
+    Verified to round-trip through a real `rich.console.Console` for every call
+    and observation summary in all four archived sessions, and for the awkward
+    shapes around them (`[/]`, `[]`, a trailing backslash, `\\\[`).
     """
 
-    return rich_escape(text)
+    def _one(match: re.Match[str]) -> str:
+        backslashes, bracket = match.group(1), match.group(2)
+        tagged = _TAG_SHAPED.match(text[match.end(2) - 1 :]) is not None
+        return (backslashes * 2 if tagged else backslashes) + "\\" + bracket
+
+    return _BRACKET_RUN.sub(_one, text)
 
 
 class _Line:
@@ -262,10 +281,6 @@ class TurnStreamRenderer:
             SUMMARY_MAX_CHARS,
             max(_MIN_SUMMARY_WIDTH, self._width - _CHROME - _GUTTER - _OUTCOME_ROOM),
         )
-        #: Where the head of a turn line ends and its outcome begins. The call is
-        #: clipped to the column, so a head is never longer than this less the
-        #: gutter and the two columns are always told apart.
-        self._tail_at = _CHROME + self._summary_width + _GUTTER
         self._phase: str | None = None
         self._printed: set[int] = set()
         #: What each turn has already said, so a restatement that carries
@@ -289,16 +304,13 @@ class TurnStreamRenderer:
         #: shown. A statement is shown at most once and only while it stands.
         self._held: dict[Warning, None] = {}
         self._shown: set[Warning] = set()
-        self._high_turn = 0
         self._job_notes: dict[str, float] = {}
         self._closed = False
 
     # -- writing -------------------------------------------------------
 
-    def _emit(self, line: _Line | str) -> None:
+    def _emit(self, line: _Line) -> None:
         self._flush()
-        if isinstance(line, str):
-            line = _Line(line)
         self._close_line()
         self._write(line.render(self._width, self._tty) + "\n")
 
@@ -337,16 +349,6 @@ class TurnStreamRenderer:
             f"{_clip(summary, self._summary_width)}"
         )
 
-    def _padded(self, head: _Line) -> _Line:
-        """The head carried out to the column every outcome starts in.
-
-        Padding the `_Line` rather than its text keeps any style the head
-        carries; it carries none today, and a renderer that silently dropped
-        one the day it did would be a hard thing to notice.
-        """
-
-        return head.add(" " * max(_GUTTER, self._tail_at - len(head.text)))
-
     @staticmethod
     def _answered(turn: Turn) -> bool:
         """Has the ledger said how this turn came out?
@@ -359,7 +361,13 @@ class TurnStreamRenderer:
         observation = turn.observation
         return observation is not None and observation.outcome is not None
 
-    def _outcome_line(self, turn: Turn, *, gate: bool) -> _Line | None:
+    def _outcome_at(self, used: int) -> int:
+        """The column this line's outcome starts in, given the head it has."""
+
+        floor = _CHROME + min(_ALIGN_CALL, self._summary_width) + _GUTTER
+        return max(floor, used + _GUTTER)
+
+    def _outcome_line(self, turn: Turn, *, gate: bool) -> _Line:
         """What the turn's settling says, as one styled line's worth of text.
 
         `gate` asks for the word a gate delivered to be part of it, which it is
@@ -369,8 +377,6 @@ class TurnStreamRenderer:
         observation = turn.observation
         outcome = observation.outcome if observation is not None else None
         summary = observation.summary if observation is not None else None
-        if summary and turn.call is not None and turn.call.tool == "phase":
-            summary = summary[len(_GATE_LABEL) :] if summary.startswith(_GATE_LABEL) else summary
         word = None if outcome == _UNMARKED_OUTCOME and summary else outcome
         gate_word = turn.gate.word if (gate and turn.gate is not None) else None
         line = _Line()
@@ -382,12 +388,14 @@ class TurnStreamRenderer:
             line.add(" · " if line.text else "").add(f"{_GATE} {gate_word}")
         return line
 
-    def _settle(self, turn: Turn, room: int) -> _Line | None:
-        """The outcome, with the turn's timing reserved out of its room.
+    def _settle(self, turn: Turn, used: int) -> _Line | None:
+        """What the turn's settling adds to a line already `used` columns long.
 
-        The timing is held back rather than left to take its chances at the end
-        of a long line: a clipped summary still says most of what it knew, and a
-        clipped duration says nothing at all.
+        The outcome starts where the call ENDED, not at a fixed column: a
+        ten-character call followed by forty blanks and then a reason code cut
+        in half is the worst thing this layout can do, because the cut string is
+        the one a reader greps for. The timing goes flush to the right edge,
+        where it stays a column to scan down and cannot be what gets clipped.
         """
 
         # Only an ANSWER finishes a turn's line. A gate that arrived first
@@ -396,24 +404,30 @@ class TurnStreamRenderer:
         if not self._answered(turn):
             return None
         line = self._outcome_line(turn, gate=turn.turn_id not in self._gated)
-        if line is None:
-            return None
+        room = self._width - used
         duration = _duration(turn)
         if duration is None:
-            # No timing to hold back, and every caller clips what it writes, so
-            # there is nothing for a second clip here to do.
+            # Nothing to hold back and every caller clips what it writes, so a
+            # second clip here would have nothing to do.
             return line
-        tail = f" · {duration}"
-        return line.truncated(max(0, room - len(tail))).add(tail)
+        body = line.truncated(max(0, room - len(duration) - _GUTTER))
+        return body.add(" " * max(_GUTTER, room - len(body.text) - len(duration)) + duration)
 
     def render_turn(self, turn: Turn) -> None:
-        """Write whatever this turn now says that it had not said before."""
+        """Write whatever this turn now says that it had not said before.
 
-        if self._answered(turn) or turn.call is None:
-            # Settled on its own evidence: the ledger said how it came out, or
-            # it never had a call to come out — an envelope always opens a NEW
-            # turn, so nothing will arrive later to fill a turn that opened
-            # without one.
+        Public since R6, and a public entry point is one a caller can reach
+        after `close()` — so it refuses there for the same reason `feed` does.
+        """
+
+        self._refuse_when_closed()
+        if self._answered(turn):
+            # The ONE thing that settles a turn: the ledger stated how it came
+            # out. "It has no call" is not a second way — a `turn_record` seals
+            # a call-less turn and retracts both holes standing on it, and 272
+            # of the 275 archived sessions carry `turn_record`. A statement
+            # about a turn the ledger has not answered waits for the close,
+            # where a retraction can still have reached it first.
             self._settled.add(turn.turn_id)
 
         # Another turn's news means the held one has waited long enough: place it
@@ -423,7 +437,6 @@ class TurnStreamRenderer:
 
         if turn.turn_id not in self._printed:
             self._printed.add(turn.turn_id)
-            self._high_turn = max(self._high_turn, turn.turn_id)
             if turn.phase == UNKNOWN_PHASE and not self._answered(turn):
                 # The ledger has not placed the run yet. Hold the line rather
                 # than print it above the band it turns out to belong to. A
@@ -442,7 +455,7 @@ class TurnStreamRenderer:
             return
 
         if turn.turn_id not in self._said:
-            settled = self._settle(turn, self._width - self._tail_at)
+            settled = self._settle(turn, self._outcome_at(self._open_cost))
             if settled is not None:
                 self._said.add(turn.turn_id)
                 if turn.gate is not None:
@@ -458,17 +471,22 @@ class TurnStreamRenderer:
 
         self._band(turn)
         head = self._head(turn)
-        settled = self._settle(turn, self._width - self._tail_at)
+        settled = self._settle(turn, self._outcome_at(len(head.text)))
         if settled is None:
             self._open_line(head)
             self._open_turn = turn.turn_id
             return
-        # No `_gated` bookkeeping here: a turn's first line is written either
-        # unanswered — and then it is not finished, so no gate went on it — or
-        # answered, which cannot happen before the gate that grades it, because
-        # a gate is a later event than the result it grades.
         self._said.add(turn.turn_id)
-        self._emit(self._padded(head).extend(settled))
+        if turn.gate is not None:
+            # A held line defers the write past events that have already
+            # happened, so a turn dispatched late can arrive with its grading
+            # already in hand and on this very line. Not recording it here says
+            # it a second time on the next restatement. Event order is not
+            # render order, and this clause is about render order.
+            self._gated.add(turn.turn_id)
+        self._emit(
+            head.add(" " * (self._outcome_at(len(head.text)) - len(head.text))).extend(settled)
+        )
 
     def _flush(self) -> None:
         """Place a held first line now, under whatever band the run is in.
@@ -500,13 +518,12 @@ class TurnStreamRenderer:
         """Finish the turn's line in place, or give the outcome its own line."""
 
         if self._open_turn == turn.turn_id and self._line_open:
-            pad = " " * max(_GUTTER, self._tail_at - self._open_cost)
-            room = self._width - self._open_cost - len(pad)
-            self._write(_Line(pad).extend(settled.truncated(room)).render(self._width, self._tty))
+            gutter = _Line(" " * (self._outcome_at(self._open_cost) - self._open_cost))
+            self._write(gutter.extend(settled).render(self._width - self._open_cost, self._tty))
             self._close_line()
             return
         marker = self._continuation(turn.turn_id)
-        self._emit(_Line(marker).extend(settled.truncated(self._width - len(marker))))
+        self._emit(_Line(marker).extend(self._settle(turn, len(marker)) or _Line()))
 
     def _band(self, turn: Turn) -> None:
         """Open a phase band when the run enters one.
@@ -566,6 +583,10 @@ class TurnStreamRenderer:
         self._emit(_Line().add(f"      ! {what} still live at close", _HOLE_STYLE))
 
     # -- the ledger's own statements -----------------------------------
+
+    def _refuse_when_closed(self) -> None:
+        if self._closed:
+            raise RuntimeError("this renderer is closed; one renderer renders one session")
 
     def _hold(self, added: Iterable[Warning], withdrawn: Iterable[Warning]) -> None:
         for warning in added:
@@ -641,8 +662,7 @@ class TurnStreamRenderer:
         to the reducer, which states it.
         """
 
-        if self._closed:
-            raise RuntimeError("this renderer is closed; one renderer renders one session")
+        self._refuse_when_closed()
         if not raw_line.lstrip().startswith("{"):
             return
         delta = self._reducer.feed(raw_line)

@@ -104,7 +104,7 @@ REAL_OBSERVATION_LINES = {
     (
         "camel-quarkus-d2r3",
         12,
-    ): "gate workspace_present · workspace /workspace/camel-quarkus exists",
+    ): "workspace_present · workspace /workspace/camel-quarkus exists",
     ("camel-quarkus-d2r3", 62): "advice delivered",
     ("camel-quarkus-d2r3", 108): "COMMAND_FAILED",
     ("camel-quarkus-d2r3", 70): "exit 1 · JAVA_VERSION_ERROR",

@@ -543,8 +543,11 @@ def test_phase_result_names_the_gate_word_and_reason():
             }
         },
     }
+    # The reason code, bare. It used to be labelled `gate <code>`, which put
+    # the word `gate` over two different facts once the turn stream rendered
+    # the word a gate DELIVERED beside it.
     assert observation_summary("phase", result) == (
-        "gate workspace_present · workspace /workspace/commons-cli exists"
+        "workspace_present · workspace /workspace/commons-cli exists"
     )
 
 

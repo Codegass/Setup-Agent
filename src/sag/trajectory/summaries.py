@@ -317,7 +317,11 @@ def _phase_observation(result: dict[str, Any]) -> str | None:
     gate = _mapping(metadata.get("gate_result"))
     word = _first_line(gate.get("code"))
     if word:
-        return _join(f"gate {word}", _first_line(gate.get("reason")))
+        # The reason code, bare, like every other reason code this module
+        # renders. Labelling it `gate` put the word over two different facts —
+        # the gate's NAME here and the word a gate DELIVERED on the row beside
+        # it — and one word over two facts makes both unreadable.
+        return _join(word, _first_line(gate.get("reason")))
     return _first_line(metadata.get("phase_signal"))
 
 

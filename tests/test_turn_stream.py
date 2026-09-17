@@ -20,22 +20,45 @@ described as "every clause". The list is now enumerated from the source file
 clause by clause, a survivor is reported as a survivor, and the number here, in
 the report and in `progress.md` is one number. See
 `test_what_this_fence_does_not_catch` for what the three archived
-sessions cannot reach on their own. The number for this round is **93 of 100**,
-and the seven that survived are each named there.
+sessions cannot reach on their own. The number for this round is **106 of 110**,
+and the four that survived are each named there.
+
+**And on the sessions themselves.** For two rounds this file replayed three
+archived sessions and called that the corpus. They are the three of 275 that
+predate the engine's per-turn seal, and building a fence on them is how a rule
+the live engine can take back got through a review, a re-review and a hundred
+mutations. `sling-commons-osgi-v4` is here so that the next such blind spot has
+somewhere to show itself.
 """
 
+import io
 import json
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from rich.text import Text
 
-from sag.console.turn_stream import TOOL_WIDTH, TurnStreamRenderer, _Line
+from sag.console.turn_stream import TOOL_WIDTH, TurnStreamRenderer, _escape, _Line
 from sag.trajectory.reducer import TrajectoryReducer
-from sag.trajectory.schema import SUMMARY_MAX_CHARS
+from sag.trajectory.schema import SUMMARY_MAX_CHARS, CallInfo, GateInfo, ObservationInfo, Turn
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "trajectory"
-SESSIONS = ("camel-quarkus-d2r3", "ignite-d2r3", "kafka-d2r3")
+#: Four archived sessions, and the fourth is not a fourth of the same thing.
+#:
+#: The first three predate the engine's per-turn seal: between them they carry
+#: no `turn_record` and no `refusal_record`. The `logs/` corpus has 275
+#: sessions and **272 of them carry `turn_record`** — 15,996 events, the second
+#: commonest kind there is — so a fence built on those three alone replays the
+#: three outliers and is blind to the shape of 99% of real runs. That blindness
+#: is not hypothetical: it is how a settling rule that a `turn_record` can
+#: retract got through a review, a re-review and a hundred mutations.
+#:
+#: `sling-commons-osgi-v4` is the fourth. 21 `turn_record`, 2 `refusal_record`,
+#: a `file_io` call, a `pending` job, an `evidence_close` and a ledger that
+#: closes with zero holes standing — every one of those a path the other three
+#: cannot reach.
+SESSIONS = ("camel-quarkus-d2r3", "ignite-d2r3", "kafka-d2r3", "sling-commons-osgi-v4")
 
 
 class _Sink:
@@ -287,7 +310,7 @@ def test_the_turns_timing_is_never_the_thing_that_gets_clipped():
     stream.close()
     line = _turn_lines(sink)[0]
     assert line.endswith("58.0s")
-    assert "…" in line
+    assert "exit 0 · 994 tests · 0 F · 61 S · 2 artifacts" in line
 
 
 def test_a_turn_the_ledger_never_timed_says_nothing_about_timing():
@@ -321,13 +344,13 @@ def test_a_turn_the_ledger_never_timed_says_nothing_about_timing():
     [
         (
             "PHASE_ACTION_MISMATCH",
-            "  #1   build     build"
-            "                                        refused · PHASE_ACTION_MISMATCH · 0.0s",
+            "  #1   build     build                       "
+            "refused · PHASE_ACTION_MISMATCH                    0.0s",
         ),
         (
             "CALL_NOT_EXECUTED",
-            "  #1   build     build"
-            "                                        cancelled · cancelled · 0.0s",
+            "  #1   build     build                       "
+            "cancelled · cancelled                              0.0s",
         ),
     ],
 )
@@ -474,10 +497,14 @@ def test_a_gate_on_a_dispatched_turn_waits_for_the_answer_rather_than_taking_it(
     stream.feed(_envelope(2, "phase", {"action": "done", "outcome": "success"}, "e1"))
     stream.feed(_gate(3, "partial", "build"))
     stream.feed(_result(4, "phase", "e1", {"operation_outcome": "success"}))
+    # And the restatement that follows every result in a real ledger must not
+    # say the gate again: the line it went on has to be recorded as having it.
+    stream.feed(_decision(5, "phase", "build"))
     stream.close()
     line = [row for row in _turn_lines(sink) if row.lstrip().startswith("#2")][0]
     assert "ok" in line
     assert "gate: partial" in line
+    assert sink.text.count("gate: partial") == 1
     assert "↳" not in sink.text
 
 
@@ -800,19 +827,54 @@ def test_a_neighbour_opening_is_not_evidence_that_this_turn_settled():
     assert "↳ #1 ok" in sink.text
 
 
-def test_a_hole_is_stated_as_soon_as_the_turn_it_names_has_settled():
-    """A turn with no call is settled the moment it appears.
+def _turn_record(sequence: int, *, envelope_ref: str | None = None, actor: str = "model") -> str:
+    return _event(
+        sequence,
+        "turn_record",
+        {
+            "actor": actor,
+            "envelope_ref": envelope_ref,
+            "phase": "build",
+            "iteration": 1,
+            "t0": f"2026-09-15T01:00:{sequence:02d}Z",
+            "t1": f"2026-09-15T01:00:{sequence:02d}Z",
+        },
+    )
 
-    An `action_envelope` always opens a NEW turn — `reducer._on_action_envelope`
-    says so and gives its reasons — so a turn that arrives with no call will
-    never be given one, and the hole in it can be stated where it happened
-    rather than saved up for the close.
+
+def test_a_turn_record_can_take_back_a_hole_so_having_no_call_does_not_settle_one():
+    """The second door into R33, and the one a live run walks through.
+
+    A turn that arrives with no call looks final — nothing more can arrive for
+    it — until a `turn_record` seals it, at which point `_sealed_turn_warnings`
+    states a DIFFERENT set and both holes standing on it are withdrawn. Treating
+    "it has no call" as proof it had settled printed two statements the
+    derivation then took back, with no un-print.
+
+    None of the first three fixtures can show this: they carry no `turn_record`
+    at all. 272 of the corpus's 275 sessions do.
     """
 
     sink = _Sink()
     stream = TurnStreamRenderer(sink, width=100)
     stream.feed(_decision(1, "bash", "build"))
-    assert any("missing_envelope: turn 1" in line for line in _warnings(sink))
+    assert _inline_holes(sink) == [], "nothing the ledger can still withdraw"
+    stream.feed(_turn_record(2))
+    stream.close()
+    assert "missing_tool_result" not in sink.text
+    assert "missing_envelope: turn 1 has a loop_decision" not in sink.text
+
+
+def test_a_hole_on_an_unsealed_turn_is_still_stated_at_the_close():
+    """Held, not dropped: the same ledger with no record still states both."""
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_decision(1, "bash", "build"))
+    stream.close()
+    joined = _hole_text(sink)
+    assert "missing_envelope: turn 1 has a loop_decision but no action_envelope" in joined
+    assert "missing_tool_result: turn 1 has no tool_result and no typed refusal" in joined
 
 
 def test_a_hole_is_stated_once_however_often_the_reducer_restates_it():
@@ -926,6 +988,10 @@ def test_close_is_terminal_and_a_second_session_cannot_continue_the_first():
     stream.close()
     with pytest.raises(RuntimeError):
         stream.feed(_envelope(3, "bash", {"command": "pwd"}, "e2"))
+    # Including a line that would have produced no turn at all: the refusal is
+    # `feed`'s own, not one it happens to inherit from rendering something.
+    with pytest.raises(RuntimeError):
+        stream.feed("2026-09-14 21:06:09 | INFO | Executing command in container: ls")
 
 
 def test_the_two_accounting_codes_are_counted_and_everything_else_is_stated():
@@ -1269,7 +1335,6 @@ CORPUS = {
         "standing": 11,
         "inline": 0,
         "counted": {"conservation_violation": 1, "missing_loop_decision": 10},
-        "missing_tool_result": 0,
         "lines": 43,
     },
     "camel-quarkus-d2r3": {
@@ -1278,7 +1343,6 @@ CORPUS = {
         "standing": 24,
         "inline": 6,
         "counted": {"conservation_violation": 1, "missing_loop_decision": 17},
-        "missing_tool_result": 3,
         "lines": 90,
     },
     "ignite-d2r3": {
@@ -1287,8 +1351,20 @@ CORPUS = {
         "standing": 9,
         "inline": 0,
         "counted": {"conservation_violation": 1, "missing_loop_decision": 8},
-        "missing_tool_result": 0,
         "lines": 50,
+    },
+    # The only one of the four whose ledger closes with nothing standing: 21
+    # turns, every one sealed by a `turn_record`, no hole anywhere. It is what a
+    # healthy run looks like in this stream, and the only fixture that reaches
+    # the closing tally's silent path, the refusal path and a `file_io` call on
+    # real bytes.
+    "sling-commons-osgi-v4": {
+        "turns": 21,
+        "bands": ["provision", "analyze", "build", "test"],
+        "standing": 0,
+        "inline": 0,
+        "counted": {},
+        "lines": 31,
     },
 }
 
@@ -1296,8 +1372,8 @@ CORPUS = {
 def _call_of(line: str) -> str:
     """The call column of a turn line, whatever width it was rendered at.
 
-    The renderer keeps two blank columns between the call and what came back, so
-    the boundary is findable without the test having to know the layout.
+    The renderer keeps at least two blank columns between the call and what came
+    back, so the boundary is findable without the test knowing the layout.
     """
 
     fields = [field for field in line.split("  ") if field]
@@ -1352,21 +1428,22 @@ def test_a_held_line_is_placed_as_soon_as_a_phase_is_stated_not_when_it_answers(
     assert "verify mvn verify" in sink.lines[1]
 
 
-def test_a_hole_about_a_call_less_turn_is_stated_where_that_turn_is(session=None):
-    """Right under it, not saved up for the close.
+def test_a_hole_about_a_call_less_turn_waits_for_the_close():
+    """Because a `turn_record` can still withdraw it, and 99% of runs write one.
 
-    A call-less turn is settled the moment it appears, so the two holes in it
-    are stated there — which is where a reader is looking when they see a turn
-    with no call in it.
+    camel-quarkus has no records, so all six statements are true at the end and
+    all six are made — after the last turn, in `warning_order`, not under the
+    turns they name. That is the price of the predicate having no proxy in it:
+    six statements move to the foot of one session, and none of them can be a
+    statement the ledger takes back.
     """
 
     lines = _render("camel-quarkus-d2r3").lines
-    index = lines.index("  #22  —         no call")
-    assert lines[index + 1] == (
+    holes = [index for index, line in enumerate(lines) if line.startswith(_HOLE)]
+    last_turn = max(index for index, line in enumerate(lines) if line.lstrip().startswith("#"))
+    assert holes and min(holes) > last_turn
+    assert lines[min(holes)] == (
         "  ! missing_envelope: turn 22 has a loop_decision but no action_envelope"
-    )
-    assert lines[index + 2] == (
-        "  ! missing_tool_result: turn 22 has no tool_result and no typed refusal"
     )
 
 
@@ -1393,18 +1470,21 @@ def test_only_the_holes_that_still_stand_are_stated_and_the_rest_are_counted(ses
     Printing each warning as the reducer emits it would print 65 / 171 / 97 —
     one under every dispatch — and retract none of them. These are the counts
     that were still true when the ledger ended, and how they are divided between
-    what a reader is shown and what is counted for them.
+    what a reader is shown and what is counted for them. The fourth session's
+    zeroes are the useful ones: a healthy closed ledger says nothing at all.
     """
 
     expected = CORPUS[session]
     sink = _render(session, width=200)
     inline = _inline_holes(sink)
     assert len(inline) == expected["inline"]
-    assert sum("missing_tool_result" in hole for hole in inline) == expected["missing_tool_result"]
     counted = expected["counted"]
     total = sum(counted.values())
     named = ", ".join(f"{code} ×{n}" for code, n in sorted(counted.items()))
-    assert f"{total} more notes about the ledger itself: {named}" in _hole_text(sink)
+    if total:
+        assert f"{total} more notes about the ledger itself: {named}" in _hole_text(sink)
+    else:
+        assert "more note" not in sink.text
     assert len(inline) + total == expected["standing"]
     for code in counted:
         assert not [hole for hole in inline if hole.startswith(f"{_HOLE}{code}:")]
@@ -1462,9 +1542,16 @@ def test_the_styled_and_plain_renderings_of_a_real_session_agree(session):
 def test_a_real_line_paints_the_outcome_word_and_nothing_else():
     marked = _render("kafka-d2r3", tty=True).lines
     assert (
-        "  #3   project   env gradle                                   "
-        "[red]failed[/red] · ENV_EXECUTABLE_NOT_FO… · 0.8s" in marked
+        "  #3   project   env gradle                  "
+        "[red]failed[/red] · ENV_EXECUTABLE_NOT_FOUND                  0.8s" in marked
     )
+
+
+def test_a_job_still_running_is_styled_as_the_unfinished_thing_it_is():
+    """The fourth session dispatches a job and answers the turn while it runs."""
+
+    marked = _render("sling-commons-osgi-v4", tty=True).lines
+    assert [line for line in marked if "[cyan]pending[/cyan] · running" in line]
 
 
 def test_the_lines_a_watcher_is_scanning_for_carry_a_style():
@@ -1499,6 +1586,16 @@ def test_a_five_way_collision_is_five_different_lines_when_the_terminal_has_the_
     ]
     assert len(collisions) == 5
     assert len({_call_of(line) for line in collisions}) == 5
+    # 120 and not 110: the five diverge at the 57th character and the call
+    # column is 53 at width 110, so three of them collapse into one there. The
+    # fence says where the property starts holding rather than implying it holds
+    # everywhere.
+    at_110 = [
+        line
+        for line in _turn_lines(_render("camel-quarkus-d2r3", width=110))
+        if "JAVA_HOME=" in line
+    ]
+    assert len({_call_of(line) for line in at_110}) == 3
     # And at 80 columns there is genuinely no room, which the fence states
     # rather than pretending otherwise.
     narrow = [
@@ -1512,29 +1609,39 @@ def test_a_five_way_collision_is_five_different_lines_when_the_terminal_has_the_
 #: One verbatim line per tool, copied from what the renderer printed on the
 #: session named. These are what a reader reads; a summariser branch going dead
 #: changes one of them and this fails with the before and after side by side.
+#: The `sling-commons-osgi-v4` rows are the four shapes no other fixture has.
 VERBATIM = [
     (
         "kafka-d2r3",
-        "  #1   project   clone apache/kafka@4.3.1                     26b251a → /workspace/kafka · 12.6s",
-    ),
-    ("kafka-d2r3", "  #15  build     compile --no-daemon                          exit 0 · 1m23s"),
-    (
-        "kafka-d2r3",
-        "  #19  build     test --no-daemon :clients:test               failed · exit 1 · DETACHED_OP… · 7m26s",
+        "  #1   project   clone apache/kafka@4.3.1    26b251a → /workspace/kafka                        12.6s",
     ),
     (
         "kafka-d2r3",
-        "  #20  search    output_3ea47959569d /(?i)(BUILD SUCCESSFUL…  80 matches · 1.9s",
+        "  #15  build     compile --no-daemon         exit 0                                            1m23s",
     ),
-    ("kafka-d2r3", "  #5   bash      which gradle || true; ls -l /usr/bin/gradl…  ok · 2.8s"),
     (
         "kafka-d2r3",
-        "  #14  advisor   consult                                      advice delivered · 0.0s",
+        "  #19  build     test --no-daemon :clients:test  failed · exit 1 · DETACHED_OPERATION_FAILED   7m26s",
     ),
-    ("kafka-d2r3", "  #23  report    generate                                     ok · 0.9s"),
     (
         "kafka-d2r3",
-        "  #7   phase     done success                                 workspace_present · workspace… · 0.2s",
+        "  #20  search    output_3ea47959569d /(?i)(BUILD SUCCESSFUL…  80 matches                        1.9s",
+    ),
+    (
+        "kafka-d2r3",
+        "  #5   bash      which gradle || true; ls -l /usr/bin/gradl…  ok                                2.8s",
+    ),
+    (
+        "kafka-d2r3",
+        "  #14  advisor   consult                     advice delivered                                   0.0s",
+    ),
+    (
+        "kafka-d2r3",
+        "  #23  report    generate                    ok                                                 0.9s",
+    ),
+    (
+        "kafka-d2r3",
+        "  #7   phase     done success                workspace_present · workspace /workspace/kafka e…  0.2s",
     ),
     ("kafka-d2r3", "      ↳ #7 gate: success"),
     ("kafka-d2r3", "▸ provision"),
@@ -1542,11 +1649,11 @@ VERBATIM = [
     ("kafka-d2r3", "✓ test evidence_close · test_terminal"),
     (
         "ignite-d2r3",
-        "  #17  build     compile                                      exit 0 · 5 artifacts · 2m27s",
+        "  #17  build     compile                     exit 0 · 5 artifacts                              2m27s",
     ),
     (
         "ignite-d2r3",
-        "  #35  ⚙ engine  test                                         pending · running · job 2c4d… · 15m06s",
+        "  #35  ⚙ engine  test                        pending · running · job 2c4d56b2fdca             15m06s",
     ),
     ("ignite-d2r3", "      ! job 2c4d56b2fdca still live at close"),
     ("ignite-d2r3", "      ↳ #34 gate: unknown"),
@@ -1561,7 +1668,27 @@ VERBATIM = [
     ),
     (
         "camel-quarkus-d2r3",
-        "  #14  build     test -DskipITs -DskipIntegrationTests -Dsk…  failed · exit 1 · JAVA_VERSIO… · 6m23s",
+        "  #14  build     test -DskipITs -DskipIntegrationTests -Dsk…  failed · exit 1 · JAVA_VERSION…  6m23s",
+    ),
+    # A `file_io` call. R21 recorded "no archived fixture holds a `file_io`
+    # call, so that branch is pinned by unit tests only"; this one does.
+    (
+        "sling-commons-osgi-v4",
+        "  #6   file_io   read /workspace/sling-org-apache-sling-com…  ok                                1.8s",
+    ),
+    # A refusal, on real bytes. R21 said the same of refusal records.
+    (
+        "sling-commons-osgi-v4",
+        "  #20  search    search                      cancelled · cancelled                              0.0s",
+    ),
+    # A job dispatched and still running when its turn was answered.
+    (
+        "sling-commons-osgi-v4",
+        "  #19  search    job:output_a93bbaebcf50     pending · running                                  1.7s",
+    ),
+    (
+        "sling-commons-osgi-v4",
+        "  #14  bash      mvn --show-version -U -B -e clean install…  ok                                1m04s",
     ),
 ]
 
@@ -1584,11 +1711,12 @@ def test_a_real_gate_that_said_unknown_says_so():
 
 
 def test_a_phase_reason_code_is_rendered_bare_like_every_other_reason_code():
-    """The derivation labels it `gate <code>`; this layer already says `gate:`.
+    """One word, one fact.
 
-    Two different facts under one word on adjacent lines is what made both
-    unreadable. `summaries._phase_observation` is out of this task's scope, so
-    the label is removed here at the presentation layer.
+    `summaries._phase_observation` used to label a gate's reason code `gate
+    <code>`, and this layer says `gate:` for the word a gate DELIVERED, so the
+    two sat on adjacent lines under one word and neither could be read. Fixed at
+    its source now, so nothing here takes a label off a neighbour's string.
     """
 
     lines = _render("kafka-d2r3").lines
@@ -1614,61 +1742,265 @@ def test_a_clip_at_eighty_columns_never_ends_on_a_dangling_separator():
             assert " ·…" not in line, line
 
 
+# --- the sink a real terminal actually is --------------------------------
+
+
+def _through_rich(markup: str, width: int) -> str:
+    """What a `rich.console.Console` puts on the screen for this markup.
+
+    R40 pinned the Task 5 sink as `console.print(text, end="", markup=True,
+    highlight=False, soft_wrap=True)`. A callable that stores strings cannot
+    tell markup from rendered output, which is the gap every styled assertion in
+    this file used to sit in — so the styled path is checked through the real
+    thing, with colour off so what comes back is the characters a reader sees.
+    """
+
+    buffer = io.StringIO()
+    Console(file=buffer, force_terminal=False, no_color=True, width=max(width, 10_000)).print(
+        markup, end="", markup=True, highlight=False, soft_wrap=True
+    )
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("width", [60, 80, 100, 110, 120, 140, 200, 300])
+@pytest.mark.parametrize("session", SESSIONS)
+def test_a_real_session_reaches_a_real_terminal_unchanged(session, width):
+    r"""Every character of every line, at every width, through a Rich sink.
+
+    This ran at one width before, and one width was enough to hide that
+    `rich.markup.escape` does not round-trip: ignite `#18`'s search pattern
+    carries `\[INFO\]`, and at width 100 that line clipped before the first
+    backslash. At 110 and above it does not, and two characters of a regex the
+    reader would copy were being dropped on the way to the screen.
+    """
+
+    plain = _render(session, width=width).lines
+    styled = _render(session, width=width, tty=True).lines
+    assert [_through_rich(line, width) for line in styled] == plain
+
+
+def test_a_backslash_before_a_bracket_survives_the_sink():
+    r"""`rich.markup.escape` escapes for one of Rich's two rules, not both.
+
+    A TAG-shaped bracket is literal behind an odd number of backslashes, and the
+    run is halved; every OTHER `\[` simply loses its backslash. Rich's own
+    escape implements the first rule only, so it hands `\[INFO\]` straight
+    through and the sink prints `[INFO\]`.
+    """
+
+    awkward = [
+        r"/(BUILD SUCCESS|ERROR|FAILURE|\[INFO\] Building|\[INFO\] Re",
+        r"x\[INFO\]y",
+        r"a\[b\]c",
+        r"\s+\[",
+        r"sed -e 's/\[0-9\]//'",
+        "[INFO] Building",
+        "[red]x[/red]",
+        "[/]",
+        "[]",
+        "\\\\",
+        "\\",
+        r"C:\path\to",
+    ]
+    for text in awkward:
+        assert _through_rich(_escape(text), 200) == text, text
+
+
+def test_the_pattern_ignite_really_ran_reaches_the_screen_whole():
+    line = [
+        row for row in _render("ignite-d2r3", width=200, tty=True).lines if "BUILD SUCCESS" in row
+    ][0]
+    assert r"\[INFO\] Building" in _through_rich(line, 200)
+
+
+# --- the other public entry point ----------------------------------------
+
+
+def _turn(**fields) -> Turn:
+    """A `Turn` built by hand, for the paths no ledger produces.
+
+    `render_turn` is public (R6) and takes any `Turn`. Five clauses this file
+    once called unfenceable are reachable through it: they are unreachable from
+    what the reducer emits, which is not the same as unreachable from the
+    module's own contract.
+    """
+
+    base = {"turn_id": 1, "phase": "build", "actor": "model"}
+    return Turn.model_validate({**base, **fields})
+
+
+def _observation(**fields) -> ObservationInfo:
+    return ObservationInfo.model_validate(fields)
+
+
+def test_render_turn_is_public_and_renders_a_turn_no_ledger_would_produce():
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.render_turn(
+        _turn(
+            call=CallInfo(tool="bash", summary="ls -l"),
+            observation=_observation(outcome="ok", summary="two files"),
+            t0="2026-09-15T01:00:00Z",
+            t1="2026-09-15T01:00:03Z",
+        )
+    )
+    stream.close()
+    assert sink.lines == [
+        "▸ build",
+        "  #1   bash      ls -l                       two files                                          3.0s",
+    ]
+
+
+def test_a_turn_that_arrives_already_answered_is_not_held_for_a_band():
+    """Holding it would be holding for a band its phase can never name.
+
+    Nothing more will arrive for an answered turn, so the band it goes under is
+    already decided; holding it only delays the line.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.render_turn(
+        _turn(
+            phase="unknown",
+            call=CallInfo(tool="bash", summary="ls"),
+            observation=_observation(outcome="ok"),
+        )
+    )
+    assert _turn_lines(sink), "written at once, not held for a phase that will never come"
+    assert not [line for line in sink.lines if line.startswith("▸")]
+
+
+def test_a_band_opens_after_a_late_outcome_and_not_before_it():
+    """A turn that moves from one KNOWN phase to another.
+
+    No archived ledger does this — the only phase moves in all four sessions are
+    `unknown` to a real phase — so only a hand-built pair of turns reaches the
+    ordering. The outcome belongs to the band the turn was dispatched in, so it
+    is written before the new band opens, not under it.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.render_turn(_turn(phase="build", call=CallInfo(tool="bash", summary="ls")))
+    stream.render_turn(
+        _turn(
+            phase="test",
+            call=CallInfo(tool="bash", summary="ls"),
+            observation=_observation(outcome="ok"),
+        )
+    )
+    stream.close()
+    assert [line.strip()[:9] for line in sink.lines] == ["▸ build", "#1   bash", "▸ test"]
+
+
+def test_an_outcome_never_lands_on_another_turns_open_line():
+    """Two calls in flight and the EARLIER one answers first.
+
+    Without the guard the outcome is written onto whatever line happens to be
+    open — #2's — and #1 never gets one at all. The existing two-in-flight test
+    feeds the results the other way round, so it cannot see this.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_decision(1, "bash", "build"))
+    stream.feed(_envelope(2, "bash", {"command": "first"}, "e1"))
+    stream.feed(_envelope(3, "bash", {"command": "second"}, "e2"))
+    stream.feed(_result(4, "bash", "e1", {"operation_outcome": "success"}))
+    stream.close()
+    second = [line for line in _turn_lines(sink) if line.lstrip().startswith("#3")][0]
+    assert second.rstrip().endswith("second"), "still in flight, and says nothing else"
+    assert "↳ #2 ok" in sink.text
+
+
+def test_render_turn_refuses_after_close_the_way_feed_does():
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.close()
+    with pytest.raises(RuntimeError):
+        stream.render_turn(_turn(call=CallInfo(tool="bash", summary="ls")))
+
+
+def test_a_gate_in_hand_when_a_held_line_is_finally_written_is_not_said_twice():
+    """R36's hold defers a write past events that already happened.
+
+    So a turn dispatched late can arrive with its grading already on the line,
+    and the next restatement of that turn will say it again unless the write
+    records it. Event order is not render order.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "phase", {"action": "done", "outcome": "success"}, "e1"))
+    stream.feed(_gate(2, "partial", "build"))
+    stream.feed(_result(3, "phase", "e1", {"operation_outcome": "success"}))
+    stream.feed(_decision(4, "phase", "build"))
+    stream.close()
+    assert sink.text.count("gate: partial") == 1
+    assert "↳" not in sink.text
+
+
+def test_held_statements_are_released_in_the_order_warnings_have():
+    """Driven directly, because `feed()` cannot produce the disagreement.
+
+    Insertion order into the held set follows the reducer's emission order, and
+    `warning_order` keys on `control_seq` first, so on everything a ledger can
+    produce the two coincide. Two statements held out of sequence order tell
+    them apart.
+    """
+
+    from sag.trajectory.schema import Warning as LedgerWarning
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=200)
+    later = LedgerWarning(code="unknown_event_kind", detail="second", control_seq=9)
+    earlier = LedgerWarning(code="unknown_event_kind", detail="first", control_seq=2)
+    stream._hold([later, earlier], [])
+    stream._release()
+    stream.close()
+    assert [line.split(": ")[1] for line in _inline_holes(sink)] == ["first", "second"]
+
+
 def test_what_this_fence_does_not_catch():
     """The named gaps, rather than a silent one (R16/R27).
 
-    100 mutations were enumerated by walking `turn_stream.py` clause by clause,
-    all 100 applied, **93 caught**. This is the list of the 7 that did not fail a
-    test, written down here so the next reader knows which parts of the module
-    are held up by reading rather than by this file. Two of them are guards I
-    would keep even knowing they cannot bite; four are equivalent mutants; one
-    is a real gap.
+    110 mutations enumerated by walking `turn_stream.py` clause by clause, all
+    110 applied, **106 caught**. The four that did not fail a test are listed
+    here so the next reader knows which parts of the module are held up by
+    reading rather than by this file. All four are equivalent mutants: no input
+    the module can be given distinguishes them, through `feed()` or through
+    `render_turn()`.
 
-    **A real gap.**
-
-    - `_release`'s `sorted(..., key=warning_order)`. Replacing it with insertion
-      order passes everything. On every reachable release that carries more than
-      one statement — a call-less turn's `missing_envelope` and
-      `missing_tool_result` — the reducer emits them in the order
-      `warning_order` puts them in, so the two orders agree and nothing can tell
-      them apart. The sort stays because `warning_order` is the schema's stated
-      total order and the live stream and the batch view are only comparable if
-      both use it, not because a test proves it.
-
-    **Guards over invariants held elsewhere (the R32 class).**
-
-    - `_outcome_line`'s `turn.call.tool == "phase"` on the `gate ` label strip.
-      Only `summaries._phase_observation` writes that label, so widening the
-      strip to every tool changes nothing the derivation can produce today. The
-      guard says which fact is being translated, and stops a future summariser
-      that puts `gate ` in a bash line from having it quietly removed.
-    - `render_turn`'s `self._answered(turn)` half of the settle predicate.
-      Removing it — settling only call-less turns — changes no output, because
-      the only turn-scoped statement that can stand on a turn WITH a call is
-      `missing_tool_result`, and that is retracted by the very event that
-      answers it. So there is no reachable statement to release early. The half
-      stays because it is what "settled" means; the code would be right by
-      accident without it.
-
-    **Equivalent mutants — the mutation is a different spelling of the same
-    behaviour on every input the derivation can produce.**
-
-    - Holding a turn that arrives already answered. Such a turn's phase can
-      never resolve later, so it is placed by the next `_emit` or by `close()`
-      either way, and `_flush` runs ahead of every emission.
-    - `close()`'s explicit `_flush()`. Every close that has a held turn also has
-      a statement to state about it, and stating one flushes.
+    - `min(SUMMARY_MAX_CHARS, …)` on the call column. `CallInfo.summary` is
+      capped at `SUMMARY_MAX_CHARS` by the schema, so a renderer column wider
+      than that has nothing to put in it. The clause states the coupling; the
+      schema is what enforces it.
     - `_event`'s `isinstance(kind, str)` guard. A non-string kind matches none
       of the `elif` arms, so returning it changes nothing.
-    - Opening a band before a restated turn writes a late outcome rather than
-      after it. Reachable only if a turn moves from one KNOWN phase to another,
-      which no archived session does — measured across all three: the only
-      phase moves are `unknown` → a real phase, at the run's first turn and
-      after an evidence close.
+    - Rendering a delta's turns before releasing its statements, rather than
+      after. Every statement a delta releases is about a turn settled in an
+      EARLIER delta, and every turn a delta prints is one no statement is
+      released for yet, so no ledger produces a line that lands in a different
+      place under the two orders.
+    - `close()`'s explicit `_flush()`. A close that still holds a turn's line
+      also still holds a statement about that turn — an unanswered turn always
+      leaves `missing_tool_result` standing — and stating one flushes.
 
-    **And one value, not a clause.** `_JOB_NOTE_INTERVAL_SECONDS` itself: any
+    And one value, not a clause: `_JOB_NOTE_INTERVAL_SECONDS` itself. Any
     interval between one second and a session's length passes every test here.
     The throttle's existence is fenced; its calibration is a judgment.
+
+    **What the fourth fixture changed.** Exactly one clause is caught by
+    `sling-commons-osgi-v4` and by nothing else — the `pending` style, which no
+    other session reaches. Seventeen test cases replay it, and it is among the
+    failures of 35 of the 106. That is the honest mutation number, and it
+    understates the point: the fixture's value is not that it catches more of
+    today's clauses but that it is the only one of the four that can catch a
+    tomorrow's. The first three carry no `turn_record` between them, and the
+    live engine writes one per sealed turn; a settling rule that a `turn_record`
+    silently retracted survived a review, a re-review and a hundred mutations
+    against those three, because nothing in them could produce the event.
     """
 
     assert True

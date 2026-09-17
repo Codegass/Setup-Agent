@@ -579,7 +579,7 @@ LINES_AT_SEQUENCE = {
     ("kafka-d2r3", 148): (
         "done partial",
         "failed",
-        "gate tests_not_executed · no tests executed of 20,497 discovered",
+        "tests_not_executed · no tests executed of 20,497 discovered",
     ),
     ("kafka-d2r3", 163): ("generate", "ok", None),
     ("camel-quarkus-d2r3", 3): (
