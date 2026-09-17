@@ -1,212 +1,167 @@
-import type { ExecutionSessionDetail } from "@/api/types"
+import type {
+  AttentionItem,
+  CardTone,
+  ExecutionSessionDetail,
+  ResultCard,
+  ResultRow,
+  RowKey,
+} from "@/api/types"
 import { ModuleTable } from "@/components/session/ModuleTable"
-import { NeedsAttention } from "@/components/session/NeedsAttention"
-import {
-  formatRate,
-  presentBuild,
-  presentDataNotes,
-  presentDiagnostics,
-  presentTestAccounting,
-  presentTestRun,
-} from "@/evidencePresentation"
 import { cn } from "@/lib/utils"
 
-function pct1(n: number): string {
-  return formatRate(n)
+const CHIP: Record<CardTone, string> = {
+  success: "bg-status-success-soft text-status-success",
+  attention: "bg-status-attention-soft text-status-attention",
+  failed: "bg-status-failed-soft text-status-failed",
+  neutral: "bg-accent text-muted-foreground",
 }
 
-function progressText(progress: Record<string, number> | undefined): string | null {
-  if (!progress) return null
-  const done = Number.isFinite(progress.done) ? progress.done : null
-  const total = Number.isFinite(progress.total) ? progress.total : 0
-  if (done === null || total <= 0) return null
-  return `${done} / ${total}`
+function rowFor(card: ResultCard, key: RowKey): ResultRow | undefined {
+  return card.rows.find((row) => row.key === key)
 }
 
-function Tile({
-  label,
-  value,
-  sub,
-  valueClass,
-}: {
-  label: string
-  value: string
-  sub?: string | null
-  valueClass?: string
-}) {
+/**
+ * One measurement, restated exactly as the card wrote it.
+ *
+ * Nothing here is recomputed: the headline, the detail and the reason are the
+ * run's own words, and a row the run did not measure carries its own reason
+ * instead of a blank the reader has to interpret.
+ */
+function Tile({ row }: { row: ResultRow | undefined }) {
+  if (!row) return null
   return (
     <div className="min-w-0 rounded-[10px] border border-border bg-card px-4 py-3.5">
-      <div className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">{label}</div>
-      <div className={cn("mt-1 text-[27px] font-bold leading-[1.1] tracking-[-0.02em] text-foreground", valueClass)}>
-        {value}
+      <div className="flex items-center gap-2">
+        <span className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">
+          {row.label}
+        </span>
+        <span className={cn("rounded-full px-2 py-0.5 text-[11px] font-semibold", CHIP[row.tone])}>
+          {row.status}
+        </span>
       </div>
-      {sub ? <div className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{sub}</div> : null}
+      {/* A headline that only repeats the chip beside it is dropped rather
+          than said twice — "success", "not collected" and the like. */}
+      {row.headline === row.status ? null : (
+        <div className="mt-1.5 text-[17px] font-semibold leading-snug tracking-[-0.01em] text-foreground">
+          {row.headline}
+        </div>
+      )}
+      {row.detail ? (
+        <div className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{row.detail}</div>
+      ) : null}
+      {row.reason ? (
+        <div className="mt-1 text-[12px] italic leading-relaxed text-muted-foreground">
+          {row.reason}
+        </div>
+      ) : null}
     </div>
   )
 }
 
-/**
- * Overview tab: the always-visible agent goal button (jumps to Turns),
- * build and test summaries, the per-module overview table,
- * and the "needs attention" card. Markup/styling mirrors WorkbenchDetail.dc.html
- * lines 100–200 (the Overview block in the AFTER template).
- */
-export function OverviewTab({
-  detail,
-  onOpenFlow,
-}: {
-  detail: ExecutionSessionDetail
-  /** Opens the tab that shows the run turn by turn. Absent when this run has
-   *  no such tab — the goal is then stated rather than offered as a button
-   *  that would go nowhere. */
-  onOpenFlow?: () => void
-}) {
-  const test = detail.test
-  const ms = detail.moduleSummary
-  const modules = detail.modules ?? []
-  const layers = test.evidenceLayers?.tests
-  const run = presentTestRun(test)
-  const accounting = presentTestAccounting(test)
-  const diagnostics = presentDiagnostics(layers)
-  const dataNotes = presentDataNotes(test.conflicts)
+function AttentionRow({ item }: { item: AttentionItem }) {
+  const refs = item.refs ?? []
+  return (
+    <li className="border-t border-border px-4 py-3 first:border-t-0">
+      <div className="text-[13px] font-semibold text-foreground">{item.title}</div>
+      {item.detail ? (
+        <div className="mt-0.5 text-[12px] leading-relaxed text-muted-foreground">{item.detail}</div>
+      ) : null}
+      {refs.length > 0 ? (
+        <div className="mt-1.5 flex flex-wrap gap-1">
+          {refs.map((ref) => (
+            <span
+              className="rounded bg-accent px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground"
+              key={ref}
+            >
+              {ref}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </li>
+  )
+}
 
-  const goal = detail.context?.trunk.goal
-  const progress = progressText(detail.context?.trunk.progress)
-  const build = presentBuild(detail.build, detail.rates)
-  const hasModuleMetrics = ms != null || modules.length > 0
-  const reportDeliveryCopy = detail.reportDeliveryStatus === "failed"
-    ? {
-        title: "Final report not delivered",
-        body: "The sealed results above are available, but the final report could not be delivered.",
-      }
-    : detail.reportDeliveryStatus === "skipped"
-      ? {
-          title: "Final report delivery skipped",
-          body: "The sealed results above are available. This run did not send a final report.",
-        }
-      : null
-  const partialResult = detail.canonicalVerdict === "partial"
-    || detail.status.trim().toLowerCase() === "partial"
-    || test.state.trim().toLowerCase() === "partial"
+/**
+ * The Overview: what needs a person first, then the two measurements they came
+ * to read, then the modules behind them, then anything the run set aside.
+ *
+ * Every word below the chrome is the result card's own. The tab does not
+ * recompute a count, and it does not fill in a number the run declined to
+ * measure — a run with no card at all says that, rather than rendering an
+ * empty shape.
+ */
+export function OverviewTab({ detail }: { detail: ExecutionSessionDetail }) {
+  const card = detail.resultCard
+  const modules = detail.modules ?? []
+  const ms = detail.moduleSummary
+  // The card carries the run's goal; older sessions that predate the card
+  // carry it on the context trace and nowhere else.
+  const goal = card?.goal ?? detail.context?.trunk.goal ?? null
+  const attention = card?.attention ?? []
+  const notes = card?.notes ?? []
 
   return (
     <div>
-      {goal ? (
-        onOpenFlow ? (
-          <button
-            type="button"
-            onClick={onOpenFlow}
-            className="mb-3 flex w-full items-center gap-3 rounded-[10px] border border-border bg-card px-4 py-2.5 text-left"
+      {card ? (
+        <>
+          <section
+            aria-labelledby="overview-attention"
+            className={cn(
+              "overflow-hidden rounded-xl border bg-card",
+              attention.length > 0 ? "border-status-attention-border" : "border-border",
+            )}
           >
-            <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground">Goal</span>
-            <span className="min-w-0 flex-1 truncate text-[13px] leading-snug text-foreground">{goal}</span>
-            {progress ? <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{progress}</span> : null}
-            <span className="shrink-0 text-[12px] font-semibold text-primary">View the turns →</span>
-          </button>
-        ) : (
-          <div className="mb-3 flex w-full items-center gap-3 rounded-[10px] border border-border bg-card px-4 py-2.5 text-left">
-            <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground">Goal</span>
-            <span className="min-w-0 flex-1 truncate text-[13px] leading-snug text-foreground">{goal}</span>
-            {progress ? <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{progress}</span> : null}
+            <div className="flex items-center gap-2 border-b border-border px-4 py-3">
+              {attention.length > 0 ? (
+                <span className="h-[7px] w-[7px] rounded-full bg-status-failed" />
+              ) : null}
+              <h2 className="text-[14px] font-bold text-foreground" id="overview-attention">
+                Needs attention
+              </h2>
+            </div>
+            {attention.length > 0 ? (
+              <ul>
+                {attention.map((item, index) => (
+                  <AttentionRow item={item} key={`${item.kind}-${index}-${item.title}`} />
+                ))}
+              </ul>
+            ) : (
+              <p className="px-4 py-3 text-[13px] text-muted-foreground">Nothing needs attention.</p>
+            )}
+          </section>
+
+          <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Tile row={rowFor(card, "build")} />
+            <Tile row={rowFor(card, "tests")} />
           </div>
-        )
-      ) : null}
-
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <Tile
-          label="Build"
-          value={build.value}
-          sub={build.summary}
-          valueClass={build.valueClass}
-        />
-        <Tile
-          label="Tests"
-          value={run.stateLabel}
-          sub={accounting.summary}
-          valueClass={run.valueClass}
-        />
-      </div>
-
-      {!!detail.taskCompletionLines?.length && (
-        <section className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3" aria-label="Required task completion">
-          <h2 className="text-[13px] font-semibold text-foreground">Required task completion</h2>
-          {detail.taskCompletionLines.map((line, index) => (
-            <p key={`${index}-${line}`} className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{line}</p>
-          ))}
-        </section>
+        </>
+      ) : (
+        <div className="rounded-xl border border-border bg-card px-4 py-3">
+          <p className="text-[13px] text-muted-foreground">
+            No result was recorded for this run yet.
+          </p>
+        </div>
       )}
 
-      <section className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3" aria-label="Official CI comparison">
-        <h2 className="text-[13px] font-semibold text-foreground">Official CI comparison</h2>
-        {(detail.ciComparisonLines?.length ? detail.ciComparisonLines : ["Official CI: unavailable (no sealed comparison)"]).map((line, index) => (
-          <p key={`${index}-${line}`} className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{line}</p>
-        ))}
-      </section>
-
-      {ms?.lineRate != null || ms?.branchRate != null ? (
-        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-          {ms?.lineRate != null ? (
-            <Tile
-              label="Line coverage"
-              value={pct1(ms.lineRate)}
-              sub={
-                ms.lineCovered != null && ms.lineTotal != null
-                  ? `${ms.lineCovered.toLocaleString()} / ${ms.lineTotal.toLocaleString()} lines`
-                  : null
-              }
-            />
-          ) : null}
-          {ms?.branchRate != null ? (
-            <Tile
-              label="Branch coverage"
-              value={pct1(ms.branchRate)}
-              sub={
-                ms.branchCovered != null && ms.branchTotal != null
-                  ? `${ms.branchCovered.toLocaleString()} / ${ms.branchTotal.toLocaleString()} branches`
-                  : null
-              }
-            />
-          ) : null}
-        </div>
-      ) : null}
-
-      {layers && diagnostics.hasData ? (
-        <section className="mt-3 flex flex-col gap-3 rounded-[10px] border border-border bg-muted/40 px-4 py-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0">
-            <h2 className="text-[13px] font-semibold text-foreground">Diagnostic observations</h2>
-            <p className="mt-0.5 max-w-[72ch] text-[12px] leading-relaxed text-muted-foreground">
-              {diagnostics.summary}
-            </p>
-            {diagnostics.breakdown ? (
-              <p className="mt-1 font-mono text-[11px] text-muted-foreground">{diagnostics.breakdown}</p>
-            ) : null}
+      {goal ? (
+        // Below the two measurements, not above them: a real goal is a
+        // paragraph the operator wrote, and putting it first pushed what needs
+        // attention off the screen on every run checked against a live API.
+        // Stated in full — it is the instruction this run was given.
+        <section className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3">
+          <div className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">
+            Goal
           </div>
-          <div className="shrink-0 font-mono text-[20px] font-semibold tabular-nums text-foreground">
-            {diagnostics.value}
-          </div>
+          <p className="mt-1 text-[13px] leading-relaxed text-foreground">{goal}</p>
         </section>
-      ) : null}
-
-      {reportDeliveryCopy ? (
-        <section className="mt-3 rounded-[10px] border border-status-attention-border bg-status-attention-soft/40 px-4 py-3">
-          <h2 className="text-[13px] font-semibold text-status-attention">{reportDeliveryCopy.title}</h2>
-          <p className="mt-0.5 text-[12px] leading-relaxed text-foreground">{reportDeliveryCopy.body}</p>
-        </section>
-      ) : null}
-
-      {dataNotes.length > 0 ? (
-        <details className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3">
-          <summary className="cursor-pointer select-none text-[12px] font-semibold text-muted-foreground hover:text-foreground">
-            {partialResult ? "Why this result is partial" : "Data notes"}
-          </summary>
-          <ul className="mt-2 space-y-1.5 pl-4 text-[12px] leading-relaxed text-muted-foreground">
-            {dataNotes.map((note) => <li key={note} className="list-disc">{note}</li>)}
-          </ul>
-        </details>
       ) : null}
 
       {modules.length > 0 ? (
-        <section className="mt-5 overflow-hidden rounded-xl border border-border bg-card">
+        <section
+          aria-label="Per-module breakdown"
+          className="mt-5 overflow-hidden rounded-xl border border-border bg-card"
+        >
           <div className="flex items-center justify-between border-b border-border px-4 py-3">
             <h2 className="text-[14px] font-bold text-foreground">Per-module breakdown</h2>
             <span className="font-mono text-[12px] text-muted-foreground">
@@ -216,18 +171,28 @@ export function OverviewTab({
           </div>
           <ModuleTable modules={modules} variant="overview" />
         </section>
-      ) : !hasModuleMetrics ? (
+      ) : (
         <section className="mt-5 rounded-xl border border-dashed border-border bg-muted/30 px-4 py-3">
-          <h2 className="text-[13px] font-semibold text-foreground">Module details unavailable</h2>
-          <p className="mt-0.5 text-[12px] leading-relaxed text-muted-foreground">
-            Detailed module metrics were not produced for this run. The build result above remains the recorded result.
+          <p className="text-[13px] text-muted-foreground">
+            Module details are not available for this run.
           </p>
         </section>
-      ) : null}
+      )}
 
-      <div className="mt-5">
-        <NeedsAttention modules={modules} warnings={detail.build.warnings ?? []} />
-      </div>
+      {notes.length > 0 ? (
+        <details className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3">
+          <summary className="cursor-pointer select-none text-[12px] font-semibold text-muted-foreground hover:text-foreground">
+            Data notes
+          </summary>
+          <ul className="mt-2 space-y-1.5 pl-4 text-[12px] leading-relaxed text-muted-foreground">
+            {notes.map((note) => (
+              <li className="list-disc" key={note}>
+                {note}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
     </div>
   )
 }

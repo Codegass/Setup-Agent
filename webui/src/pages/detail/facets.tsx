@@ -100,9 +100,6 @@ export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
 export interface TabBodyProps {
   tabId: TabId
   detail: ExecutionSessionDetail
-  /** Used by the Overview goal button to jump into the Turns tab. Omitted when
-   *  this run has no such tab, so the button is not offered at all. */
-  onOpenFlow?: () => void
   onSubmitTask?: (
     workspaceId: string,
     task: string,
@@ -113,12 +110,13 @@ export interface TabBodyProps {
 /**
  * Renders the panel body for a tab. `overview` and `turns` use the dedicated
  * OverviewTab/TrajectoryTab panels; the rest delegate to the existing session
- * renderers. `onOpenFlow` lets the Overview goal button jump into Turns.
+ * renderers. Navigation between tabs belongs to the result band above them,
+ * whose rows each link to the tab that answers them.
  */
-export function TabBody({ tabId, detail, onOpenFlow }: TabBodyProps) {
+export function TabBody({ tabId, detail }: TabBodyProps) {
   switch (tabId) {
     case "overview":
-      return <OverviewTab detail={detail} onOpenFlow={onOpenFlow} />
+      return <OverviewTab detail={detail} />
     case "turns":
       return <TrajectoryTab live={isLiveSessionStatus(detail.status)} sessionId={detail.id} />
     case "tests":

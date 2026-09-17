@@ -138,11 +138,17 @@ describe("DetailPane", () => {
   })
 
   it("renders the header, the result band, and the tab bar (Overview active by default)", () => {
-    render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
+    const { container } = render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
     expect(screen.getByRole("heading", { name: "owner/x" })).toBeInTheDocument()
-    // The result band states each of the card's seven rows.
+    // The result band states each of the card's seven rows. Scoped to the band's
+    // own row: the Overview below it restates the tests row word for word, so an
+    // unscoped query would find two and say nothing about which surface it read.
     expect(screen.getByText("4/4 phases")).toBeInTheDocument()
-    expect(screen.getByText("10 executed · 10 passed · 0 failed · 0 errors · 0 skipped")).toBeInTheDocument()
+    const testsRow = container.querySelector('[data-row="tests"]') as HTMLElement
+    expect(testsRow).not.toBeNull()
+    expect(
+      within(testsRow).getByText("10 executed · 10 passed · 0 failed · 0 errors · 0 skipped"),
+    ).toBeInTheDocument()
     expect(screen.getByText("Official CI")).toBeInTheDocument()
     // Tab bar.
     expect(screen.getByRole("navigation", { name: /detail tabs/i })).toBeInTheDocument()
@@ -154,14 +160,14 @@ describe("DetailPane", () => {
 
   it("switches panels when a tab is clicked (real switch, not scroll)", () => {
     render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
-    // Overview content is visible up front; unsealed build duration is omitted.
-    expect(screen.getByText(/did not record its test outcome totals/i)).toBeInTheDocument()
+    // Overview content is visible up front.
+    expect(screen.getByText("Nothing needs attention.")).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: /^Build/ }))
     const build = screen.getByRole("button", { name: /^Build/ })
     expect(build).toHaveAttribute("aria-current", "true")
-    // The Build facet now owns the panel; the overview result cards are gone.
-    expect(screen.queryByText(/did not record its test outcome totals/i)).not.toBeInTheDocument()
+    // The Build facet now owns the panel; the Overview's own sections are gone.
+    expect(screen.queryByText("Nothing needs attention.")).not.toBeInTheDocument()
     expect(screen.getByText("Compiled all modules")).toBeInTheDocument()
   })
 

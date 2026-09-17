@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { ExecutionSessionDetail, ResultCard } from "@/api/types"
@@ -252,9 +252,15 @@ describe("App", () => {
     // Master-detail: header heading + result band + tab nav.
     expect(await screen.findByRole("heading", { name: "apache/commons-cli" })).toBeInTheDocument()
     expect(screen.getByRole("navigation", { name: /detail tabs/i })).toBeInTheDocument()
-    // The result band states every row of the card the API served.
+    // The result band states every row of the card the API served. The tests row
+    // is read inside the band, because the Overview below restates it word for
+    // word and an unscoped query would not say which surface it found.
     expect(screen.getByText("3/5 phases · 21 turns")).toBeInTheDocument()
-    expect(screen.getByText("320 executed · 312 passed · 8 failed · 0 errors · 0 skipped")).toBeInTheDocument()
+    const bandTests = document.querySelector('[data-row="tests"]') as HTMLElement
+    expect(bandTests).not.toBeNull()
+    expect(
+      within(bandTests).getByText("320 executed · 312 passed · 8 failed · 0 errors · 0 skipped"),
+    ).toBeInTheDocument()
     // The Report tab swaps in the report document body.
     fireEvent.click(screen.getByRole("button", { name: /^Report/ }))
     expect(screen.getByText("Project builds.")).toBeInTheDocument()

@@ -131,14 +131,7 @@ export function DetailPane({
 
       <main className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-7">
         <div className="mx-auto max-w-[1000px]">
-          <TabBody
-            detail={detail}
-            onOpenFlow={
-              tabIds.includes("turns") ? () => setActive("turns") : undefined
-            }
-            onSubmitTask={onSubmitTask}
-            tabId={active}
-          />
+          <TabBody detail={detail} onSubmitTask={onSubmitTask} tabId={active} />
         </div>
       </main>
 
