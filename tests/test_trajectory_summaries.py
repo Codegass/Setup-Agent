@@ -1,4 +1,10 @@
-"""A turn reads as a line: what was asked, and what came back."""
+"""A turn reads as a line: what was asked, and what came back.
+
+Every payload in this file is shaped like a payload the engine really writes.
+Where a fixture here once carried an invented key, it was replaced with the real
+one; `tests/test_trajectory_summaries_corpus.py` holds the derivation to three
+archived sessions so an invented shape cannot pass again.
+"""
 
 from sag.trajectory.schema import SUMMARY_MAX_CHARS
 from sag.trajectory.summaries import (
@@ -21,10 +27,47 @@ def test_build_call_names_its_action_and_command():
         )
         == "verify mvn clean verify"
     )
+    # The reviewed runner command is carried under `source_command` instead when
+    # the envelope states a verb and its args separately.
+    assert (
+        call_summary(
+            "build",
+            {
+                "action": "verify",
+                "args": "-B clean",
+                "source_command": "mvn -B clean verify",
+                "system": "maven",
+            },
+        )
+        == "verify mvn -B clean verify"
+    )
 
 
 def test_build_call_without_a_recognisable_action_shows_the_command():
     assert call_summary("build", {"command": "./gradlew check"}) == "./gradlew check"
+
+
+def test_a_build_call_that_carries_only_a_verb_says_the_verb():
+    """The commonest real build envelope has no `command` at all — just `action`."""
+
+    assert (
+        call_summary("build", {"action": "compile", "timeout": 1200, "working_directory": "/w"})
+        == "compile"
+    )
+    assert call_summary("build", {"action": "test", "args": "--no-daemon :clients:test"}) == "test"
+
+
+def test_the_mirrored_build_verbs_are_the_build_tool_s_own():
+    """`_BUILD_ACTIONS` is a copy of a vocabulary this layer must not import.
+
+    The derivation is read-only and must not import a Docker-bound tool, so the
+    verbs are mirrored. A test may import it; a mirror that drifts is a word
+    dropped off every build line it used to name.
+    """
+    from sag.tools.build import build_tool
+    from sag.trajectory.summaries import _BUILD_ACTIONS
+
+    assert _BUILD_ACTIONS == set(build_tool._ACTIONS)
 
 
 def test_bash_call_collapses_the_command_to_its_first_line():
@@ -45,6 +88,37 @@ def test_project_clone_names_the_repository_and_ref():
     )
 
 
+def test_a_clone_ref_that_is_a_tag_is_carried_whole():
+    """Real refs are tags, and half a tag is a ref that does not exist.
+
+    Only a full 40-character hex sha is shortened. Every other ref is printed as
+    the record holds it, or the reader is handed `release` for
+    `releases/lucene/10.4.0` and `clone apache/ignite` for a pinned `2.18.0`.
+    """
+    assert (
+        call_summary(
+            "project",
+            {
+                "action": "clone",
+                "repo_url": "https://github.com/apache/ignite.git",
+                "ref": "2.18.0",
+            },
+        )
+        == "clone apache/ignite@2.18.0"
+    )
+    assert (
+        call_summary(
+            "project",
+            {
+                "action": "clone",
+                "repo_url": "https://github.com/apache/lucene.git",
+                "ref": "releases/lucene/10.4.0",
+            },
+        )
+        == "clone apache/lucene@releases/lucene/10.4.0"
+    )
+
+
 def test_project_provision_names_the_toolchain():
     assert (
         call_summary(
@@ -58,17 +132,56 @@ def test_project_provision_names_the_toolchain():
     )
 
 
-def test_files_and_search_and_phase_and_advisor_and_report():
-    assert call_summary("files", {"action": "write", "path": "/workspace/x/pom.xml"}) == (
-        "write /workspace/x/pom.xml"
+def test_a_provision_that_named_no_distribution_does_not_invent_one():
+    """The real envelope is `{"action": "provision", "java_version": "17"}`.
+
+    `java` is the name of the key the number came from. A distribution word
+    would be a fact the payload never carried.
+    """
+    assert call_summary("project", {"action": "provision", "java_version": "17"}) == (
+        "provision java 17"
+    )
+
+
+def test_file_io_and_search_and_phase_and_advisor_and_report():
+    assert call_summary("file_io", {"action": "read", "path": "/workspace/x/pom.xml"}) == (
+        "read /workspace/x/pom.xml"
     )
     assert call_summary("search", {"target": "output_abc", "pattern": "ERROR"}) == (
         "output_abc /ERROR/"
     )
-    assert call_summary("search", {"query": "maven enforcer minimum"}) == ("maven enforcer minimum")
-    assert call_summary("phase", {"signal": "done", "phase": "build"}) == "done build"
-    assert call_summary("advisor", {"question": "what now"}) == "consult"
+    assert call_summary("search", {"target": "name:/workspace/kafka"}) == "name:/workspace/kafka"
+    assert call_summary("phase", {"action": "done", "outcome": "success"}) == "done success"
+    assert call_summary("advisor", {}) == "consult"
+    assert call_summary("report", {"action": "generate"}) == "generate"
     assert call_summary("report", {}) == "generate"
+    # `generate` is the only action the corpus carries today, so the line the
+    # envelope states and the fallback agree. The rule is that the envelope
+    # wins, and only a second word can say so.
+    assert call_summary("report", {"action": "finalize"}) == "finalize"
+
+
+def test_a_file_io_call_is_not_summarised_by_its_line_numbers():
+    """`start_line` and `end_line` ride along on every real read.
+
+    Falling through to the parameter-scraping tail promotes them ahead of the
+    path and then clips the path away behind them.
+    """
+    summary = call_summary(
+        "file_io",
+        {
+            "action": "read",
+            "path": "/workspace/seatunnel-web/pom.xml",
+            "start_line": 1,
+            "end_line": 260,
+        },
+    )
+    assert summary == "read /workspace/seatunnel-web/pom.xml"
+
+
+def test_a_phase_call_that_stated_no_outcome_says_only_what_it_did():
+    assert call_summary("phase", {"action": "note", "text": "Analyze facts: root build"}) == "note"
+    assert call_summary("phase", {"action": "blocked", "outcome": "failed"}) == "blocked failed"
 
 
 def test_an_unknown_tool_shows_its_first_three_scalar_parameters():
@@ -82,9 +195,39 @@ def test_a_summary_is_truncated_with_an_ellipsis():
     assert summary.endswith("…")
 
 
+def test_a_summary_that_collapses_to_nothing_is_none_not_a_blank():
+    """ "Absence is stated, never implied" — and `""` implies a blank answer."""
+
+    assert call_summary("file_io", {"action": "  ", "path": "\t"}) is None
+    assert call_summary("bash", {"command": "   \n  "}) is None
+    assert observation_summary("phase", {"metadata": {"gate_result": {"code": "  "}}}) is None
+
+
+def test_the_clip_every_line_passes_through_never_returns_a_blank():
+    """The last gate before a line reaches a field that forbids an empty string.
+
+    Its callers all filter blanks before it, so this is the guard's only direct
+    test — and without it the module can start answering an empty string where
+    it means `None`, which is the distinction this layer is built on.
+    """
+    from sag.trajectory.summaries import _clip
+
+    assert _clip("   ") is None
+    assert _clip("\n\t ") is None
+    assert _clip(None) is None
+    assert _clip("  kept  ") == "kept"
+
+
 def test_no_params_yields_no_summary():
     assert call_summary("build", None) is None
     assert call_summary("build", {}) is None
+
+
+def test_the_two_tools_whose_summary_is_their_name_answer_without_params():
+    """A deliberate asymmetry: `consult` and `generate` are read off the tool."""
+
+    assert call_summary("advisor", None) == "consult"
+    assert call_summary("report", None) == "generate"
 
 
 def test_outcome_reads_success_as_ok():
@@ -92,13 +235,61 @@ def test_outcome_reads_success_as_ok():
 
 
 def test_outcome_reads_a_running_dispatch_as_pending():
-    assert observation_outcome({"invocation_status": "dispatched"}) == "pending"
-    assert observation_outcome({"invocation_status": "running"}) == "pending"
+    assert observation_outcome({"invocation_status": "pending"}) == "pending"
+    assert (
+        observation_outcome({"invocation_status": "pending", "operation_outcome": "unknown"})
+        == "pending"
+    )
 
 
-def test_outcome_falls_back_to_failed():
+def test_an_outcome_the_payload_declined_to_state_is_not_a_verdict():
+    """`unknown` is the engine saying "I do not know"; `failed` would be a verdict.
+
+    `partial` and `skipped` are legal words too, and neither of them is a
+    failure. Where the record states no outcome this layer states none either.
+    """
     assert observation_outcome({"operation_outcome": "failed"}) == "failed"
-    assert observation_outcome({}) == "failed"
+    assert observation_outcome({"operation_outcome": "unknown"}) is None
+    assert observation_outcome({"operation_outcome": "partial"}) is None
+    assert observation_outcome({"operation_outcome": "skipped"}) is None
+    assert observation_outcome({}) is None
+
+
+def test_a_cancelled_call_is_cancelled_and_a_crashed_one_failed():
+    assert observation_outcome({"invocation_status": "cancelled"}) == "cancelled"
+    assert observation_outcome({"invocation_status": "crashed"}) == "failed"
+    assert observation_outcome({"invocation_status": "timeout"}) == "failed"
+
+
+def test_every_word_the_engine_can_write_has_one_answer():
+    """The whole mapping, pinned against the engine's two enums.
+
+    `dispatched`, `running` and `polling` — the words this module used to look
+    for — are not among them, which is why all 76 real pending calls read as
+    failures before this table was written down.
+    """
+    from sag.evidence import InvocationStatus, OperationOutcome
+
+    assert {
+        status.value: observation_outcome({"invocation_status": status.value})
+        for status in InvocationStatus
+    } == {
+        "pending": "pending",
+        "completed": None,
+        "timeout": "failed",
+        "crashed": "failed",
+        "cancelled": "cancelled",
+    }
+    assert {
+        outcome.value: observation_outcome({"operation_outcome": outcome.value})
+        for outcome in OperationOutcome
+    } == {
+        "unknown": None,
+        "success": "ok",
+        "partial": None,
+        "failed": "failed",
+        "skipped": None,
+    }
 
 
 def test_no_result_yields_no_outcome():
@@ -107,17 +298,58 @@ def test_no_result_yields_no_outcome():
 
 def test_build_result_summarises_exit_tests_and_artifacts():
     result = {
+        "invocation_status": "completed",
         "operation_outcome": "success",
         "facts": {"executed": 994, "passed": 933, "failed": 0, "skipped": 61},
         "metadata": {
-            "analysis": {
-                "exit_code": 0,
-                "artifacts_created": ["a.jar", "b.jar"],
-                "log_tests_run": {"errors": 0},
-            }
+            "exit_code": 0,
+            "analysis": {"exit_code": 0, "artifacts_created": ["a.jar", "b.jar"]},
         },
     }
-    assert observation_summary("build", result) == "exit 0 · 994 tests · 0 F · 0 E · 61 S · 2 jars"
+    assert observation_summary("build", result) == "exit 0 · 994 tests · 0 F · 61 S · 2 jars"
+
+
+def test_a_five_figure_test_count_is_grouped_for_reading():
+    result = {
+        "operation_outcome": "success",
+        "facts": {"executed": 18421, "failed": 3, "skipped": 31},
+        "metadata": {"exit_code": 0},
+    }
+    assert observation_summary("build", result) == "exit 0 · 18,421 tests · 3 F · 31 S"
+
+
+def test_a_count_the_payload_never_took_is_not_printed_as_zero():
+    """No `E` term at all: no real build result carries an error count.
+
+    `facts["errors"]` does not exist, and `metadata.analysis.log_tests_run`
+    occurs in no build result, so every `0 E` this line used to print was a
+    count nobody took. `failed` and `skipped` are stated only when they are
+    stated — a `None` must never render as `0 F`, and never as `None F`.
+    """
+    counted = {
+        "operation_outcome": "success",
+        "facts": {"executed": 994, "passed": 994, "failed": None, "skipped": None},
+        "metadata": {"exit_code": 0},
+    }
+    assert observation_summary("build", counted) == "exit 0 · 994 tests"
+
+    uncounted = {"operation_outcome": "success", "facts": {}, "metadata": {"exit_code": 0}}
+    assert observation_summary("build", uncounted) == "exit 0"
+
+    # `True` is an `int` in Python, and it is not a count of anything.
+    flagged = {
+        "operation_outcome": "success",
+        "facts": {"executed": 5, "failed": True, "skipped": False},
+        "metadata": {"exit_code": 0},
+    }
+    assert observation_summary("build", flagged) == "exit 0 · 5 tests"
+
+    partial = {
+        "operation_outcome": "success",
+        "facts": {"executed": 994, "failed": 3},
+        "metadata": {"exit_code": 0},
+    }
+    assert observation_summary("build", partial) == "exit 0 · 994 tests · 3 F"
 
 
 def test_failed_build_result_names_its_error():
@@ -129,12 +361,26 @@ def test_failed_build_result_names_its_error():
     assert observation_summary("build", result) == "exit 1 · MAVEN_VERSION_BELOW_MINIMUM"
 
 
+def test_a_failed_build_that_states_only_a_log_diagnosis_names_that():
+    result = {
+        "operation_outcome": "failed",
+        "metadata": {"exit_code": 1, "analysis": {"exit_code": 1, "error_type": "MODULE_BANNED"}},
+    }
+    assert observation_summary("build", result) == "exit 1 · MODULE_BANNED"
+
+
 def test_provision_result_names_the_version_it_verified():
     result = {
         "operation_outcome": "success",
         "metadata": {"verified_java_version": "17.0.20", "java_version": "17"},
     }
     assert observation_summary("project", result) == "java 17.0.20"
+    assert (
+        observation_summary(
+            "project", {"operation_outcome": "success", "metadata": {"java_version": "17"}}
+        )
+        == "java 17"
+    )
 
 
 def test_clone_result_names_the_commit_and_path():
@@ -143,19 +389,47 @@ def test_clone_result_names_the_commit_and_path():
         "metadata": {
             "resolved_commit": "e17111798da51037659b3594d9c0b3b525040081",
             "clone_path": "/workspace/commons-cli",
+            "ref": "2.18.0",
         },
     }
     assert observation_summary("project", result) == "e171117 → /workspace/commons-cli"
 
 
+def test_a_failed_project_call_never_reads_like_a_successful_one():
+    """Success-shaped metadata survives a failure; the outcome decides first."""
+
+    result = {
+        "operation_outcome": "failed",
+        "error_code": "ENV_RUNTIME_REQUIREMENT_MISMATCH",
+        "metadata": {"verified_java_version": "17.0.20"},
+    }
+    assert observation_summary("project", result) == "ENV_RUNTIME_REQUIREMENT_MISMATCH"
+
+
 def test_phase_result_names_the_gate_word_and_reason():
+    """The gate word is `metadata.gate_result["code"]`, and it is a dict."""
+
     result = {
         "operation_outcome": "success",
-        "facts": {"gate": "success", "reason": "workspace /workspace/commons-cli exists"},
+        "facts": {"phase": "provision"},
+        "metadata": {
+            "gate_result": {
+                "accepted": True,
+                "code": "workspace_present",
+                "reason": "workspace /workspace/commons-cli exists",
+                "validator_state": "green",
+            }
+        },
     }
     assert observation_summary("phase", result) == (
-        "gate success · workspace /workspace/commons-cli exists"
+        "gate workspace_present · workspace /workspace/commons-cli exists"
     )
+
+
+def test_a_phase_result_with_no_gate_says_the_signal_it_has():
+    result = {"operation_outcome": "success", "metadata": {"phase_signal": "note"}}
+    assert observation_summary("phase", result) == "note"
+    assert observation_summary("phase", {"operation_outcome": "success", "metadata": {}}) is None
 
 
 def test_advisor_result_says_advice_was_delivered():
@@ -163,8 +437,24 @@ def test_advisor_result_says_advice_was_delivered():
 
 
 def test_a_pending_job_names_its_handle():
-    result = {"invocation_status": "dispatched", "metadata": {"job_id": "c523e63040aa"}}
-    assert observation_summary("build", result) == "running · job c523e63040aa"
+    result = {
+        "invocation_status": "pending",
+        "operation_outcome": "unknown",
+        "metadata": {"job_id": "2c4d56b2fdca"},
+    }
+    assert observation_summary("build", result) == "running · job 2c4d56b2fdca"
+    assert observation_summary("build", {"invocation_status": "pending"}) == "running"
+
+
+def test_a_result_that_states_no_error_states_nothing():
+    """The generic tail carries a code or says nothing; `failed` is the outcome's word."""
+
+    assert observation_summary("bash", {"operation_outcome": "failed"}) is None
+    assert (
+        observation_summary("bash", {"operation_outcome": "failed", "error_code": "COMMAND_FAILED"})
+        == "COMMAND_FAILED"
+    )
+    assert observation_summary("search", {"operation_outcome": "success"}) is None
 
 
 def test_a_refusal_states_its_code():
@@ -179,3 +469,19 @@ def test_a_non_cancellation_refusal_is_a_refusal():
     outcome, summary = refusal_summary({"refusal_code": "TOOL_PARAMETERS_INVALID"})
     assert outcome == "refused"
     assert summary == "TOOL_PARAMETERS_INVALID"
+
+
+def test_a_lowercase_refusal_code_is_still_shown_whole():
+    """Real refusal codes are not all SHOUTED: `execution_refused:evidence_closed`."""
+
+    outcome, summary = refusal_summary({"refusal_code": "execution_refused:evidence_closed"})
+    assert outcome == "refused"
+    assert summary == "execution_refused:evidence_closed"
+    assert refusal_summary({"refusal_code": "skipped"}) == ("refused", "skipped")
+
+
+def test_the_cancellation_code_is_the_engine_s_own():
+    from sag.agent.control_events import CANCELLED_CALL_REFUSAL_CODE
+
+    outcome, _ = refusal_summary({"refusal_code": CANCELLED_CALL_REFUSAL_CODE})
+    assert outcome == "cancelled"
