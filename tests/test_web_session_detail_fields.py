@@ -76,6 +76,10 @@ def test_result_card_serializes_under_its_camel_case_alias():
     dumped = detail.model_dump(mode="json", by_alias=True, include={"result_card"})
     assert "resultCard" in dumped
     assert dumped["resultCard"]["rows"][0]["key"] == "setup"
+    # The envelope key is not the only camelCase thing here: the body speaks the
+    # same convention, so a reader never switches halfway through the object.
+    assert dumped["resultCard"]["runId"] == card.run_id
+    assert [key for key in dumped["resultCard"] if "_" in key] == []
 
 
 def test_the_composed_verdict_module_is_gone():

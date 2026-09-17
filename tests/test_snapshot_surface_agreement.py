@@ -1389,8 +1389,10 @@ def test_the_web_payload_carries_the_same_rows_as_the_terminal(record):
     printed = _printed_rows(card)
     cells = _report_cells(card)
 
-    # The hop this leg reaches is the card's own: `model_dump(mode="json")`
-    # out to the JSON shape the API serves, `model_validate` back in. It does
+    # The hop this leg reaches is the card's own: `model_dump(mode="json",
+    # by_alias=True)` out to the JSON shape the API serves — camelCase, the
+    # same convention as everything else on the wire, which is why the dump is
+    # taken by alias and not by field name — and `model_validate` back in. It does
     # NOT run the registry — `_setup_artifact_item` and `_session_detail` are
     # imported above for the tests further up this file, not for this one, and
     # that the registry performs this same dump and validate is pinned in
@@ -1402,8 +1404,13 @@ def test_the_web_payload_carries_the_same_rows_as_the_terminal(record):
     # the JSON shape drops and a renderer that drifted from the card both fail
     # here, because neither of the two surfaces it is compared against went
     # through this hop.
-    served = card.model_dump(mode="json")
+    served = card.model_dump(mode="json", by_alias=True)
     delivered = RunResultCard.model_validate(served)
+
+    assert [key for key in served if "_" in key] == [], (
+        f"{_WEB} serves {[key for key in served if '_' in key]} for {record}; the card body "
+        "is camelCase like the rest of the API"
+    )
 
     assert [row["key"] for row in served["rows"]] == list(printed), (
         f"{_WEB} serves rows {[row['key'] for row in served['rows']]} for {record}; "

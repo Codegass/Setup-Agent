@@ -111,3 +111,46 @@ def test_an_explicit_nested_override_still_wins():
                          "steps": [], "reasons": ["task_run_pin_unavailable"]},
     )
     assert payload["task_completion"]["run_id"] == RUN_ID
+
+
+def test_the_card_body_serializes_camel_case_like_the_rest_of_the_api():
+    """The API serves camelCase around the card; the body speaks it too.
+
+    Before this, `resultCard` was the only aliased key and everything inside it
+    arrived snake_case, so a reader had to switch conventions mid-object.
+    """
+
+    card = _card(
+        session_dir="logs/session_recorded",
+        stats=ResultStats(wall_clock_seconds=1.5, tool_calls=3, phases_completed=5),
+    )
+
+    dumped = card.model_dump(mode="json", by_alias=True)
+
+    assert dumped["schemaVersion"] == 1
+    assert dumped["runId"] == "run-1"
+    assert dumped["verdictSource"] == "snapshot"
+    assert dumped["sessionDir"] == "logs/session_recorded"
+    assert dumped["stats"]["wallClockSeconds"] == 1.5
+    assert dumped["stats"]["toolCalls"] == 3
+    assert dumped["stats"]["phasesCompleted"] == 5
+    assert [key for key in dumped if "_" in key] == []
+    assert [key for key in dumped["stats"] if "_" in key] == []
+
+
+def test_the_card_reads_back_from_the_shape_it_serves():
+    """A camelCase body validates back into the same card, field for field."""
+
+    card = _card(session_dir="logs/session_recorded", stats=ResultStats(tool_calls=3))
+
+    assert RunResultCard.model_validate(card.model_dump(mode="json", by_alias=True)) == card
+
+
+def test_python_side_construction_keeps_its_field_names():
+    """Every caller in this repository builds the card by field name."""
+
+    card = _card(session_dir="logs/session_recorded")
+
+    assert card.session_dir == "logs/session_recorded"
+    assert card.verdict_source == "snapshot"
+    assert RunResultCard.model_validate(card.model_dump(mode="json")).run_id == "run-1"

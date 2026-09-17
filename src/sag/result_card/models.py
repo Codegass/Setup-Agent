@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic.alias_generators import to_camel
 
 RowKey = Literal["setup", "task", "build", "tests", "coverage", "ci", "report"]
 Tone = Literal["success", "attention", "failed", "neutral"]
@@ -32,7 +33,22 @@ ROW_LABELS: dict[RowKey, str] = {
 
 
 class _Frozen(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    """Read-only, and camelCase on the wire.
+
+    ``alias_generator`` is what the web API serves under: everything else the
+    API returns is camelCase, and a single snake_case body inside a camelCase
+    envelope is a trap for every later reader. ``populate_by_name`` keeps the
+    Python side unchanged — the terminal block, the report and every builder in
+    this package construct and read by field name, and a card already written
+    to disk in field-name form still validates.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
 
 
 class ResultRow(_Frozen):
