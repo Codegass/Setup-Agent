@@ -2,9 +2,12 @@
 saw (spec §7). Helpers are pure; sources (container/session-dir) are injected."""
 
 import json
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 import sag.config as config_module
@@ -281,3 +284,128 @@ def _write_recorded_session(tmp_path):
         encoding="utf-8",
     )
     return session_dir
+
+
+# --- sag inspect --turn: one turn end to end -------------------------------
+#
+# These read a real recorded control ledger. `--turn` derives from that ledger
+# through `build_trajectory`, so the journal/contexts session
+# `_write_recorded_session` writes above cannot serve them: it has no ledger.
+
+LEDGER_FIXTURE = Path(__file__).parent / "fixtures" / "trajectory" / "sling-commons-osgi-v4"
+
+WELCOME_LINE = "Automated project setup with AI"
+
+
+@pytest.fixture
+def ledger_session(tmp_path):
+    """A copy of a recorded session that carries a control ledger."""
+
+    session = tmp_path / "ledger-session"
+    shutil.copytree(LEDGER_FIXTURE, session)
+    return session
+
+
+def _inspect(session, *args):
+    return CliRunner().invoke(cli, ["inspect", "x", "--session", str(session), *args])
+
+
+def test_inspect_does_not_print_the_welcome_panel(ledger_session):
+    result = _inspect(ledger_session, "--turn", "1")
+
+    assert result.exit_code == 0
+    assert WELCOME_LINE not in result.output
+
+
+def test_turn_shows_one_turns_call_and_result(ledger_session):
+    result = _inspect(ledger_session, "--turn", "1")
+
+    assert result.exit_code == 0
+    assert "Turn 1" in result.output
+    assert "tool: project" in result.output
+    assert '"action": "clone"' in result.output
+    assert "outcome: ok" in result.output
+    # The headers alone prove nothing; the turn must have found a real call
+    # and a real result.
+    assert "this turn called no tool" not in result.output
+    assert "no result is recorded for this turn" not in result.output
+
+
+def test_a_turn_with_a_gate_names_the_word_it_delivered(ledger_session):
+    result = _inspect(ledger_session, "--turn", "5")
+
+    assert result.exit_code == 0
+    assert "Gate: success" in result.output
+    assert "decision gate-30aaf29fbbace326f509efb0aa6719f4" in result.output
+
+
+def test_an_unknown_turn_names_the_range_that_exists(ledger_session):
+    result = _inspect(ledger_session, "--turn", "9999")
+
+    assert result.exit_code == 1
+    assert "recorded turns" in result.output
+    assert "1..21" in result.output
+
+
+def test_a_turn_says_when_this_session_kept_no_bytes_for_a_ref(ledger_session):
+    result = _inspect(ledger_session, "--turn", "1")
+
+    assert result.exit_code == 0
+    assert "model-visible ref output_16686c22765a" in result.output
+    assert "evidence ref output_1b45ec5b0417" in result.output
+    assert result.output.count("no bytes for this ref") == 2
+
+
+def _synthetic_document(*, gate, observation, outputs):
+    from sag.trajectory.schema import SessionInfo, Trajectory, Turn
+
+    return Trajectory(
+        session=SessionInfo(run_id="synthetic"),
+        turns=[
+            Turn(
+                turn_id=1,
+                phase="build",
+                actor="model",
+                observation=observation,
+                gate=gate,
+            )
+        ],
+        outputs=outputs,
+    )
+
+
+def test_a_gate_with_no_decision_id_does_not_print_none(monkeypatch, tmp_path):
+    import sag.main as main_module
+    from sag.trajectory.schema import GateInfo
+
+    document = _synthetic_document(
+        gate=GateInfo(word="success", decision_id=None),
+        observation=None,
+        outputs={},
+    )
+    monkeypatch.setattr(main_module, "build_trajectory", lambda *a, **k: document)
+
+    result = _inspect(tmp_path, "--turn", "1")
+
+    assert result.exit_code == 0
+    assert "Gate: success" in result.output
+    assert "None" not in result.output
+
+
+def test_an_empty_result_is_not_reported_as_missing_from_the_store(monkeypatch, tmp_path):
+    import sag.main as main_module
+    from sag.trajectory.schema import ObservationInfo
+
+    document = _synthetic_document(
+        gate=None,
+        observation=ObservationInfo(outcome="ok", ref="output_empty", evidence_ref="output_absent"),
+        outputs={"output_empty": ""},
+    )
+    monkeypatch.setattr(main_module, "build_trajectory", lambda *a, **k: document)
+
+    result = _inspect(tmp_path, "--turn", "1")
+
+    assert result.exit_code == 0
+    assert "the store holds this ref, and it is empty" in result.output
+    assert "no bytes for this ref" in result.output
+    assert result.output.count("no bytes for this ref") == 1

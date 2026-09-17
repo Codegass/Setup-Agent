@@ -572,3 +572,58 @@ def test_the_block_states_the_run_counts_and_names_the_report_it_was_given():
     assert "12 turns · 20 tool calls · 6m 30s" in text
     assert "setup-report-20260914-211444.md" in text
     assert "written inside the container" not in text
+
+
+class _LiveContainerOrchestrator:
+    """A container that exists and runs. Every command it is asked to run
+    fails, so `sag run` falls back to the docker label for the project name."""
+
+    def __init__(self, project_name=None):
+        self.project_name = project_name
+        self.container_name = f"sag-{project_name}" if project_name else "sag-x"
+
+    def container_exists(self):
+        return True
+
+    def is_container_running(self):
+        return True
+
+    def start_container(self):
+        return True
+
+    def execute_command(self, command, **kwargs):
+        return {"exit_code": 1, "success": False, "output": ""}
+
+
+def _invoke_run(monkeypatch, tmp_path, *, finished):
+    reset_config_state(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_module, "DockerOrchestrator", _LiveContainerOrchestrator)
+    monkeypatch.setattr(
+        "sag.agent.agent.SetupAgent.run_task",
+        lambda self, project_name, task_description: finished,
+    )
+    return CliRunner().invoke(main_module.cli, ["run", "sag-x", "--task", "do a thing"])
+
+
+def test_sag_run_exits_one_when_the_task_did_not_finish(monkeypatch, tmp_path):
+    result = _invoke_run(monkeypatch, tmp_path, finished=False)
+
+    assert result.exit_code == 1
+    assert "did not finish" in result.output
+
+
+def test_sag_run_exits_zero_when_the_task_finished(monkeypatch, tmp_path):
+    result = _invoke_run(monkeypatch, tmp_path, finished=True)
+
+    assert result.exit_code == 0
+    assert "did not finish" not in result.output
+
+
+def test_sag_run_still_greets_because_it_starts_agent_work(monkeypatch, tmp_path):
+    # The welcome panel now prints for `project` and `run` only. This is the
+    # fence that stops that narrowing from swallowing the two commands it is
+    # meant to keep.
+    result = _invoke_run(monkeypatch, tmp_path, finished=True)
+
+    assert "Automated project setup with AI" in result.output

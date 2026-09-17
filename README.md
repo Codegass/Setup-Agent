@@ -149,6 +149,7 @@ uv run sag inspect sag-commons-cli --phase build --iter 23
 
 # Read a recorded session after the container is gone
 uv run sag inspect sag-commons-cli --session logs/session_X --phase build
+uv run sag inspect sag-commons-cli --session logs/session_X --turn 12
 uv run sag trajectory logs/session_X
 uv run sag result logs/session_X
 

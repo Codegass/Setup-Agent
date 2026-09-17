@@ -1132,10 +1132,8 @@ class SetupAgent:
                 self.console.print("[bold yellow]Task cancelled.[/bold yellow]")
             elif success:
                 self.orchestrator.update_last_comment(f"Task completed: {task_description}")
-                self.console.print(f"[bold green]✅ Task completed successfully![/bold green]")
             else:
                 self.orchestrator.update_last_comment(f"Task in progress: {task_description}")
-                self.console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
 
             # Step 7: Provide execution summary
             self._provide_task_summary(success, task_description)
@@ -1683,91 +1681,47 @@ START by working toward the current phase objective shown in my context.
             Panel(summary_text, title="[bold]Setup Summary[/bold]", border_style=border_style)
         )
 
-        # Show TODO list status if in trunk context
-        if context_info.get("context_type") == "trunk":
-            # Load trunk context to show TODO list
-            try:
-                trunk_context = self.context_manager.load_trunk_context()
-                if trunk_context and trunk_context.todo_list:
-                    self.console.print("\n[bold]Final TODO List Status:[/bold]")
-
-                    for task in trunk_context.todo_list:
-                        status_icon = {
-                            "pending": "⏳",
-                            "in_progress": "🔄",
-                            "completed": "✅",
-                            "failed": "❌",
-                        }.get(str(task.status).split(".")[-1].lower(), "❓")
-
-                        self.console.print(f"  {status_icon} {task.description}")
-                        if task.notes:
-                            self.console.print(f"    [dim]Notes: {task.notes}[/dim]")
-            except Exception as e:
-                logger.warning(f"Failed to load trunk context for TODO display: {e}")
-                self.console.print(f"\n[dim]Could not load TODO list status[/dim]")
-
         # Log detailed summary
         logger.info(f"Setup summary: {exec_summary}")
 
-        # Provide next steps
+        # Provide next steps. The container name is the only handle `sag shell`
+        # and `sag run` accept, and it is what this agent is holding.
+        container = (
+            getattr(self.orchestrator, "container_name", None) if self.orchestrator else None
+        )
         if success and getattr(self, "final_verdict", "success") == "partial":
             reason = getattr(self, "final_verdict_reason", "") or "see report for details"
             self.console.print(
                 f"\n[bold yellow]⚠️ Project setup PARTIALLY completed: {reason}.[/bold yellow]"
             )
-            self.console.print(f"[dim]You can connect to the container using:[/dim]")
-            self.console.print(
-                f"  setup-agent connect {context_info.get('project_name', 'project')}"
-            )
         elif success:
             self.console.print(
                 f"\n[bold green]🎉 Project setup completed successfully![/bold green]"
             )
-            self.console.print(f"[dim]You can now connect to the container using:[/dim]")
-            self.console.print(
-                f"  setup-agent connect {context_info.get('project_name', 'project')}"
-            )
         else:
             self.console.print(f"\n[bold yellow]⚠️ Setup process incomplete.[/bold yellow]")
-            self.console.print(f"[dim]You can continue the setup using:[/dim]")
-            self.console.print(
-                f"  setup-agent continue {context_info.get('project_name', 'project')}"
-            )
+
+        if container:
+            self.console.print("[dim]Open a shell in the container with:[/dim]")
+            self.console.print(f"  sag shell {container}")
+            self.console.print("[dim]Continue the work with:[/dim]")
+            self.console.print(f'  sag run {container} --task "..."')
 
     def _provide_task_summary(self, success: bool, task_description: str):
-        """Provide a summary of task execution in the terminal final output, this will not shown in the log"""
+        """Print what the run cost. `sag run` states how it came out."""
 
-        # Get execution summary
         summary = self.react_engine.get_execution_summary()
 
-        if success:
-            self.console.print(
-                Panel.fit(
-                    f"[bold green]✅ Task Completed Successfully[/bold green]\n"
-                    f"[dim]Task: {task_description}[/dim]\n"
-                    f"[dim]Execution Summary:[/dim]\n"
-                    f"[dim]• Total steps: {summary['total_steps']}[/dim]\n"
-                    f"[dim]• Iterations: {summary['iterations']}[/dim]\n"
-                    f"[dim]• Thinking model calls: {summary.get('thinking_model_calls', 0)}[/dim]\n"
-                    f"[dim]• Action model calls: {summary.get('action_model_calls', 0)}[/dim]\n"
-                    f"[dim]• Successful actions: {summary['successful_actions']}/{summary['actions']}[/dim]",
-                    border_style="green",
-                )
+        self.console.print(
+            Panel.fit(
+                f"[dim]Task: {task_description}[/dim]\n"
+                f"[dim]Steps: {summary['total_steps']}[/dim]\n"
+                f"[dim]Iterations: {summary['iterations']}[/dim]\n"
+                f"[dim]Actions that succeeded: "
+                f"{summary['successful_actions']}/{summary['actions']}[/dim]",
+                border_style="green" if success else "yellow",
             )
-        else:
-            self.console.print(
-                Panel.fit(
-                    f"[bold yellow]⚠️ Task May Be Incomplete[/bold yellow]\n"
-                    f"[dim]Task: {task_description}[/dim]\n"
-                    f"[dim]Execution Summary:[/dim]\n"
-                    f"[dim]• Total steps: {summary['total_steps']}[/dim]\n"
-                    f"[dim]• Iterations: {summary['iterations']}[/dim]\n"
-                    f"[dim]• Thinking model calls: {summary.get('thinking_model_calls', 0)}[/dim]\n"
-                    f"[dim]• Action model calls: {summary.get('action_model_calls', 0)}[/dim]\n"
-                    f"[dim]• Successful actions: {summary['successful_actions']}/{summary['actions']}[/dim]",
-                    border_style="yellow",
-                )
-            )
+        )
 
         logger.info(
             f"Task execution completed for {self.orchestrator.project_name}: {task_description}"

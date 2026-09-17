@@ -41,7 +41,12 @@ from sag.docker_orch.orch import DockerOrchestrator
 from sag.result_card import build_result_card
 from sag.runtime.container_io import read_container_text
 from sag.tools.module_metrics import MODULE_METRICS_PATH
-from sag.trajectory.builder import build_trajectory, control_events_path, follow_trajectory
+from sag.trajectory.builder import (
+    build_trajectory,
+    control_events_path,
+    follow_trajectory,
+    read_call_envelope,
+)
 from sag.trajectory.schema import DETAIL_TIERS
 from sag.utils.git_utils import extract_project_name_from_url
 from sag.web.server import run_web_server
@@ -605,10 +610,11 @@ def cli(ctx, log_level, log_file, verbose):
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
 
-    # Display welcome message for main commands.
-    # `trajectory` and `result` are excluded because their stdout is something
-    # somebody parses — `sag result X --json | jq` is dead with a panel above it.
-    if ctx.invoked_subcommand not in ["list", "trajectory", "result"] and not config.verbose:
+    # The panel greets the two commands that start agent work. Every other
+    # command's stdout is something somebody reads or pipes — `sag result X
+    # --json | jq` is dead with a panel above it, and so is a turn view a
+    # reader is scrolling. `--verbose` still suppresses it, as it always has.
+    if ctx.invoked_subcommand in {"project", "run"} and not config.verbose:
         console.print(
             Panel.fit(
                 "[bold blue]SAG[/bold blue] - [dim]Setup Agent[/dim]\n"
@@ -620,55 +626,68 @@ def cli(ctx, log_level, log_file, verbose):
 
 @cli.command()
 def list():
-    """List all SAG-managed Docker containers with their status and last comment."""
+    """List SAG workspaces and what each run produced."""
 
-    try:
-        orchestrator = DockerOrchestrator()
-        projects = orchestrator.list_sag_projects()
+    # The same read model the Workbench dashboard renders, so the terminal and
+    # the web page cannot disagree about a workspace.
+    from sag.web.read_model import ReadModelBuilder
 
-        if not projects:
-            console.print("[yellow]No SAG projects found.[/yellow]")
-            console.print("[dim]Use 'sag project <repo_url>' to create a new project.[/dim]")
-            return
+    dashboard = ReadModelBuilder().dashboard()
 
-        # Create table
-        table = Table(title="SAG Projects", show_header=True, header_style="bold magenta")
-        table.add_column("Project Name", style="cyan", no_wrap=True)
-        table.add_column("Docker Name", style="blue", no_wrap=True)
-        table.add_column("Status", style="green")
-        table.add_column("Last Comment", style="white", max_width=50)
-        table.add_column("Created", style="dim")
-
-        for project in projects:
-            # Get status with color
-            status = project["status"]
-            if status == "running":
-                status_text = Text("🟢 running", style="green")
-            elif status == "exited":
-                status_text = Text("🔴 stopped", style="red")
-            else:
-                status_text = Text(f"🟡 {status}", style="yellow")
-
-            # Get last comment from agent
-            last_comment = project.get("last_comment", "No comment available")
-            # Show full comment without truncation
-
-            table.add_row(
-                project["project_name"],
-                project["docker_name"],
-                status_text,
-                last_comment,
-                project["created"],
-            )
-
-        console.print(table)
+    # A read that failed is not an empty dashboard, and saying so would invent
+    # a fact about the machine.
+    if dashboard.read_status != "available":
         console.print(
-            f"\n[dim]Use 'sag run <docker_name> --task \"description\"' to continue working on a project.[/dim]"
+            f"[bold red]❌ {dashboard.read_error or 'Workspace data could not be read.'}[/bold red]"
+        )
+        return
+
+    if not dashboard.workspaces:
+        console.print("[yellow]No SAG workspaces found.[/yellow]")
+        console.print("[dim]Use 'sag project <repo_url>' to create one.[/dim]")
+        return
+
+    table = Table(title="SAG Workspaces", show_header=True, header_style="bold magenta")
+    table.add_column("Project", style="cyan", no_wrap=True)
+    table.add_column("Container", style="blue", no_wrap=True)
+    table.add_column("State")
+    table.add_column("Setup")
+    table.add_column("Required task")
+    table.add_column("Tests")
+    table.add_column("Updated", style="dim")
+
+    for workspace in dashboard.workspaces:
+        # `result` is the recorded outcome of the workspace's last run. Until
+        # the read model carries it, every result column says "—" rather than
+        # borrowing a number from somewhere that did not measure it.
+        outcome = getattr(workspace, "result", None)
+        task = getattr(outcome, "task", None) if outcome else None
+        tests = getattr(outcome, "tests", None) if outcome else None
+
+        task_text = f"{task.completed}/{task.required}" if task else "—"
+        if tests and tests.executed:
+            failed = (tests.failed or 0) + (tests.errors or 0)
+            tests_text = f"{tests.passed:,}/{tests.executed:,} passed"
+            if failed:
+                tests_text = f"{tests_text}, {failed:,} failed"
+        else:
+            tests_text = "—"
+
+        status = workspace.docker.status or "—"
+        table.add_row(
+            workspace.project or "—",
+            workspace.container or workspace.id,
+            Text(status, style="green" if status == "running" else "yellow"),
+            (getattr(outcome, "verdict", None) or "—") if outcome else "—",
+            task_text,
+            tests_text,
+            workspace.updated or "—",
         )
 
-    except Exception as e:
-        logger.error(f"List projects failed: {e}")
-        console.print(f"[bold red]❌ Failed to list projects: {e}[/bold red]")
+    console.print(table)
+    console.print(
+        "\n[dim]Use 'sag run <container> --task \"description\"' to continue a workspace.[/dim]"
+    )
 
 
 @cli.command()
@@ -950,11 +969,13 @@ def run(ctx, docker_name, task, max_iterations, record, coverage):
         if coverage:
             _run_coverage_pass(orchestrator, actual_project_name)
 
+        # The command's exit code is the run's answer: a task that did not
+        # finish must not read as a success to a script.
         if success:
-            console.print(f"[bold green]✅ Task completed successfully![/bold green]")
+            console.print("[green]Task completed.[/green]")
         else:
-            console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
-            console.print(f"[dim]Check logs for details or run another task to continue.[/dim]")
+            console.print("[yellow]Task did not finish. Run another task to continue.[/yellow]")
+            sys.exit(1)
 
     except Exception as e:
         logger.error(f"Task execution failed: {e}")
@@ -1547,6 +1568,83 @@ def _inspect_render_phase_list(source) -> str:
     return "\n".join(lines)
 
 
+def _inspect_render_turn(session_dir: Path, turn_id: int) -> str:
+    """One turn: what was asked, what came back, and what the gate decided.
+
+    This reads the control ledger through `build_trajectory`, so it answers for
+    any recorded session that has one — including a session with no recorded
+    context tree, which the phase and iteration views cannot read.
+    """
+
+    document = build_trajectory(session_dir, detail="full")
+    turn = next((item for item in document.turns if item.turn_id == turn_id), None)
+    if turn is None:
+        ids = [item.turn_id for item in document.turns]
+        span = f"{min(ids)}..{max(ids)}" if ids else "none"
+        raise _InspectError(f"No turn {turn_id} (recorded turns: {span})")
+
+    lines = [f"=== Turn {turn.turn_id} ({turn.phase}, {turn.actor}) ==="]
+    if turn.iteration is not None:
+        lines.append(f"Iteration: {turn.iteration}")
+    if turn.control_seq:
+        lines.append("Control events: " + ", ".join(str(seq) for seq in turn.control_seq))
+    else:
+        lines.append("Control events: this turn names none")
+    lines.append("")
+
+    lines.append("Call:")
+    if turn.call is None:
+        lines.append("  this turn called no tool")
+    else:
+        lines.append(f"  tool: {turn.call.tool}")
+        if turn.call.summary:
+            lines.append(f"  summary: {turn.call.summary}")
+        if turn.call.params_ref:
+            envelope = read_call_envelope(session_dir, turn.call.params_ref)
+            if envelope is None:
+                lines.append(f"  the ledger has no call parameters for {turn.call.params_ref}")
+            else:
+                params = json.dumps(envelope.get("exact_params"), indent=2, sort_keys=True)
+                lines.append(textwrap.indent(params, "  "))
+    lines.append("")
+
+    lines.append("Result:")
+    observation = turn.observation
+    if observation is None:
+        lines.append("  no result is recorded for this turn")
+    else:
+        if observation.outcome:
+            lines.append(f"  outcome: {observation.outcome}")
+        if observation.summary:
+            lines.append(f"  summary: {observation.summary}")
+        if observation.error_code:
+            lines.append(f"  error code: {observation.error_code}")
+        for label, ref in (
+            ("model-visible", observation.ref),
+            ("evidence", observation.evidence_ref),
+        ):
+            if not ref:
+                continue
+            # Bytes that resolved to nothing and bytes this session never kept
+            # are different facts, and a quiet successful command is the first
+            # of them.
+            body = (document.outputs or {}).get(ref)
+            lines.append(f"  {label} ref {ref}:")
+            if body is None:
+                lines.append("    this session's store has no bytes for this ref")
+            elif body == "":
+                lines.append("    the store holds this ref, and it is empty")
+            else:
+                lines.append(textwrap.indent(body, "    "))
+
+    if turn.gate is not None:
+        gate_line = f"Gate: {turn.gate.word}"
+        if turn.gate.decision_id:
+            gate_line += f" (decision {turn.gate.decision_id})"
+        lines.extend(["", gate_line])
+    return "\n".join(lines)
+
+
 @cli.command()
 @click.argument("docker_name")
 @click.option("--phase", default=None, help=f"Phase to inspect ({'/'.join(PHASE_NAMES)})")
@@ -1563,9 +1661,31 @@ def _inspect_render_phase_list(source) -> str:
     default=None,
     help="Read from a local --record artifact dir (e.g. logs/session_X) instead of the container",
 )
-def inspect(docker_name, phase, iteration, session_dir):
-    """Inspect recorded context windows: phase timelines and per-iteration views."""
+@click.option(
+    "--turn",
+    "turn_id",
+    default=None,
+    type=int,
+    help="Show one turn end to end: its call, its result and how the gate graded it",
+)
+def inspect(docker_name, phase, iteration, session_dir, turn_id):
+    """Inspect a recorded run: phase timelines, per-iteration views, one turn."""
     try:
+        # The turn view derives from the control ledger, which a recorded
+        # session carries whether or not it also has a context tree. It is
+        # answered before any context source is opened, because opening one
+        # would fail on exactly the sessions this view exists to read.
+        if turn_id is not None:
+            if not session_dir:
+                raise _InspectError(
+                    "--turn reads a recorded session; name one with --session <dir>"
+                )
+            directory = Path(session_dir)
+            if not directory.is_dir():
+                raise _InspectError(f"No session directory at '{directory}'")
+            click.echo(_inspect_render_turn(directory, turn_id))
+            return
+
         if session_dir:
             source = _SessionInspectSource(session_dir)
         else:
