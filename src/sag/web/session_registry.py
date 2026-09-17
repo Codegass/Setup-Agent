@@ -1001,8 +1001,8 @@ def _snapshot_build_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
         }
     return {
         "state": build.outcome.value,
-        "tool": "sealed snapshot",
-        "note": "Canonical build evidence from verdict.json",
+        "tool": "not recorded",
+        "note": "Build result read back from the run's verdict.json",
         "class_count": build.compiled_classes,
         "evidence_refs": list(build.refs),
     }
@@ -2209,16 +2209,16 @@ def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
         source="Build evidence",
         title="Build evidence reference",
         status_value=build.get("state"),
-        detail=_text(build.get("note"), default="Evidence used for the sealed build result."),
+        detail=_text(build.get("note"), default="Evidence behind the recorded build result."),
         refs_value=build.get("evidence_refs"),
     )
 
     test = item.get("test") if isinstance(item.get("test"), dict) else {}
     add_refs(
-        source="Sealed run inputs",
+        source="Run evidence",
         title="Run evidence reference",
         status_value=test.get("state"),
-        detail="Evidence inputs used to produce the sealed run summary.",
+        detail="Evidence behind the recorded test results.",
         refs_value=test.get("evidence_refs"),
     )
 
@@ -2230,7 +2230,7 @@ def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
                 status="info",
                 counts="1 artifact",
                 time=time,
-                summary="Generated narrative report; the sealed summary remains authoritative.",
+                summary="A narrative report written during the run. The recorded result is what the run is judged on.",
                 records=[
                     EvidenceRecord(
                         time=time,

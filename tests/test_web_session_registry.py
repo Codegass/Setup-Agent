@@ -35,7 +35,7 @@ def test_evidence_groups_use_actual_refs_and_do_not_fabricate_a_session_record()
             "finish": "2026-08-16T03:51:00",
             "build": {
                 "state": "partial",
-                "note": "Canonical build evidence",
+                "note": "Build evidence from the run",
                 "evidence_refs": ["output_build"],
             },
             "test": {
@@ -49,7 +49,7 @@ def test_evidence_groups_use_actual_refs_and_do_not_fabricate_a_session_record()
 
     assert [group.source for group in groups] == [
         "Build evidence",
-        "Sealed run inputs",
+        "Run evidence",
         "Generated report",
     ]
     assert groups[0].records[0].ref == "output_build"

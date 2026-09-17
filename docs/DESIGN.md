@@ -139,8 +139,8 @@ observant, precise, and unhurried, an operations room, not a marketing page.
 - Monospace is a first-class voice for machine identifiers, not an accent.
 - Flat by default; depth appears only on overlays and on hover.
 - Dense but legible: many rows are welcome, hierarchy keeps them scannable.
-- Light is the shipping theme; a full dark "night console" palette is wired in
-  tokens and supported, awaiting a theme switch.
+- Light is the default theme; a full dark "night console" palette is wired in
+  tokens and ships behind the toggle in the nav bar.
 
 ## 2. Colors
 
@@ -176,12 +176,12 @@ status vocabulary that is the only place saturation is allowed to live.
 - **Idle Slate** (`oklch(0.446 0.043 257)`, `slate-600` on `slate-100`): Queued,
   pending, created, none; states that are waiting, not working.
 
-### Dark theme (supported, dormant)
+### Dark theme (shipping)
 A complete night-console palette is defined under `.dark` and tracked as
 first-class (`dark-background oklch(0.18 0.032 265)`, `dark-card
 oklch(0.22 0.036 265)`, `dark-primary oklch(0.72 0.16 252)`, borders as low-alpha
-white). It is not yet wired to a toggle; treat it as a supported second theme to
-keep on-brand, not a separate identity.
+white). The nav bar toggle switches to it and the choice is remembered; treat it
+as a supported second theme to keep on-brand, not a separate identity.
 
 ### Named Rules
 **The Signal Rule.** Saturated color belongs to state and to the single primary
