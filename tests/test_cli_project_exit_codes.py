@@ -428,9 +428,9 @@ def _session_with_ledger(tmp_path):
 def test_run_counts_are_folded_from_the_session_ledger(tmp_path):
     """The Setup row's turns and tool calls come from the run's own ledger."""
 
-    from sag.main import _read_run_counts_for_cli
+    from sag.result_card.run_evidence import read_run_counts
 
-    counts = _read_run_counts_for_cli(str(_session_with_ledger(tmp_path)))
+    counts = read_run_counts(str(_session_with_ledger(tmp_path)))
 
     assert counts["turn_count"] == 24
     assert counts["tool_calls"] == 24
@@ -441,7 +441,7 @@ def test_run_counts_are_folded_from_the_session_ledger(tmp_path):
 def test_run_counts_state_absence_rather_than_zero_or_raising(tmp_path):
     """A missing ledger, directory or argument leaves every count absent."""
 
-    from sag.main import _read_run_counts_for_cli
+    from sag.result_card.run_evidence import read_run_counts
 
     absent = {
         "trajectory_session": None,
@@ -450,23 +450,25 @@ def test_run_counts_state_absence_rather_than_zero_or_raising(tmp_path):
         "tool_failures": None,
         "token_usage": None,
     }
-    assert _read_run_counts_for_cli(None) == absent
-    assert _read_run_counts_for_cli(str(tmp_path / "never-written")) == absent
+    assert read_run_counts(None) == absent
+    assert read_run_counts(str(tmp_path / "never-written")) == absent
     # A directory with no ledger still names the session; it counts no turns,
     # rather than counting zero of them.
-    no_ledger = _read_run_counts_for_cli(str(tmp_path))
+    no_ledger = read_run_counts(str(tmp_path))
     assert no_ledger["turn_count"] is None
     assert no_ledger["tool_calls"] is None
     assert no_ledger["tool_failures"] is None
 
 
 def test_run_counts_survive_this_module_shadowing_the_list_builtin(tmp_path):
-    """`sag list` binds the name `list` in `sag.main`; the reader must not use it."""
+    """`sag list` binds the name `list` in `sag.main`; nothing there may use it."""
+
+    from sag.result_card.run_evidence import read_run_counts
 
     assert isinstance(main_module.list, click.Command)
     # A ledger with turns in it is what turns the shadowing into a crash, so
     # the guard is a real read rather than an inspection of the source.
-    assert main_module._read_run_counts_for_cli(str(_session_with_ledger(tmp_path)))["turn_count"]
+    assert read_run_counts(str(_session_with_ledger(tmp_path)))["turn_count"]
 
 
 def test_the_run_pin_is_read_from_the_host_and_degrades_to_absent(tmp_path):
@@ -559,10 +561,12 @@ def test_the_block_states_the_run_counts_and_names_the_report_it_was_given():
         snapshot,
         termination,
         "commons-cli",
-        trajectory_session={"wall_clock_seconds": 390.2},
-        turn_count=12,
-        tool_calls=20,
-        tool_failures=3,
+        run_counts={
+            "trajectory_session": {"wall_clock_seconds": 390.2},
+            "turn_count": 12,
+            "tool_calls": 20,
+            "tool_failures": 3,
+        },
         run_pin={"action_model": "gpt-5.4-mini"},
         container="sag-commons-cli",
         session_dir="logs/session_20260914_210609",

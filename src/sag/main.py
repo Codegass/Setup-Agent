@@ -2,6 +2,7 @@
 
 import builtins
 import json
+import os
 import re
 import subprocess
 import sys
@@ -39,6 +40,11 @@ from sag.console.turn_stream import TurnStreamRenderer
 from sag.coverage.runner import apply_coverage
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.result_card import build_result_card
+from sag.result_card.run_evidence import (
+    find_recorded_session,
+    read_run_counts,
+    recorded_report,
+)
 from sag.runtime.container_io import read_container_text
 from sag.tools.module_metrics import MODULE_METRICS_PATH
 from sag.trajectory.builder import (
@@ -46,12 +52,20 @@ from sag.trajectory.builder import (
     control_events_path,
     follow_trajectory,
     read_call_envelope,
+    read_output_bytes,
+    resolve_session_dir,
 )
-from sag.trajectory.schema import DETAIL_TIERS
+from sag.trajectory.schema import DETAIL_TIERS, TrajectoryDelta
 from sag.utils.git_utils import extract_project_name_from_url
 from sag.web.server import run_web_server
 
 console = Console()
+
+#: What a column says when the read model does not carry the answer yet.
+_NOT_YET_READ = "—"
+
+#: What tells a path from a container name. A container name never holds one.
+_SEPARATORS = frozenset({"/", os.sep})
 
 # Note: You may see "Exception ignored while finalizing... ValueError: I/O operation on closed file"
 # at the end of execution. This is a harmless cleanup issue from urllib3/docker-py during
@@ -66,27 +80,25 @@ def _render_setup_cli_result(
     module_metrics: Mapping[str, Any] | None = None,
     report_metrics: Mapping[str, Any] | None = None,
     run_pin: Mapping[str, Any] | None = None,
-    token_usage: Any = None,
-    trajectory_session: Mapping[str, Any] | None = None,
-    turn_count: int | None = None,
-    tool_calls: int | None = None,
-    tool_failures: int | None = None,
+    run_counts: Mapping[str, Any] | None = None,
     container: str | None = None,
     session_dir: str | None = None,
     report_path: str | None = None,
 ) -> tuple[str, int]:
-    """Render the run's result block and translate only its verdict to an exit code."""
+    """Render the run's result block and translate only its verdict to an exit code.
+
+    `run_counts` arrives whole from `read_run_counts` and is splatted whole. No
+    surface names the counts one at a time, so none can fill four of the five
+    and drop the fifth — which is how the terminal came to bill tokens the web
+    API said nothing about for the same run.
+    """
 
     card = build_result_card(
         snapshot,
         module_metrics=module_metrics,
         report_metrics=report_metrics,
         run_pin=run_pin,
-        token_usage=token_usage,
-        trajectory_session=trajectory_session,
-        turn_count=turn_count,
-        tool_calls=tool_calls,
-        tool_failures=tool_failures,
+        **(read_run_counts(None) | dict(run_counts or {})),
         termination=termination,
         project=project_name,
         container=container,
@@ -140,54 +152,6 @@ def _read_run_pin_for_cli(session_logger: Any) -> Mapping[str, Any] | None:
     except Exception:
         return None
     return parsed if isinstance(parsed, dict) else None
-
-
-def _read_run_counts_for_cli(session_dir: str | None) -> dict[str, Any]:
-    """Fold the session's own ledger into the counts the result block states.
-
-    Every count is absent unless the ledger supplied it: a run whose turns were
-    never recorded reports no turns, not zero turns, and a session directory
-    that cannot be read leaves the whole group absent rather than raising.
-    """
-
-    counts: dict[str, Any] = {
-        "trajectory_session": None,
-        "turn_count": None,
-        "tool_calls": None,
-        "tool_failures": None,
-        "token_usage": None,
-    }
-    if not session_dir:
-        return counts
-    try:
-        document = build_trajectory(session_dir)
-    except Exception as exc:
-        logger.debug(f"run counts for the result block are unavailable: {exc}")
-        return counts
-
-    counts["trajectory_session"] = document.session.model_dump(mode="json")
-    # `list` is this module's `sag list` command, not the builtin.
-    turns = tuple(document.turns)
-    if not turns:
-        return counts
-    counts["turn_count"] = len(turns)
-    counts["tool_calls"] = sum(1 for turn in turns if turn.call is not None)
-    counts["tool_failures"] = sum(
-        1
-        for turn in turns
-        if turn.observation is not None
-        and (turn.observation.error_code or turn.observation.failure_signature)
-    )
-    # The bill each turn carries, not the token file's raw rows: the derivation
-    # has already decided which row pays for which turn, and a second reader
-    # adding the rows up itself would double-count the duplicates it dropped.
-    billed = tuple(
-        {"prompt_tokens": turn.tokens.input, "output_tokens": turn.tokens.output}
-        for turn in turns
-        if turn.tokens is not None
-    )
-    counts["token_usage"] = billed or None
-    return counts
 
 
 def _read_metrics_v2_for_cli(orchestrator: DockerOrchestrator) -> Mapping[str, Any] | None:
@@ -635,12 +599,14 @@ def list():
     dashboard = ReadModelBuilder().dashboard()
 
     # A read that failed is not an empty dashboard, and saying so would invent
-    # a fact about the machine.
+    # a fact about the machine. It exits 1, the way `sag result` does: one
+    # branch cannot report "I could not look" as success while its neighbour
+    # reports the same thing as failure.
     if dashboard.read_status != "available":
         console.print(
             f"[bold red]❌ {dashboard.read_error or 'Workspace data could not be read.'}[/bold red]"
         )
-        return
+        sys.exit(1)
 
     if not dashboard.workspaces:
         console.print("[yellow]No SAG workspaces found.[/yellow]")
@@ -657,30 +623,20 @@ def list():
     table.add_column("Updated", style="dim")
 
     for workspace in dashboard.workspaces:
-        # `result` is the recorded outcome of the workspace's last run. Until
-        # the read model carries it, every result column says "—" rather than
-        # borrowing a number from somewhere that did not measure it.
-        outcome = getattr(workspace, "result", None)
-        task = getattr(outcome, "task", None) if outcome else None
-        tests = getattr(outcome, "tests", None) if outcome else None
-
-        task_text = f"{task.completed}/{task.required}" if task else "—"
-        if tests and tests.executed:
-            failed = (tests.failed or 0) + (tests.errors or 0)
-            tests_text = f"{tests.passed:,}/{tests.executed:,} passed"
-            if failed:
-                tests_text = f"{tests_text}, {failed:,} failed"
-        else:
-            tests_text = "—"
-
         status = workspace.docker.status or "—"
         table.add_row(
             workspace.project or "—",
             workspace.container or workspace.id,
             Text(status, style="green" if status == "running" else "yellow"),
-            (getattr(outcome, "verdict", None) or "—") if outcome else "—",
-            task_text,
-            tests_text,
+            # The Setup, Required task and Tests columns wait on the result card
+            # that phase 3 adds to `WorkspaceSummary` (`src/sag/web/models.py`).
+            # `WorkspaceSummary` carries no such field today and `WebModel`
+            # ignores extras, so code that reached for one would be unreachable
+            # for every input while reading as though it were live. A dash is
+            # what this surface can honestly say until the field arrives.
+            _NOT_YET_READ,
+            _NOT_YET_READ,
+            _NOT_YET_READ,
             workspace.updated or "—",
         )
 
@@ -855,7 +811,7 @@ def project(
         # happened before the block is built.
         report_path = _save_setup_artifacts(orchestrator, project_name) if record else None
 
-        run_counts = _read_run_counts_for_cli(session_dir)
+        run_counts = read_run_counts(session_dir)
         cli_result, exit_code = _render_setup_cli_result(
             snapshot,
             termination,
@@ -863,11 +819,7 @@ def project(
             module_metrics=_read_module_metrics_for_cli(orchestrator),
             report_metrics=_read_metrics_v2_for_cli(orchestrator),
             run_pin=_read_run_pin_for_cli(session_logger),
-            trajectory_session=run_counts["trajectory_session"],
-            turn_count=run_counts["turn_count"],
-            tool_calls=run_counts["tool_calls"],
-            tool_failures=run_counts["tool_failures"],
-            token_usage=run_counts["token_usage"],
+            run_counts=run_counts,
             container=docker_name,
             session_dir=session_dir,
             report_path=_report_name_for_block(report_path, session_dir),
@@ -1576,7 +1528,7 @@ def _inspect_render_turn(session_dir: Path, turn_id: int) -> str:
     context tree, which the phase and iteration views cannot read.
     """
 
-    document = build_trajectory(session_dir, detail="full")
+    document = build_trajectory(session_dir)
     turn = next((item for item in document.turns if item.turn_id == turn_id), None)
     if turn is None:
         ids = [item.turn_id for item in document.turns]
@@ -1619,6 +1571,11 @@ def _inspect_render_turn(session_dir: Path, turn_id: int) -> str:
             lines.append(f"  summary: {observation.summary}")
         if observation.error_code:
             lines.append(f"  error code: {observation.error_code}")
+        # Only this turn's refs are resolved. The full tier resolves every ref
+        # the whole session holds, which on a real run is a hundred lookups and
+        # a store warning for each one that misses — 56 lines on stderr to
+        # print two.
+        resolved = read_output_bytes(session_dir, (observation.ref, observation.evidence_ref))
         for label, ref in (
             ("model-visible", observation.ref),
             ("evidence", observation.evidence_ref),
@@ -1628,7 +1585,7 @@ def _inspect_render_turn(session_dir: Path, turn_id: int) -> str:
             # Bytes that resolved to nothing and bytes this session never kept
             # are different facts, and a quiet successful command is the first
             # of them.
-            body = (document.outputs or {}).get(ref)
+            body = resolved.get(ref)
             lines.append(f"  {label} ref {ref}:")
             if body is None:
                 lines.append("    this session's store has no bytes for this ref")
@@ -1755,21 +1712,28 @@ def _trajectory_table(session_dir: Path, *, follow: bool) -> None:
     """Replay or tail the session as the turn stream a live run prints.
 
     One renderer, closed once. A replay feeds the ledger's own lines through
-    it; a follow leaves the lines to `follow_trajectory` and renders the deltas
-    it yields, including the one that only stopping can produce. The two are
-    alternatives, not stages: feeding the whole ledger and then following would
-    show every turn twice, the second time after the stream had already said
-    what the run finished with.
+    it; a follow leaves the lines to `follow_trajectory` and is handed each one
+    as it lands, because a phase closing lives in the raw event and no delta
+    carries it — a follow driven by deltas alone showed five fewer lines than a
+    replay of the same bytes. The two are alternatives, not stages: feeding the
+    whole ledger and then following would show every turn twice, the second
+    time after the stream had already said what the run finished with.
+
+    The document is built first, and not only for the header: the joins it
+    makes state holes the renderer's own fold cannot see — a ledger that was
+    never written, one that could not be read — and those go through the same
+    renderer rather than being left as silence.
     """
 
-    document = build_trajectory(session_dir)
+    directory = resolve_session_dir(session_dir)
+    document = build_trajectory(directory)
     header = _trajectory_header(document)
     if header:
         console.print(header, markup=False, highlight=False)
     stream = TurnStreamRenderer(_turn_stream_sink(), width=console.width, tty=console.is_terminal)
     try:
         if follow:
-            tail = follow_trajectory(session_dir)
+            tail = follow_trajectory(directory, on_line=stream.note_event)
             try:
                 for delta in tail:
                     stream.render_delta(delta)
@@ -1781,20 +1745,29 @@ def _trajectory_table(session_dir: Path, *, follow: bool) -> None:
                 if final is not None:
                     stream.render_delta(final)
             return
-        ledger = control_events_path(session_dir)
+        ledger = control_events_path(directory)
         if ledger is not None:
             with ledger.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     stream.feed(line)
+        # What the replay could not say for itself. A statement already made
+        # from the lines is the same statement by value and is shown once.
+        stream.render_delta(TrajectoryDelta(warnings=document.warnings))
     finally:
         stream.close()
 
 
 def _trajectory_json(session_dir: Path, *, follow: bool, detail: str) -> None:
-    """Print the document, or one delta per line while the run is still going."""
+    """Print the document, or one delta per line while the run is still going.
 
+    The directory is resolved the same way the table resolves it. Two formats
+    of one command answering for two different runs would be worse than either
+    of them being wrong on its own.
+    """
+
+    directory = resolve_session_dir(session_dir)
     if follow:
-        stream = follow_trajectory(session_dir, detail=detail)
+        stream = follow_trajectory(directory, detail=detail)
         try:
             for delta in stream:
                 click.echo(delta.model_dump_json())
@@ -1806,7 +1779,7 @@ def _trajectory_json(session_dir: Path, *, follow: bool, detail: str) -> None:
             if final is not None:
                 click.echo(final.model_dump_json())
         return
-    click.echo(build_trajectory(session_dir, detail=detail).model_dump_json())
+    click.echo(build_trajectory(directory, detail=detail).model_dump_json())
 
 
 @cli.command()
@@ -1877,12 +1850,6 @@ _REPORT_METRICS_NAME = "report_metrics.json"
 #: a card and the turns beside it are never read from different copies.
 _RUN_ARTIFACT_ROOTS = (".", ".setup_agent")
 
-#: The subdirectory a campaign archive keeps the container's copy in. The
-#: archiver names it after the container directory, and `container-evidence` is
-#: what it has been called for every archive on disk; the glob beside it covers
-#: the rest rather than guessing.
-_ARCHIVED_EVIDENCE_DIR = "container-evidence"
-
 
 def _read_run_document(base: Path, name: str) -> Dict[str, Any] | None:
     """Read one of a run's JSON artifacts, or nothing when it is not readable."""
@@ -1900,41 +1867,52 @@ def _read_run_document(base: Path, name: str) -> Dict[str, Any] | None:
     return None
 
 
-def _evidence_bases(directory: Path) -> Tuple[Path, ...]:
-    """Where one run's evidence may sit, relative to the directory named.
-
-    A session directory holds it at its own root — that covers both a
-    `--record` artifact dir and a `.setup_agent` directory pointed at
-    directly. A campaign archive keeps the container's copy one level down,
-    beside the rest of the run.
-    """
-
-    bases = [directory, directory / _ARCHIVED_EVIDENCE_DIR]
-    bases.extend(
-        sorted(path.parent.parent for path in directory.glob(f"*/.setup_agent/{_VERDICT_NAME}"))
-    )
-    ordered: Dict[Path, None] = {}
-    for base in bases:
-        ordered.setdefault(base, None)
-    return tuple(ordered)
-
-
 def _recorded_run(directory: Path) -> Tuple[Path, Dict[str, Any]] | None:
     """A recorded run's verdict, and the directory the rest of the run sits in.
 
     The directory comes back with the verdict because everything else the card
-    reads — the ledger, the run pin, the metrics — has to come from the same
-    copy. Reading the verdict from an archive and the counts from the session
-    that no longer holds any would describe two runs as one.
+    reads — the ledger, the run pin, the metrics, the report — has to come from
+    the same copy. Reading the verdict from an archive and the counts from the
+    session that no longer holds any would describe two runs as one.
+
+    Where to look is `resolve_session_dir`'s answer, which is also the one
+    `sag trajectory` uses: the `Next` line this command prints names that
+    command, and the two must agree about where a run lives.
     """
 
-    for base in _evidence_bases(directory):
-        if not base.is_dir():
-            continue
-        payload = _read_run_document(base, _VERDICT_NAME)
-        if payload is not None:
-            return base, payload
-    return None
+    if not directory.is_dir():
+        return None
+    base = resolve_session_dir(directory)
+    payload = _read_run_document(base, _VERDICT_NAME)
+    return (base, payload) if payload is not None else None
+
+
+def _live_run(target: str) -> Tuple[Any, Any] | None:
+    """The container's own verdict and the orchestrator that read it.
+
+    The two failures are told apart because they mean different things to
+    whoever is standing at the terminal: a container this host cannot be asked
+    about at all is a Docker problem, and a container with nothing to read is a
+    run that has not reached a verdict.
+    """
+
+    try:
+        # By keyword, and without the prefix: the constructor takes its base
+        # image first, so a container name handed over positionally opens
+        # `sag-default` instead of the container the user asked for.
+        orchestrator = DockerOrchestrator(project_name=target.removeprefix("sag-"))
+    except Exception as exc:  # a reader ends with a sentence, not a traceback
+        logger.debug(f"sag result could not reach Docker for {target}: {exc}")
+        console.print(f"[bold red]❌ Docker could not be asked about {target}: {exc}[/bold red]")
+        return None
+    try:
+        snapshot = read_live_verdict_snapshot(orchestrator)
+    except Exception as exc:
+        logger.debug(f"sag result could not read a verdict from {target}: {exc}")
+        return None
+    if snapshot is None or snapshot.verdict == "unknown":
+        return None
+    return orchestrator, snapshot
 
 
 @cli.command()
@@ -1954,11 +1932,11 @@ def result(target, as_json):
     """
 
     directory = Path(target)
-    found = _recorded_run(directory) if directory.is_dir() else None
+    found = _recorded_run(directory)
     payload: Dict[str, Any] | None = None
-    run_pin = module_metrics = report_metrics = None
-    project = goal = container = session_dir = None
-    counts = _read_run_counts_for_cli(None)
+    run_pin = module_metrics = report_metrics = termination = None
+    project = goal = container = session_dir = report_path = None
+    counts = read_run_counts(None)
 
     if found is not None:
         evidence_dir, payload = found
@@ -1969,24 +1947,31 @@ def result(target, as_json):
         meta = _read_run_document(evidence_dir, _PROJECT_META_NAME) or {}
         project = meta.get("project_name") or None
         goal = meta.get("goal") or None
-        counts = _read_run_counts_for_cli(str(evidence_dir))
-    elif not directory.is_dir():
-        orchestrator = None
-        snapshot = None
-        try:
-            # By keyword, and without the prefix: the constructor takes its base
-            # image first, so a container name handed over positionally opens
-            # `sag-default` instead of the container the user asked for.
-            orchestrator = DockerOrchestrator(project_name=target.removeprefix("sag-"))
-            snapshot = read_live_verdict_snapshot(orchestrator)
-        except Exception as exc:  # a reader ends with a sentence, not a traceback
-            logger.debug(f"sag result could not open {target}: {exc}")
-        if snapshot is not None and snapshot.verdict != "unknown":
+        counts = read_run_counts(evidence_dir)
+        termination, found_report = recorded_report(directory, evidence_dir)
+        report_path = _report_name_for_block(found_report, session_dir)
+    elif _SEPARATORS.isdisjoint(target):
+        # A name with no path separator in it is a container name, whether or
+        # not the current directory happens to hold something called that.
+        live = _live_run(target)
+        if live is not None:
+            orchestrator, snapshot = live
             payload = snapshot.model_dump(mode="json")
             container = orchestrator.container_name
             project = orchestrator.project_name
             module_metrics = _read_module_metrics_for_cli(orchestrator)
             report_metrics = _read_metrics_v2_for_cli(orchestrator)
+            # The container holds the run; the host holds the record of it. The
+            # counts, the model pin and the report are all in the session
+            # directory this run wrote, and reading them is what keeps the two
+            # halves of this one command from printing two different cards.
+            recorded = find_recorded_session(snapshot.run_id)
+            if recorded is not None:
+                session_dir = str(recorded)
+                counts = read_run_counts(recorded)
+                run_pin = _read_run_document(recorded, _RUN_PIN_NAME)
+                termination, found_report = recorded_report(recorded)
+                report_path = _report_name_for_block(found_report, session_dir)
 
     if payload is None:
         console.print(f"[bold red]❌ no result could be read from {target}[/bold red]")
@@ -1997,15 +1982,13 @@ def result(target, as_json):
         module_metrics=module_metrics,
         report_metrics=report_metrics,
         run_pin=run_pin,
-        token_usage=counts["token_usage"],
-        trajectory_session=counts["trajectory_session"],
-        turn_count=counts["turn_count"],
-        tool_calls=counts["tool_calls"],
-        tool_failures=counts["tool_failures"],
+        **counts,
+        termination=termination,
         project=project,
         goal=goal,
         container=container,
         session_dir=session_dir,
+        report_path=report_path,
     )
     if as_json:
         click.echo(json.dumps(card.model_dump(mode="json"), indent=2, sort_keys=True))
@@ -2013,7 +1996,15 @@ def result(target, as_json):
     # `exit_hint=False`: the block's closing line names the code the run exited
     # with, and this command exits 0 whatever it read. Naming one here would
     # state something the command did not do.
-    console.print(render_result_block(card, width=console.width, exit_hint=False))
+    #
+    # `soft_wrap=True`: the block has already fitted every line to this width.
+    # Letting the console wrap them a second time, at the same width and with
+    # no indent, snaps a session path in half against the left margin.
+    console.print(
+        render_result_block(card, width=console.width, exit_hint=False),
+        highlight=False,
+        soft_wrap=True,
+    )
 
 
 @cli.command()

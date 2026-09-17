@@ -402,6 +402,16 @@ def test_an_empty_result_is_not_reported_as_missing_from_the_store(monkeypatch, 
         outputs={"output_empty": ""},
     )
     monkeypatch.setattr(main_module, "build_trajectory", lambda *a, **k: document)
+    # The bytes come from the store reader now — only the refs this turn names
+    # are asked for, rather than the whole session's store being resolved to
+    # print one turn — so the store is what this stands in for.
+    monkeypatch.setattr(
+        main_module,
+        "read_output_bytes",
+        lambda session_dir, refs: {
+            ref: document.outputs[ref] for ref in refs if ref in (document.outputs or {})
+        },
+    )
 
     result = _inspect(tmp_path, "--turn", "1")
 
@@ -409,3 +419,39 @@ def test_an_empty_result_is_not_reported_as_missing_from_the_store(monkeypatch, 
     assert "the store holds this ref, and it is empty" in result.output
     assert "no bytes for this ref" in result.output
     assert result.output.count("no bytes for this ref") == 1
+
+
+def test_one_turn_resolves_only_the_refs_that_turn_names(monkeypatch, tmp_path):
+    """A view of one turn asks the store for that turn's bytes and no others.
+
+    The full detail tier resolves EVERY ref a session holds. Used to print one
+    turn, that is a hundred lookups on a real run and a store warning on stderr
+    for each ref that misses — 56 lines to print two.
+    """
+    import sag.main as main_module
+    from sag.trajectory.schema import ObservationInfo
+
+    document = _synthetic_document(
+        gate=None,
+        observation=ObservationInfo(outcome="ok", ref="output_wanted", evidence_ref=None),
+        outputs={"output_wanted": "the bytes", "output_elsewhere": "another turn's"},
+    )
+    asked: dict = {}
+
+    def _build(session_dir, **kwargs):
+        asked["detail"] = kwargs.get("detail")
+        return document
+
+    def _bytes(session_dir, refs):
+        asked["refs"] = tuple(refs)
+        return {"output_wanted": "the bytes"}
+
+    monkeypatch.setattr(main_module, "build_trajectory", _build)
+    monkeypatch.setattr(main_module, "read_output_bytes", _bytes)
+
+    result = _inspect(tmp_path, "--turn", "1")
+
+    assert result.exit_code == 0, result.output
+    assert asked["detail"] is None
+    assert asked["refs"] == ("output_wanted", None)
+    assert "the bytes" in result.output

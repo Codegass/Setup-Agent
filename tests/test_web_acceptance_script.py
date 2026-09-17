@@ -193,3 +193,30 @@ def test_backend_web_tests_exclude_acceptance_script(tmp_path, monkeypatch):
 
     assert module.backend_web_test_paths(failures) == []
     assert failures == ["no backend web tests found"]
+
+
+def test_the_backend_phase_passes_on_this_repository():
+    """The project's own acceptance gate must pass on the project.
+
+    Only the skeleton, unknown and terminal phases were driven here, so a
+    module deleted from `src/sag/web/` left its path in `BACKEND_FILES` and
+    broke `--phase backend` with the whole suite green.
+    """
+    result = subprocess.run(
+        [sys.executable, "scripts/accept_web_ui.py", "--phase", "backend", "--skip-commands"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ACCEPTANCE PASS" in result.stdout
+
+
+def test_every_backend_file_the_gate_requires_is_in_the_repository():
+    """Named separately from the phase so a failure says which file is gone."""
+    module = load_acceptance_module()
+
+    missing = [path for path in module.BACKEND_FILES if not (module.ROOT / path).exists()]
+
+    assert missing == []

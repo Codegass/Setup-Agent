@@ -222,3 +222,24 @@ def test_the_block_never_speaks_the_forbidden_vocabulary():
     text = _plain(_card(snapshot=snapshot_dict(verdict="partial"))).lower()
     for word in ("sealed", "canonical", "claimed", "quarantined", "metrics-v2", "promoting"):
         assert word not in text
+
+
+def test_a_value_longer_than_its_column_stays_inside_the_width_it_was_given():
+    """No line the block emits is wider than the width the block was built to.
+
+    `break_long_words=False` let a single unbreakable token — a campaign path,
+    a full Maven command — run past the edge, producing an 82-column line on an
+    80-column block. The console then re-wrapped that line at its own width
+    with no indent, snapping the path in half against the left margin.
+    """
+    from rich.text import Text
+
+    long_path = "logs/advisor-high20-mini-high-commons-cli-20260914/runs/commons-cli"
+    # Measured on what the block RETURNS, not on what a console prints: a
+    # console re-wraps an over-long line before anyone can see it was over-long,
+    # which is exactly why this went unnoticed.
+    block = render_result_block(_card(session_dir=long_path, container=None), width=80)
+
+    over = [line for line in block.splitlines() if Text.from_markup(line).cell_len > 80]
+    assert over == []
+    assert long_path[:20] in block

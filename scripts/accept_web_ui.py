@@ -20,7 +20,6 @@ BACKEND_FILES = [
     "src/sag/web/workspace_registry.py",
     "src/sag/web/session_registry.py",
     "src/sag/web/read_model.py",
-    "src/sag/web/evidence.py",
     "src/sag/web/context_trace.py",
     "src/sag/web/file_tracker.py",
     "src/sag/web/task_runner.py",

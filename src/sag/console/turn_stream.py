@@ -674,16 +674,34 @@ class TurnStreamRenderer:
         if not raw_line.lstrip().startswith("{"):
             return
         delta = self._reducer.feed(raw_line)
+        self._note_event(raw_line)
+        self._apply(delta)
+
+    def note_event(self, raw_line: str) -> None:
+        """Write the notes an event carries that no turn and no delta does.
+
+        Three kinds say something a reader needs and nothing downstream keeps:
+        a phase closing, a job the run is still waiting on, and a job left
+        running at the close. They live in the raw event, so a caller that
+        folds the lines elsewhere — `follow_trajectory` does — has to hand them
+        here as well, or the same ledger reads one way replayed and another way
+        tailed.
+        """
+
+        self._refuse_when_closed()
+        self._note_event(raw_line)
+
+    def _note_event(self, raw_line: str) -> None:
         event = self._event(raw_line)
-        if event is not None:
-            kind, body = event
-            if kind == "phase_transition":
-                self._note_transition(body)
-            elif kind == "job_barrier_wait":
-                self._note_job(body)
-            elif kind == "job_live_at_close":
-                self._note_live_job(body)
-        self.render_delta(delta)
+        if event is None:
+            return
+        kind, body = event
+        if kind == "phase_transition":
+            self._note_transition(body)
+        elif kind == "job_barrier_wait":
+            self._note_job(body)
+        elif kind == "job_live_at_close":
+            self._note_live_job(body)
 
     def render_delta(self, delta: TrajectoryDelta) -> None:
         """Write what one delta changed: its turns, then its statements.
@@ -692,12 +710,20 @@ class TurnStreamRenderer:
         reader replaying or tailing a recorded session has already folded
         them — `follow_trajectory` yields whole deltas, including the one only
         the end of a follow can produce — so both arrive here and leave by the
-        same two steps. Turns first, because a statement about a turn is held
-        until that turn has settled; the statements after, so a hole a follow
-        reports is shown on exactly the terms a replay shows it.
+        same two steps.
         """
 
         self._refuse_when_closed()
+        self._apply(delta)
+
+    def _apply(self, delta: TrajectoryDelta) -> None:
+        """Turns first, then statements.
+
+        Turns first because a statement about a turn is held until that turn
+        has settled on its own evidence; the statements after, so a hole a
+        follow reports is shown on exactly the terms a replay shows it.
+        """
+
         for turn in delta.turns:
             self.render_turn(turn)
         self._hold(delta.warnings, delta.retracted_warnings)

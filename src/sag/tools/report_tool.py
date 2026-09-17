@@ -973,7 +973,9 @@ class ReportTool(BaseTool):
             RunTermination,
             RunTerminationStatus,
         )
+        from sag.config import get_session_logger
         from sag.result_card.build import build_result_card
+        from sag.result_card.run_evidence import read_run_counts
 
         payload = (snapshot or {}).get("canonical_snapshot")
         if not isinstance(payload, dict):
@@ -993,11 +995,20 @@ class ReportTool(BaseTool):
         # would raise into this `except` and cost the report its whole Result
         # section instead of raising.
         module_metrics = self._read_module_metrics_payload()
+        # The run's own ledger, through the one reader every surface uses. The
+        # report used to state no turns and no tokens for a run whose terminal
+        # block stated both, which is one run described two ways by two
+        # documents a reader holds side by side.
+        session_logger = get_session_logger()
+        run_counts = read_run_counts(
+            getattr(session_logger, "session_log_dir", None) if session_logger else None
+        )
         try:
             return build_result_card(
                 payload,
                 module_metrics=module_metrics,
                 report_metrics=(snapshot or {}).get("metrics_v2"),
+                **run_counts,
                 termination=delivered,
                 project=project,
                 report_path=(snapshot or {}).get("report_path"),

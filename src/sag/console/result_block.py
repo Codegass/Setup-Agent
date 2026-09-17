@@ -78,8 +78,20 @@ def _identity(card: RunResultCard, room: int) -> str:
 
 
 def _wrap(text: str, width: int, indent: str, hanging: str | None = None) -> list[str]:
-    # ``width`` is the room left for the text itself; ``textwrap`` measures the
-    # whole line, indent included, so the indent is added back before wrapping.
+    """Lay text out under its indent, never wider than the room it was given.
+
+    ``width`` is the room left for the text itself; ``textwrap`` measures the
+    whole line, indent included, so the indent is added back before wrapping.
+
+    A single token longer than that room — a session path, a ref, a full Maven
+    command — is broken rather than allowed to run past the edge. Letting it
+    run produced a line WIDER than the width the block was built to, which the
+    console then re-wrapped at its own width with no indent, snapping a path in
+    half at column 80 and starting the remainder hard against the margin. A
+    break the block makes itself keeps the hanging indent, so the second half
+    of a path still reads as part of the line above it.
+    """
+
     if width <= 0:
         return [indent + text]
     return textwrap.wrap(
@@ -87,7 +99,7 @@ def _wrap(text: str, width: int, indent: str, hanging: str | None = None) -> lis
         width=width + len(indent),
         initial_indent=indent,
         subsequent_indent=indent if hanging is None else hanging,
-        break_long_words=False,
+        break_long_words=True,
         break_on_hyphens=False,
     ) or [indent.rstrip()]
 

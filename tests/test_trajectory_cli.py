@@ -394,3 +394,91 @@ def test_following_the_table_ends_the_stream_once_and_states_its_tail(monkeypatc
     # Stated as the stream states a hole, not dumped as the document does it.
     assert "! ledger_tail_torn: the last line is half written" in result.stdout
     assert not result.stdout.lstrip().startswith("{")
+
+
+def test_a_directory_with_no_ledger_says_so_instead_of_nothing(tmp_path):
+    """Silence is the one answer this surface may not give.
+
+    `--format json` states `missing_control_events` for a directory holding no
+    ledger. The table printed a header and zero bytes at exit 0 for the same
+    input — implying the absence the document states.
+    """
+    empty = tmp_path / "no-ledger"
+    empty.mkdir()
+
+    result = _table(str(empty))
+
+    assert result.exit_code == 0, result.stderr
+    assert "missing_control_events" in result.stdout
+    assert "control_events.jsonl" in result.stdout
+
+
+def test_a_campaign_archive_reads_the_run_inside_it(tmp_path):
+    """`sag result` finds a run one level down, and this command must agree.
+
+    The block `sag result` prints ends with a `Next` line naming this command
+    and the directory it was given. When only one of the two searched the
+    archive, that line named a command that printed nothing.
+    """
+    archive = tmp_path / "runs" / "commons-cli"
+    evidence = archive / "container-evidence" / ".setup_agent"
+    evidence.mkdir(parents=True)
+    (evidence / "control_events.jsonl").write_bytes((KAFKA / "control_events.jsonl").read_bytes())
+
+    result = _table(str(archive))
+
+    assert result.exit_code == 0, result.stderr
+    assert "24 turns" in result.stdout.splitlines()[0]
+    assert "▸ provision" in result.stdout
+
+
+def test_following_states_everything_a_replay_of_the_same_ledger_states(monkeypatch):
+    """One ledger, one answer, whichever way it is read.
+
+    A phase closing lives in the raw event and no delta carries it, so a follow
+    driven by deltas alone dropped every `✓ <phase>` line a replay prints — the
+    same command giving two different answers for one input.
+    """
+    import sag.main as main_module
+
+    replay = _table(str(KAFKA))
+    assert replay.exit_code == 0, replay.stderr
+
+    real_follow = main_module.follow_trajectory
+
+    def _stop(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        main_module,
+        "follow_trajectory",
+        lambda session_dir, **kwargs: real_follow(session_dir, sleep=_stop, **kwargs),
+    )
+    followed = _table(str(KAFKA), "--follow")
+
+    assert followed.exit_code == 0, followed.stderr
+    closes = [line for line in replay.stdout.splitlines() if line.startswith("✓ ")]
+    assert len(closes) == 5
+    missing = [line for line in closes if line not in followed.stdout]
+    assert missing == []
+
+
+def test_both_formats_answer_for_the_same_run(tmp_path):
+    """One directory, one run, whichever format is asked for.
+
+    The table learned to look inside a campaign archive first. A document that
+    kept looking only at the directory named answered for no run at all — an
+    empty run_id and no turns — for the input its own table read whole.
+    """
+    archive = tmp_path / "runs" / "commons-cli"
+    evidence = archive / "container-evidence" / ".setup_agent"
+    evidence.mkdir(parents=True)
+    (evidence / "control_events.jsonl").write_bytes((KAFKA / "control_events.jsonl").read_bytes())
+
+    table = _table(str(archive))
+    document = json.loads(_run(str(archive)).stdout)
+
+    assert table.exit_code == 0, table.stderr
+    assert document["session"]["run_id"]
+    assert document["session"]["run_id"] in table.stdout.splitlines()[0]
+    assert len(document["turns"]) == 24

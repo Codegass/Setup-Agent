@@ -719,9 +719,7 @@ def test_web_card_keeps_the_mutable_module_rollup_out_of_the_build_word(snapshot
     build = card.row("build")
     assert build.status == "success"
     assert build.headline == "success"
-    assert build.detail == (
-        "4 modules failed · counts are diagnostic, CI defines scope"
-    )
+    assert build.detail == ("4 modules failed · counts are diagnostic, CI defines scope")
     assert card.row("tests").headline == (
         "328 executed · 328 passed · 0 failed · 0 errors · 0 skipped"
     )
@@ -1301,9 +1299,9 @@ def test_every_surface_states_the_same_status_and_the_same_explanation(record):
     printed = _printed_rows(card)
     cells = _report_cells(card)
 
-    assert list(printed) == list(ROW_ORDER), (
-        f"{_TERMINAL} prints rows {list(printed)} for {record}; a card states {list(ROW_ORDER)}"
-    )
+    assert list(printed) == list(
+        ROW_ORDER
+    ), f"{_TERMINAL} prints rows {list(printed)} for {record}; a card states {list(ROW_ORDER)}"
     assert list(cells) == [ROW_LABELS[key] for key in ROW_ORDER], (
         f"{_REPORT} tabulates rows {list(cells)} for {record}; "
         f"a card states {[ROW_LABELS[key] for key in ROW_ORDER]}"
@@ -1530,6 +1528,69 @@ def test_every_ci_verdict_the_record_can_hold_has_a_word_a_reader_can_read():
         )
 
     unknown = set(_CI_STATUS_WORD) - set(get_args(AttainmentVerdict))
-    assert not unknown, (
-        f"_CI_STATUS_WORD spells {sorted(unknown)}, which no AttainmentVerdict can hold"
+    assert (
+        not unknown
+    ), f"_CI_STATUS_WORD spells {sorted(unknown)}, which no AttainmentVerdict can hold"
+
+
+# -- one reader, four surfaces ---------------------------------------------
+
+
+def test_the_run_counts_a_card_states_come_from_one_reader():
+    """Four surfaces, one fold of one ledger, handed over as one group.
+
+    The counts are named `read_run_counts` answers with, and every card site
+    splats that answer whole. When two sites folded the ledger themselves and
+    one of them learned to bill tokens, a single run reported 117068 tokens on
+    the terminal and nothing at all through the web API — a contradiction a
+    reader could see by opening both.
+    """
+    import inspect as inspection
+    from pathlib import Path
+
+    from sag.result_card.run_evidence import RUN_COUNT_KEYS, read_run_counts
+
+    kafka = Path(__file__).parent / "fixtures" / "trajectory" / "kafka-d2r3"
+    counts = read_run_counts(kafka)
+
+    assert set(counts) == set(RUN_COUNT_KEYS)
+    accepted = set(inspection.signature(build_result_card).parameters)
+    assert set(counts) <= accepted
+
+    card = build_result_card(snapshot_dict(), **counts)
+    assert card.stats.turns == 24
+    assert card.stats.tokens_in and card.stats.tokens_out
+    assert counts["token_usage"], "the kafka session bills tokens; the reader must carry them"
+
+
+def test_no_surface_names_the_run_counts_one_at_a_time():
+    """The keywords may only reach `build_result_card` through the shared group.
+
+    A site that names them one at a time can name four and forget the fifth,
+    which is exactly how the surfaces came to disagree. Splatting one mapping
+    makes that impossible rather than merely unlikely, so naming any of these
+    keywords outside the reader that produces them is the defect itself.
+    """
+    from pathlib import Path
+
+    from sag.result_card.run_evidence import RUN_COUNT_KEYS
+
+    # Every module that builds a card FROM A RECORDED RUN. `build.py` declares
+    # the keywords, and `web/demo_data.py` invents a run rather than reading
+    # one, so neither has a ledger to disagree with anyone about.
+    sites = (
+        "src/sag/main.py",
+        "src/sag/web/session_registry.py",
+        "src/sag/tools/report_tool.py",
+    )
+    offenders: dict[str, list[str]] = {}
+    for name in sites:
+        source = Path(name).read_text(encoding="utf-8")
+        named = [key for key in RUN_COUNT_KEYS if f"{key}=" in source]
+        if named:
+            offenders[name] = named
+
+    assert offenders == {}, (
+        "these files name a run count by keyword instead of splatting "
+        f"read_run_counts(...): {offenders}"
     )

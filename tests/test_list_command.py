@@ -74,8 +74,39 @@ def test_an_empty_dashboard_teaches_the_first_command(monkeypatch):
 
 
 def test_a_failed_read_is_not_reported_as_an_empty_dashboard(monkeypatch):
+    """And it is not reported as success either.
+
+    `sag result` exits 1 when it cannot read a run. Two readers on one branch
+    answering "I could not look" with two different exit codes is a difference
+    a script cannot see past, so this one exits 1 as well. An EMPTY dashboard
+    is a different answer and still exits 0.
+    """
     result = _invoke(monkeypatch, UNREADABLE)
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert "Workspace data could not be read" in result.output
     assert "No SAG workspaces found." not in result.output
+
+
+def test_the_table_names_no_field_the_read_model_does_not_define():
+    """Three columns wait on a field `WorkspaceSummary` does not carry yet.
+
+    `WebModel` ignores extras, so code reaching for one is unreachable for
+    every possible input while reading as though it were live — and the code
+    behind these columns also named `tests.passed`, `tests.executed` and
+    `tests.errors`, none of which `TestSummary` defines. A dash and a comment
+    naming the field are honest; unreachable code that looks live is not.
+    """
+    import inspect
+    import re
+
+    import sag.main as main_module
+
+    source = inspect.getsource(main_module.list.callback)
+    named = set(re.findall(r"workspace\.(\w+)", source))
+    named |= set(re.findall(r'getattr\(\s*workspace\s*,\s*"(\w+)"', source))
+
+    assert named <= set(WorkspaceSummary.model_fields), (
+        f"`sag list` reads {sorted(named - set(WorkspaceSummary.model_fields))} off a workspace, "
+        "which WorkspaceSummary does not define"
+    )

@@ -33,6 +33,7 @@ from sag.agent.verdict_finalizer import (
     read_live_verdict_snapshot,
 )
 from sag.result_card.build import build_result_card
+from sag.result_card.run_evidence import ReportDeliveryOnly, read_run_counts
 from sag.result_card.models import RunResultCard
 from sag.runtime.container_io import resolve_control_execute
 from sag.trajectory.builder import CONTROL_EVENTS_NAME, build_trajectory
@@ -879,48 +880,6 @@ def _snapshot_phase_reached(snapshot: RunVerdictSnapshot, phase: str) -> bool | 
     return any(record.phase == phase and record.termination != "skipped" for record in records)
 
 
-def _run_counts_from_ledger(session_dir: Path | None) -> dict[str, Any]:
-    """Fold the run's own ledger into the counts the card states.
-
-    Every count is absent unless the ledger supplied it: a run whose turns were
-    never recorded reports no turns, not zero turns, and a directory holding no
-    ledger leaves the whole group absent rather than raising. The four travel
-    together because they are four readings of one replay — asking the ledger
-    four times could answer four different things about the same run.
-
-    The failure signal is the one the result block already counts, so the two
-    surfaces state the same number for the same run.
-    """
-
-    counts: dict[str, Any] = {
-        "trajectory_session": None,
-        "turn_count": None,
-        "tool_calls": None,
-        "tool_failures": None,
-    }
-    if session_dir is None:
-        return counts
-    try:
-        document = build_trajectory(session_dir)
-    except (OSError, TypeError, ValueError) as exc:
-        logger.debug("Run counts unavailable in {}: {}", session_dir, exc)
-        return counts
-
-    counts["trajectory_session"] = document.session.model_dump(mode="json")
-    turns = tuple(document.turns)
-    if not turns:
-        return counts
-    counts["turn_count"] = len(turns)
-    counts["tool_calls"] = sum(1 for turn in turns if turn.call is not None)
-    counts["tool_failures"] = sum(
-        1
-        for turn in turns
-        if turn.observation is not None
-        and (turn.observation.error_code or turn.observation.failure_signature)
-    )
-    return counts
-
-
 def _host_run_pin(session_dir: Path | None) -> dict[str, Any] | None:
     """The run pin this session directory holds, or nothing when it holds none."""
 
@@ -956,24 +915,9 @@ def _report_path_for_card(session_dir: Path | None, container_path: str | None) 
     return container_path
 
 
-@dataclass(frozen=True)
-class _ReportDeliveryOnly:
-    """What this surface can state about how the run ended: the report, and no more.
-
-    The result card's Report row reads ``report_delivery_status`` and its Setup
-    row reads ``termination``. The Workbench reads a finished run's artifacts
-    from outside the run, so it can say whether the report document exists — it
-    is holding one — but nothing it reads says whether the run completed or was
-    cut short. Carrying no ``termination`` is how the Setup row is told that,
-    and it reads the same as the run ending normally.
-    """
-
-    report_delivery_status: ReportDeliveryStatus
-
-
 def _observed_report_delivery(
     trunk_data: dict[str, Any], report_raw: str | None
-) -> _ReportDeliveryOnly | None:
+) -> ReportDeliveryOnly | None:
     """The run's own word on delivery, or the document this reader is holding."""
 
     stated = _durable_report_delivery_status(trunk_data)
@@ -981,7 +925,7 @@ def _observed_report_delivery(
         stated = "delivered"
     if stated is None:
         return None
-    return _ReportDeliveryOnly(report_delivery_status=ReportDeliveryStatus(stated))
+    return ReportDeliveryOnly(report_delivery_status=ReportDeliveryStatus(stated))
 
 
 def _durable_report_delivery_status(trunk_data: dict[str, Any]) -> str | None:
@@ -1082,15 +1026,13 @@ def _setup_artifact_item(
         # mistake in building one of them is indistinguishable from a record the
         # card cannot read, and the detail would serve no card at all while every
         # test still passed.
-        run_counts = _run_counts_from_ledger(run_dir)
         card_inputs = {
             "module_metrics": module_metrics,
             "report_metrics": metrics if isinstance(metrics, dict) else None,
             "run_pin": _host_run_pin(run_dir),
-            "trajectory_session": run_counts["trajectory_session"],
-            "turn_count": run_counts["turn_count"],
-            "tool_calls": run_counts["tool_calls"],
-            "tool_failures": run_counts["tool_failures"],
+            # Whole, never key by key: this surface and the terminal read one
+            # run with one reader, so they cannot state different numbers for it.
+            **read_run_counts(run_dir),
             "termination": _observed_report_delivery(trunk_data, report_raw),
             "project": project_name or None,
             "goal": _text(trunk_data.get("goal"), default="") or None,
