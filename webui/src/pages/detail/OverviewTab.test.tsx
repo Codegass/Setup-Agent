@@ -153,9 +153,13 @@ describe("OverviewTab", () => {
     expect(container.querySelector("details")).toBeNull()
   })
 
-  it("renders without a card at all", () => {
+  it("leaves the no-result sentence to the band and still says what it can", () => {
+    // The band prints "No result was recorded for this run yet." above the tab
+    // bar. Seen live on an archived run with no card, the Overview printed the
+    // identical sentence two inches below it.
     render(<OverviewTab detail={{ ...cleanDetail(), resultCard: null }} />)
-    expect(screen.getByText(/No result was recorded/)).toBeInTheDocument()
+    expect(screen.queryByText(/No result was recorded/)).toBeNull()
+    expect(screen.getByText("Module details are not available for this run.")).toBeInTheDocument()
   })
 
   it("keeps the run's goal on the page", () => {

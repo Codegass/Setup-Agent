@@ -78,13 +78,11 @@ export function OverviewTab({ detail }: { detail: ExecutionSessionDetail }) {
             <p className="px-4 py-3 text-[13px] text-muted-foreground">Nothing needs attention.</p>
           )}
         </section>
-      ) : (
-        <div className="rounded-xl border border-border bg-card px-4 py-3">
-          <p className="text-[13px] text-muted-foreground">
-            No result was recorded for this run yet.
-          </p>
-        </div>
-      )}
+      ) : // A run with no card has no attention list to show, and the band said
+      // "No result was recorded for this run yet." two inches above this line —
+      // repeating it here put the same sentence on the screen twice. What this
+      // tab can still say about such a run is below: its goal, and its modules.
+      null}
 
       {goal ? (
         // Below what needs attention, not above it: a real goal is a paragraph
