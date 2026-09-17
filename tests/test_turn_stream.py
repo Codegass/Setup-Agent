@@ -2078,6 +2078,25 @@ def test_what_this_fence_does_not_catch():
     live engine writes one per sealed turn; a settling rule that a `turn_record`
     silently retracted survived a review, a re-review and a hundred mutations
     against those three, because nothing in them could produce the event.
+
+    The two claims above that can be checked rather than read are checked
+    below, so this stops being a green test that asserts nothing: the first
+    mutant is equivalent only while the schema caps the summary, and the
+    throttle's existence is what the docstring says is fenced.
     """
 
-    assert True
+    import pydantic
+
+    from sag.console.turn_stream import _JOB_NOTE_INTERVAL_SECONDS
+    from sag.trajectory.schema import SUMMARY_MAX_CHARS, CallInfo, ObservationInfo
+
+    # Why `min(SUMMARY_MAX_CHARS, …)` is an equivalent mutant: nothing longer
+    # can reach the column. If this cap is ever lifted, the clause starts doing
+    # work and this docstring starts being wrong. The legal summary is built
+    # first so the refusal below cannot be a missing field instead of a cap.
+    for model, required in ((CallInfo, {"tool": "bash"}), (ObservationInfo, {})):
+        assert model(**required, summary="x" * SUMMARY_MAX_CHARS).summary
+        with pytest.raises(pydantic.ValidationError, match="at most"):
+            model(**required, summary="x" * (SUMMARY_MAX_CHARS + 1))
+
+    assert _JOB_NOTE_INTERVAL_SECONDS > 0, "the throttle exists; its value is a judgment"

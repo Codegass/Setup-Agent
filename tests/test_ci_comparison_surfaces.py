@@ -1,6 +1,7 @@
 """Reader and command-entry agreement; producer tests live in test_ci_comparison."""
 
 import hashlib
+import re
 import json
 
 import pytest
@@ -114,19 +115,31 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     assert first["ciComparison"] == comparison.model_dump(mode="json")
     assert first["canonicalVerdict"] == "success"
     # The Workbench serves the card rather than rendering it, so the same
-    # fragments the block and the report print are read out of the CI row.
+    # fragments the block and the report print are read out of the CI row —
+    # each from the field that is supposed to carry it. Joining the five fields
+    # into one string and matching substrings let a fragment that had landed in
+    # the wrong field pass, which is most of what this fence is for.
     ci = next(row for row in first["resultCard"]["rows"] if row["key"] == "ci")
-    ci_text = " ".join(
-        [
-            ci["status"],
-            ci["headline"],
-            ci["detail"] or "",
-            ci["reason"] or "",
-            *ci["items"],
-        ]
-    )
-    for fragment in _block_ci_fragments(comparison):
-        assert fragment in ci_text
+    result = comparison.attainment
+    if result is None:
+        assert ci["status"] == "not compared"
+        assert ci["headline"] == "not compared"
+        for reason in comparison.reasons[:1]:
+            assert ci["reason"] and reason in ci["reason"]
+    else:
+        word = {"not_met": "not met", "invalid": "not scored"}.get(
+            str(result.verdict), str(result.verdict)
+        )
+        assert ci["status"] == word
+        if result.alpha is not None:
+            assert ci["headline"] == (
+                f"{word} {result.alpha.numerator:,}/{result.alpha.denominator:,}"
+            )
+        elif word == "not scored":
+            assert ci["headline"] == word
+        else:
+            assert ci["headline"] == f"{word} · scope score unavailable"
+        assert ci["detail"] and f'cell "{result.cell_id}"' in ci["detail"]
     if status == "met":
         assert comparison.attainment.verdict == "met"
         assert comparison.attainment.alpha is not None
@@ -172,8 +185,9 @@ def test_cli_loads_explicit_target_bytes_before_starting_agent(monkeypatch, tmp_
     pinned = RecordingSetupAgent.calls[0]["ci_target"]
     assert pinned.record == target
     assert pinned.raw_sha256 == hashlib.sha256(raw).hexdigest()
-    assert "Official CI" in result.output
-    assert "not compared" in result.output
+    # Adjacency, not two free-floating substrings: the row's label and its word
+    # on one line is the thing that can drift apart.
+    assert re.search(r"Official CI\s+not compared", result.output), result.output
     assert "[fully]" not in result.output
 
 

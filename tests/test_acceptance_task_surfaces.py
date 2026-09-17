@@ -151,19 +151,25 @@ def test_required_task_result_is_identical_across_sealed_surfaces(snapshot_facto
     detail = _session_detail(item, "sag-tvm", None).model_dump(mode="json", by_alias=True)
     assert detail["taskCompletion"] == completion.model_dump(mode="json")
     # The Workbench serves the card rather than rendering it, so the same
-    # fragments the block and the report print are read out of the task row.
+    # fragments the block and the report print are read out of the task row —
+    # each from the field that is supposed to carry it. Joining the five fields
+    # into one string and matching substrings passed a fragment that had landed
+    # in the wrong field, which is most of what this fence is for.
     task = next(row for row in detail["resultCard"]["rows"] if row["key"] == "task")
-    task_text = " ".join(
-        [
-            task["status"],
-            task["headline"],
-            task["detail"] or "",
-            task["reason"] or "",
-            *task["items"],
-        ]
-    )
-    for fragment in _block_task_fragments(completion):
-        assert fragment in task_text
+    steps = tuple(completion.steps or ())
+    assert task["status"] == str(completion.status)
+    if steps:
+        complete = sum(1 for step in steps if step.status == "complete")
+        assert task["headline"] == f"{completion.status} {complete}/{len(steps)} steps"
+    else:
+        assert task["headline"] == "step definition unavailable"
+        # The row explains the code rather than restating it bare.
+        for reason in completion.reasons[:1]:
+            assert task["reason"] and reason in task["reason"]
+    # The step lines the block prints, in the row's own `items`, one for one.
+    assert [item.split(" \u2192 exit ")[0].split(";")[0] for item in task["items"]] == [
+        f"{step.id}: {step.status} \u2014 {step.command}" for step in steps
+    ]
     authority = evidence_publication_authority_for(orch)
     head = authority.latest_head(VERDICT_LOGICAL_ARTIFACT_ID)
     authority.revoke_latest(
