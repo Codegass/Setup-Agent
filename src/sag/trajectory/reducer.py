@@ -132,6 +132,7 @@ from typing import Any
 
 from sag.agent.control_events import CANCELLED_CALL_REFUSAL_CODE, CONTROL_EVENT_KINDS
 from sag.trajectory.schema import (
+    KEY_RESULTS_MAX_CHARS,
     Annotation,
     CallInfo,
     GateInfo,
@@ -144,6 +145,12 @@ from sag.trajectory.schema import (
     Turn,
     Warning,
     warning_order,
+)
+from sag.trajectory.summaries import (
+    call_summary,
+    observation_outcome,
+    observation_summary,
+    refusal_summary,
 )
 
 #: The engine's own event vocabulary is the definition of "known". Anything
@@ -261,9 +268,23 @@ class _PhaseState:
     name: str
     termination: str | None = None
     gates: list[GateInfo] = field(default_factory=list)
+    #: What the LAST gate on this band read, in the gate's own words. A band
+    #: graded more than once shows the reading in force, exactly as a turn shows
+    #: the word in force; a gate that stated nothing writes nothing, which is
+    #: `None` and not a blank line.
+    validator_state: str | None = None
+    reason: str | None = None
+    key_results: str | None = None
 
     def render(self) -> PhaseInfo:
-        return PhaseInfo(name=self.name, termination=self.termination, gates=list(self.gates))
+        return PhaseInfo(
+            name=self.name,
+            termination=self.termination,
+            gates=list(self.gates),
+            validator_state=self.validator_state,
+            reason=self.reason,
+            key_results=self.key_results,
+        )
 
 
 class TrajectoryReducer:
@@ -705,7 +726,11 @@ class TrajectoryReducer:
         # seq 124→125 and 138→139; the slice corpus pins the holes at the
         # refusals, seq 124/138/216, not at the retries).
         turn = self._open(collector, actor=actor, phase=None)
-        turn.call = CallInfo(tool=tool, params_ref=envelope_id)
+        turn.call = CallInfo(
+            tool=tool,
+            params_ref=envelope_id,
+            summary=call_summary(tool, payload.get("exact_params")),
+        )
         turn.envelope_id = envelope_id
         turn.t0 = timestamp
         turn.touch(sequence)
@@ -725,7 +750,11 @@ class TrajectoryReducer:
         turn = self._open(
             collector, actor="controller", phase=phase if isinstance(phase, str) else None
         )
-        turn.call = CallInfo(tool=tool, params_ref=envelope_id)
+        turn.call = CallInfo(
+            tool=tool,
+            params_ref=envelope_id,
+            summary=call_summary(tool, payload.get("exact_params")),
+        )
         turn.envelope_id = envelope_id
         turn.t0 = timestamp
         turn.touch(sequence)
@@ -853,6 +882,10 @@ class TrajectoryReducer:
         refusal_code = _text(payload.get("refusal_code"))
         turn = self._open(collector, actor="model", phase=None)
         turn.call = CallInfo(tool=tool, params_ref=None)
+        outcome, summary = refusal_summary(payload)
+        turn.observation = (turn.observation or ObservationInfo()).model_copy(
+            update={"outcome": outcome, "summary": summary}
+        )
         turn.t0 = timestamp
         turn.t1 = timestamp
         turn.has_result = True
@@ -894,6 +927,17 @@ class TrajectoryReducer:
             ref=_text(result.get("output_ref")),
             error_code=_text(result.get("error_code")),
             failure_signature=_text(result.get("failure_signature")),
+        )
+        # The result is the only event that carries the projected payload the
+        # summarisers read, so it is the only one that derives [C]'s line. What
+        # they hand back is written as-is, `None` included: a result that stated
+        # no outcome is not a failure, and a line nobody could derive is not "".
+        tool_name = turn.call.tool if turn.call else (_text(payload.get("tool")) or "")
+        turn.observation = turn.observation.model_copy(
+            update={
+                "outcome": observation_outcome(result),
+                "summary": observation_summary(tool_name, result),
+            }
         )
         turn.has_result = True
         turn.t1 = timestamp
@@ -979,7 +1023,29 @@ class TrajectoryReducer:
             decision_id=_text(payload.get("decision_id")),
             supersedes=_text(payload.get("supersedes")),
         )
-        self._attach_gate(collector, gate, sequence, payload.get("phase"))
+        phase = payload.get("phase")
+        self._attach_gate(collector, gate, sequence, phase)
+        # Only a `gate_decision` carries the validator's reading; a revision
+        # replaces the WORD and states no validator state or key results, so it
+        # must not blank what the decision recorded.
+        if isinstance(phase, str) and phase:
+            self._band_reading(self._phase_band(phase), payload)
+
+    @staticmethod
+    def _band_reading(band: _PhaseState, payload: dict) -> None:
+        """Record on the band what the gate read, and only what it stated.
+
+        Every string goes through `_text` because the engine defaults `reason`
+        and `key_results` to `""` and this schema rejects a blank cell: `""` in
+        the ledger means "not stated", and that is `None` here (camel-quarkus
+        seq 250 writes exactly that).
+        """
+        band.validator_state = _text(payload.get("validator_state"))
+        band.reason = _text(payload.get("reason"))
+        key_results = _text(payload.get("key_results"))
+        if key_results and len(key_results) > KEY_RESULTS_MAX_CHARS:
+            key_results = key_results[: KEY_RESULTS_MAX_CHARS - 1] + "…"
+        band.key_results = key_results
 
     def _on_gate_outcome_revised(
         self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
@@ -1380,6 +1446,12 @@ def _merge_observation(
         evidence_ref=displaced,
         error_code=existing.error_code or error_code,
         failure_signature=existing.failure_signature or failure_signature,
+        # Derived by the result, which is the only event holding the payload
+        # they were read off. The decision that follows it describes the same
+        # observation from four fields and could not re-derive them, so it
+        # carries them forward rather than rebuilding [C] without them.
+        outcome=existing.outcome,
+        summary=existing.summary,
     )
 
 
@@ -1412,6 +1484,8 @@ def _delivered_observation(
             evidence_ref=evidence,
             error_code=existing.error_code,
             failure_signature=existing.failure_signature,
+            outcome=existing.outcome,
+            summary=existing.summary,
         ),
         displaced,
     )

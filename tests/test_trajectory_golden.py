@@ -45,7 +45,7 @@ import pytest
 
 from sag.trajectory.builder import build_trajectory, follow_trajectory
 from sag.trajectory.reducer import DeltaAccumulator
-from sag.trajectory.schema import Trajectory
+from sag.trajectory.schema import KEY_RESULTS_MAX_CHARS, Trajectory
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trajectory"
 KAFKA = FIXTURES / "kafka-d2r3"
@@ -498,3 +498,271 @@ def test_the_executor_rows_that_bill_nobody_are_counted_out_loud():
     assert len(unattributed) == 1
     assert str(len(orphans)) in unattributed[0].detail
     assert len(orphans) == 8 and len(_executor_rows(KAFKA)) == 19
+
+
+# ---------------------------------------------------------------------------
+# The derived one-liners, held to the three archived sessions.
+#
+# Counts here are LITERALS on purpose. The summarisers were first written
+# against invented payloads and four whole-tool branches were wrong on 100% of
+# real data while a green suite said nothing; the wiring can go dead the same
+# way — an envelope key that stops being read, a fold that rebuilds [C] without
+# the line the result derived — and a total that merely says "something was
+# summarised" would not notice. Every number below takes a branch with it.
+# ---------------------------------------------------------------------------
+
+#: `call.summary` is stated for EVERY call in all three sessions, so these are
+#: also the envelope counts. A tool here that drops to zero is a branch that
+#: stopped firing; a tool missing from a session's row is a tool this fence
+#: stopped watching.
+CALLS_SUMMARISED_PER_TOOL = {
+    "kafka-d2r3": {
+        "advisor": 2,
+        "bash": 1,
+        "build": 2,
+        "phase": 7,
+        "project": 4,
+        "report": 1,
+        "search": 7,
+    },
+    "camel-quarkus-d2r3": {
+        "advisor": 2,
+        "bash": 9,
+        "build": 2,
+        "phase": 14,
+        "project": 6,
+        "report": 1,
+        "search": 21,
+    },
+    "ignite-d2r3": {"advisor": 3, "bash": 3, "build": 2, "phase": 6, "project": 3, "search": 18},
+}
+
+#: `observation.summary`, which unlike a call may honestly have nothing to say —
+#: a bash that exited 0 carries no line of its own, and a `report` result states
+#: only its status. Held exactly rather than as a total for that reason.
+OBSERVATIONS_SUMMARISED_PER_TOOL = {
+    "kafka-d2r3": {"advisor": 2, "build": 2, "phase": 7, "project": 3, "search": 7},
+    "camel-quarkus-d2r3": {
+        "advisor": 2,
+        "bash": 6,
+        "build": 2,
+        "phase": 14,
+        "project": 6,
+        "search": 21,
+    },
+    "ignite-d2r3": {"advisor": 3, "bash": 1, "build": 2, "phase": 6, "project": 3, "search": 17},
+}
+
+#: `observation.outcome` across each session. `None` is a real answer and is
+#: counted as one: camel-quarkus' three refused calls are described by a
+#: `loop_decision` and answered by no `tool_result`, so nothing ever stated how
+#: they came out, and this layer does not invent `failed` for them.
+OUTCOMES_PER_SESSION = {
+    "kafka-d2r3": {"ok": 20, "failed": 4},
+    "camel-quarkus-d2r3": {"ok": 36, "failed": 19, None: 3},
+    "ignite-d2r3": {"ok": 29, "failed": 5, "pending": 1},
+}
+
+#: `(session, opening control sequence) -> (call line, outcome, result line)`,
+#: copied out of the archived ledgers. These are the sentences a reader will
+#: actually be shown: a real ref, a real command, a real gate word, a real
+#: short sha, a real job handle.
+LINES_AT_SEQUENCE = {
+    ("kafka-d2r3", 3): ("clone apache/kafka@4.3.1", "ok", "26b251a → /workspace/kafka"),
+    ("kafka-d2r3", 11): ("env gradle", "failed", "ENV_EXECUTABLE_NOT_FOUND"),
+    ("kafka-d2r3", 119): ("compile --no-daemon", "ok", "exit 0"),
+    ("kafka-d2r3", 141): (
+        "test --no-daemon :clients:test",
+        "failed",
+        "exit 1 · DETACHED_OPERATION_FAILED",
+    ),
+    ("kafka-d2r3", 148): (
+        "done partial",
+        "failed",
+        "gate tests_not_executed · no tests executed of 20,497 discovered",
+    ),
+    ("kafka-d2r3", 163): ("generate", "ok", None),
+    ("camel-quarkus-d2r3", 3): (
+        "clone apache/camel-quarkus@3.36.0",
+        "ok",
+        "5dec869 → /workspace/camel-quarkus",
+    ),
+    ("camel-quarkus-d2r3", 63): ("compile", "failed", "exit 1 · JAVA_VERSION_ERROR"),
+    ("camel-quarkus-d2r3", 98): (
+        "env maven",
+        "failed",
+        "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH",
+    ),
+    ("ignite-d2r3", 6): ("clone apache/ignite@2.18.0", "ok", "d49adad → /workspace/ignite"),
+    ("ignite-d2r3", 168): ("compile", "ok", "exit 0 · 5 artifacts"),
+    # The forced dispatch: the controller's own call, summarised like any other,
+    # and a job the run never heard the end of, which reads as still running.
+    ("ignite-d2r3", 235): ("test", "pending", "running · job 2c4d56b2fdca"),
+}
+
+#: `session -> phase name -> (validator_state, the head of reason, len(key_results))`.
+#: The reading of the LAST gate on each band. `key_results` is 400 wherever the
+#: gate wrote more than the cap and the clip took it back to it; camel-quarkus'
+#: `test` band is the gate that wrote `""`, which this layer states as absence.
+PHASE_READINGS = {
+    "kafka-d2r3": {
+        "provision": ("green", "workspace /workspace/kafka exists", 400),
+        "analyze": ("green", "project analysis validator returned no", 400),
+        "build": ("partial", "Built 3655 of 3678 expected classes", 304),
+        "test": ("red", "no tests executed of 20,497 discovered", 400),
+        "report": ("green", "report artifact exists", 400),
+    },
+    "camel-quarkus-d2r3": {
+        "provision": ("green", "workspace /workspace/camel-quarkus exists", 400),
+        "analyze": ("green", "project analysis validator returned no", 368),
+        "build": ("partial", "Found 3386 compiled classes", 400),
+        "test": ("red", "no tests executed of 2,765 discovered", None),
+        "report": ("green", "report artifact exists", 400),
+    },
+    "ignite-d2r3": {
+        "provision": ("green", "workspace /workspace/ignite exists", 400),
+        "analyze": ("green", "project analysis validator returned no", 400),
+        "build": ("partial", "Built 5466 of 5470 expected classes", 378),
+        "test": ("unavailable", "Test phase cannot terminate before one", 400),
+    },
+}
+
+SESSION_DIRS = {"kafka-d2r3": KAFKA, "camel-quarkus-d2r3": CAMEL_QUARKUS, "ignite-d2r3": IGNITE}
+
+
+def _per_tool(turns, pick):
+    counts: dict[str, int] = {}
+    for turn in turns:
+        if turn.call is not None and pick(turn):
+            counts[turn.call.tool] = counts.get(turn.call.tool, 0) + 1
+    return counts
+
+
+@pytest.mark.parametrize("session", sorted(SESSION_DIRS))
+def test_every_archived_call_says_what_it_asked_for(session):
+    """Not one envelope in the three sessions goes without its line."""
+    snap = build_trajectory(SESSION_DIRS[session])
+    assert _per_tool(snap.turns, lambda t: t.call.summary) == CALLS_SUMMARISED_PER_TOOL[session]
+    assert all(t.call.summary for t in snap.turns if t.call is not None)
+
+
+@pytest.mark.parametrize("session", sorted(SESSION_DIRS))
+def test_the_archived_results_carry_their_outcome_and_their_line(session):
+    """How each call came out, and what it answered, counted per tool.
+
+    `report` summarises nothing in any session and `bash` summarises only the
+    calls that failed: a result with nothing to state states nothing, which is
+    why these are held exactly instead of against the envelope totals.
+    """
+    snap = build_trajectory(SESSION_DIRS[session])
+    outcomes: dict[str | None, int] = {}
+    for turn in snap.turns:
+        if turn.observation is not None:
+            outcomes[turn.observation.outcome] = outcomes.get(turn.observation.outcome, 0) + 1
+    assert outcomes == OUTCOMES_PER_SESSION[session]
+    assert (
+        _per_tool(snap.turns, lambda t: t.observation and t.observation.summary)
+        == OBSERVATIONS_SUMMARISED_PER_TOOL[session]
+    )
+
+
+@pytest.mark.parametrize("session", sorted(SESSION_DIRS))
+def test_the_archived_turns_read_the_way_a_reader_will_read_them(session):
+    """Exact sentences, at sequences the archived ledgers really wrote."""
+    snap = build_trajectory(SESSION_DIRS[session])
+    by_sequence = {t.control_seq[0]: t for t in snap.turns if t.control_seq}
+    expected = {seq: value for (name, seq), value in LINES_AT_SEQUENCE.items() if name == session}
+    assert expected  # this session is watched at all
+    for sequence, (call, outcome, observation) in expected.items():
+        turn = by_sequence[sequence]
+        assert turn.call.summary == call, sequence
+        assert turn.observation.outcome == outcome, sequence
+        assert turn.observation.summary == observation, sequence
+
+
+@pytest.mark.parametrize("session", sorted(SESSION_DIRS))
+def test_the_archived_phases_carry_the_gates_reading(session):
+    """Every band states what the validator saw and why the gate said it.
+
+    All twenty-six archived `gate_decision` events across these three sessions
+    carry `validator_state`, `reason` and `key_results`, so all three populate
+    here. Fifteen of them write more than `KEY_RESULTS_MAX_CHARS`, which is why
+    so many bands read exactly 400 — the clip is exercised by real bytes, not
+    by a fixture built to exercise it. camel-quarkus' `test` band is the
+    opposite case: its last gate (seq 250) writes `key_results: ""`, and a
+    blank cell is stated as absence rather than shown as an empty paragraph.
+    """
+    snap = build_trajectory(SESSION_DIRS[session])
+    readings = PHASE_READINGS[session]
+    assert [p.name for p in snap.phases] == list(readings)
+    for phase in snap.phases:
+        state, reason_head, key_length = readings[phase.name]
+        assert phase.validator_state == state, phase.name
+        assert phase.reason is not None and phase.reason.startswith(reason_head), phase.name
+        assert (len(phase.key_results) if phase.key_results else None) == key_length, phase.name
+        if key_length == KEY_RESULTS_MAX_CHARS:
+            assert phase.key_results.endswith("…"), phase.name
+
+
+def test_no_archived_session_refuses_a_call_before_dispatch():
+    """Stated, because the refusal wiring is NOT fenced by these fixtures.
+
+    `refusal_record` is a Stage-B kind: none of the three committed sessions
+    emits one, so `observation.outcome == "cancelled" | "refused"` never fires
+    here. camel-quarkus' three refusals (seq 124, 138, 216) are `loop_decision`
+    events describing an execution that never happened — which is why those
+    three turns are the `None` outcomes counted above, not `refused` ones. The
+    refusal path is fenced in `tests/test_trajectory_reducer.py` against the
+    real `RefusalRecordPayload` shape instead, and this test exists so the gap
+    is written down rather than mistaken for coverage.
+    """
+    for directory in SESSION_DIRS.values():
+        events = (directory / "control_events.jsonl").read_text(encoding="utf-8")
+        assert '"kind":"refusal_record"' not in events
+        snap = build_trajectory(directory)
+        assert not [
+            t
+            for t in snap.turns
+            if t.observation and t.observation.outcome in ("refused", "cancelled")
+        ]
+
+
+def test_live_accumulation_says_the_same_lines_as_batch_replay(tmp_path):
+    """The batch-vs-follow fence, narrowed onto the derived lines.
+
+    `test_live_accumulation_equals_batch_replay` already compares the whole
+    document, so this one cannot fail while that one passes. It is here because
+    a whole-document equality is also satisfied by two documents in which every
+    new field is `None`, and that is precisely the failure this wiring is at
+    risk of: the fields are optional, and a fold that never fills them is equal
+    to another fold that never fills them.
+    """
+    for name, directory in SESSION_DIRS.items():
+        accumulated = _accumulated(directory, tmp_path)
+        batch = build_trajectory(directory)
+        assert [(t.turn_id, t.call and t.call.summary) for t in accumulated.turns] == [
+            (t.turn_id, t.call and t.call.summary) for t in batch.turns
+        ], name
+        assert [
+            (
+                t.turn_id,
+                t.observation and t.observation.outcome,
+                t.observation and t.observation.summary,
+            )
+            for t in accumulated.turns
+        ] == [
+            (
+                t.turn_id,
+                t.observation and t.observation.outcome,
+                t.observation and t.observation.summary,
+            )
+            for t in batch.turns
+        ], name
+        assert [
+            (p.name, p.validator_state, p.reason, p.key_results) for p in accumulated.phases
+        ] == [(p.name, p.validator_state, p.reason, p.key_results) for p in batch.phases], name
+        # And neither document is empty of the thing being compared.
+        assert sum(1 for t in accumulated.turns if t.call and t.call.summary) == sum(
+            CALLS_SUMMARISED_PER_TOOL[name].values()
+        )
+        assert all(p.validator_state and p.reason for p in accumulated.phases), name
