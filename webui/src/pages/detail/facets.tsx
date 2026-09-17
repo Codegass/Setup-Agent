@@ -2,6 +2,7 @@ import type { ExecutionSessionDetail, SubmitTaskResponse } from "@/api/types"
 import { isLiveSessionStatus } from "@/components/common/status"
 import { BuildFacet } from "@/components/session/BuildFacet"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
+import { ReceiptTable } from "@/components/session/ReceiptTable"
 import { LogsView } from "@/components/session/LogsView"
 import { ReportDoc } from "@/components/session/ReportDoc"
 import { TestFacet } from "@/components/session/TestFacet"
@@ -127,7 +128,20 @@ export function TabBody({ tabId, detail, onOpenFlow }: TabBodyProps) {
     case "ci":
       return detail.ciComparison ? <OfficialCITab comparison={detail.ciComparison} /> : null
     case "evidence":
-      return <EvidenceTimeline groups={detail.evidence} />
+      // Commands first, grouped artifacts under them — and the timeline's own
+      // empty state only where there are no groups AND the tab exists because
+      // of them. Three of six real sessions reach this tab on receipts alone,
+      // and used to be told "Evidence is not available for this session"
+      // beside a payload holding 78 recorded commands.
+      return (
+        <div className="space-y-4">
+          <ReceiptTable
+            caption="Every command this run dispatched."
+            receipts={detail.receipts ?? []}
+          />
+          {detail.evidence.length > 0 ? <EvidenceTimeline groups={detail.evidence} /> : null}
+        </div>
+      )
     case "logs":
       return <LogsView logs={detail.logs} />
     case "report":

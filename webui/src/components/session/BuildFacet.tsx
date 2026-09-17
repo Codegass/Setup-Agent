@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils"
 
 import { BuildDetailPage } from "./BuildDetailPage"
 import { ModuleBreakdownDialog } from "./ModuleBreakdownDialog"
+import { ReceiptTable } from "./ReceiptTable"
 
 function fmtNum(n?: number | null): string {
   return typeof n === "number" && Number.isFinite(n) ? n.toLocaleString() : "—"
@@ -134,6 +135,15 @@ export function BuildFacet({ detail }: { detail: ExecutionSessionDetail }) {
         <ConclusionCard build={detail.build} />
         <OutputsCard build={detail.build} />
       </div>
+      {/* Unfiltered on purpose. The plan narrowed this to `tool` in {maven,
+          gradle, bash, python}, which is the entire vocabulary the receipt
+          write gate accepts — all 1,181 archived receipts pass it — so the
+          filter read as a distinction and drew none. What each tab's list is
+          gets said in words instead. */}
+      <ReceiptTable
+        caption="Every command this run dispatched, with the toolchain it actually used."
+        receipts={detail.receipts ?? []}
+      />
       {hasModuleMetrics ? (
         <button
           className="font-mono text-[11px] text-status-running hover:underline"

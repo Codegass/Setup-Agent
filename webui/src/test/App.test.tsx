@@ -41,7 +41,10 @@ const jsonResponse = (payload: unknown) =>
 /** A result card the way `build_result_card` emits one: the seven rows, in
  *  order, each stating the run's own words. The tests that follow a refetch key
  *  off the setup row's headline, which is the band's first line. */
-const resultCard = (setupHeadline: string): ResultCard => ({
+const resultCard = (
+  setupHeadline: string,
+  testsHeadline = "320 executed · 312 passed · 8 failed · 0 errors · 0 skipped",
+): ResultCard => ({
   schemaVersion: 1,
   runId: "CC-3",
   verdict: "partial",
@@ -61,7 +64,7 @@ const resultCard = (setupHeadline: string): ResultCard => ({
       label: "Tests",
       status: "executed",
       tone: "attention",
-      headline: "320 executed · 312 passed · 8 failed · 0 errors · 0 skipped",
+      headline: testsHeadline,
     },
     { key: "coverage", label: "Coverage", status: "not collected", tone: "neutral", headline: "not collected" },
     { key: "ci", label: "Official CI", status: "not compared", tone: "neutral", headline: "not compared" },
@@ -465,7 +468,10 @@ describe("App", () => {
       status: "completed",
       duration: "2m 45s",
       outcome: "Setup completed after polling.",
-      resultCard: resultCard("5/5 phases · 33 turns"),
+      resultCard: resultCard(
+        "5/5 phases · 33 turns",
+        "430 executed · 430 passed · 0 failed · 0 errors · 0 skipped",
+      ),
       test: { state: "success", pass: 430, fail: 0, skip: 0, total: 430 },
     }
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
@@ -503,9 +509,12 @@ describe("App", () => {
     await new Promise((resolve) => setTimeout(resolve, 3200))
 
     expect(await screen.findByText("5/5 phases · 33 turns")).toBeInTheDocument()
-    // The Tests tab's sealed-run summary reflects the freshly polled totals.
+    // The Tests tab states the freshly polled card's own tests row — the same
+    // string the band above it states, not a second reading of the counts.
     fireEvent.click(screen.getByRole("button", { name: /^Tests/ }))
-    expect(screen.getByText(/test results: 430 passed/i)).toBeInTheDocument()
+    expect(
+      screen.getAllByText("430 executed · 430 passed · 0 failed · 0 errors · 0 skipped").length,
+    ).toBe(2)
   }, 8000)
 
   it("refreshes completed session details when late metrics arrive", async () => {

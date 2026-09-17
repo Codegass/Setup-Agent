@@ -1,6 +1,6 @@
 import { useState } from "react"
 
-import type { CardTone, ExecutionSessionDetail, ResultRow } from "@/api/types"
+import type { CardTone, ExecutionSessionDetail, ReceiptSummary, ResultRow } from "@/api/types"
 import { Badge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
 import { TestBar } from "@/components/common/TestBar"
@@ -9,7 +9,26 @@ import { formatRate, presentTestRun } from "@/evidencePresentation"
 import { EvidenceAccounting } from "./EvidenceAccounting"
 import { FailingCard } from "./FailingCard"
 import { ModuleBreakdownDialog } from "./ModuleBreakdownDialog"
+import { ReceiptTable } from "./ReceiptTable"
 import { TestDetailPage } from "./TestDetailPage"
+
+/**
+ * The commands that wrote test reports.
+ *
+ * `testsReported` alone — the plan's filter — is null on 955 of the 1,195
+ * archived receipts and on five of the six real sessions checked against a
+ * running API, including runs whose commands plainly wrote reports, so a tab
+ * filtered on it says "nothing was recorded" about a run that recorded 78
+ * commands. A command that wrote or rewrote a test report is the division a
+ * reader means.
+ */
+function wroteTestReports(receipt: ReceiptSummary): boolean {
+  return (
+    typeof receipt.testsReported === "number"
+    || receipt.reportsNew > 0
+    || receipt.reportsChanged > 0
+  )
+}
 
 const TONE_CLASS: Record<CardTone, string> = {
   success: "text-status-success",
@@ -91,6 +110,7 @@ export function TestFacet({ detail }: { detail: ExecutionSessionDetail }) {
   const moduleCount = s?.modulesTotal ?? detail.modules?.length ?? 0
   const failing = detail.test.failingNames ?? []
   const layers = detail.test.evidenceLayers
+  const testReceipts = (detail.receipts ?? []).filter(wroteTestReports)
   const detailLabel = layers
     ? single ? "View module test details →" : `View per-module test details (${moduleCount} modules) →`
     : single ? "View test details →" : `View per-module breakdown (${moduleCount} modules) →`
@@ -112,6 +132,11 @@ export function TestFacet({ detail }: { detail: ExecutionSessionDetail }) {
           Detailed module test metrics were not produced for this run.
         </p>
       )}
+      <ReceiptTable
+        caption="Commands that wrote test reports."
+        empty="No command in this run wrote a test report."
+        receipts={testReceipts}
+      />
       {layers ? (
         <EvidenceAccounting evidence={layers.evidence} layers={layers.tests} />
       ) : null}

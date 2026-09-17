@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest"
 
 import { TestFacet } from "./TestFacet"
@@ -204,5 +204,56 @@ describe("TestFacet", () => {
 
     expect(screen.getByText(/detailed module test metrics were not produced/i)).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: /view test details/i })).not.toBeInTheDocument()
+  })
+
+  it("lists the commands that wrote test reports, and only those", () => {
+    // `testsReported` alone was the plan's filter. It is null on 955 of the
+    // 1,195 archived receipts and on five of the six real sessions checked
+    // here — including runs whose commands plainly wrote test reports — so a
+    // tab filtered on it says "nothing was recorded" about a run that recorded
+    // 78 commands. A command that wrote a test report is the real division.
+    const withReceipts = {
+      ...igniteShape,
+      receipts: [
+        {
+          receiptId: "wrote-reports",
+          tool: "maven",
+          argv: "mvn --fail-at-end -Dmaven.test.failure.ignore=true test",
+          actualCwd: "/workspace/commons-cli",
+          exitCode: 0,
+          outcome: "completed",
+          toolchain: { executable: "mvn", version: "Apache Maven 3.9.9" },
+          jdkMajor: "8",
+          jdkVersion: null,
+          reportsNew: 47,
+          reportsChanged: 0,
+          testsReported: null,
+        },
+        {
+          receiptId: "compiled-only",
+          tool: "maven",
+          argv: "mvn --fail-at-end compile",
+          actualCwd: "/workspace/commons-cli",
+          exitCode: 0,
+          outcome: "completed",
+          toolchain: { executable: "mvn", version: "Apache Maven 3.9.9" },
+          jdkMajor: "8",
+          jdkVersion: null,
+          reportsNew: 0,
+          reportsChanged: 0,
+          testsReported: null,
+        },
+      ],
+    } as any
+
+    render(<TestFacet detail={withReceipts} />)
+    const table = screen.getByRole("table", { name: "Commands that wrote test reports." })
+    expect(within(table).getByText(/maven.test.failure.ignore/)).toBeInTheDocument()
+    expect(within(table).queryByText("mvn --fail-at-end compile")).not.toBeInTheDocument()
+  })
+
+  it("says what it found none of when no command wrote a test report", () => {
+    render(<TestFacet detail={igniteShape} />)
+    expect(screen.getByText("No command in this run wrote a test report.")).toBeInTheDocument()
   })
 })

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
@@ -72,6 +72,42 @@ const detail: ExecutionSessionDetail = {
   report: "ready",
   evidence: [],
   logs: [],
+}
+
+/** A run whose evidence groups are empty but whose commands are not — the
+ *  shape three of the six real sessions checked against a running API take.
+ *  The Evidence tab existed for them and said "Evidence is not available for
+ *  this session" while the payload carried 78 recorded commands. */
+const withReceipts: ExecutionSessionDetail = {
+  ...detail,
+  receipts: [
+    {
+      receiptId: "inv-maven-1-f006510e44c8-0001",
+      tool: "maven",
+      argv: "/opt/apache-maven-3.9.9/bin/mvn clean verify",
+      workingDirectory: "/workspace/gson",
+      actualCwd: "/workspace/gson",
+      exitCode: 0,
+      outcome: "completed",
+      lifecycleState: "finished",
+      toolchain: { executable: "/opt/apache-maven-3.9.9/bin/mvn", version: "Apache Maven 3.9.9" },
+      jdkMajor: "17",
+      jdkVersion: "17.0.20",
+      reportsNew: 138,
+      reportsChanged: 0,
+      testsReported: 4866,
+    },
+  ],
+  evidence: [
+    {
+      source: "Build evidence",
+      status: "success",
+      counts: "11 references",
+      time: "10:27",
+      summary: "Build outputs recorded by the run",
+      records: [],
+    },
+  ],
 }
 
 /** Every run the API serves a comparison for; the tab is where it is read. */
@@ -185,5 +221,35 @@ describe("DetailPane", () => {
     render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
     fireEvent.click(screen.getByRole("button", { name: /terminal/i }))
     expect(screen.getByRole("dialog", { name: /terminal/i })).toBeInTheDocument()
+  })
+
+  it("shows the commands above the evidence timeline on the Evidence tab", () => {
+    // Nothing in this repo renders `TabBody`, so a change to the Evidence case
+    // lands committed and unread. This mounts the pane and clicks the tab.
+    const { container } = render(
+      <DetailPane workspace={workspace} detail={withReceipts} {...handlers} />,
+    )
+    fireEvent.click(screen.getByRole("button", { name: /^Evidence/ }))
+
+    const table = screen.getByRole("table", { name: "Every command this run dispatched." })
+    expect(within(table).getByText("/opt/apache-maven-3.9.9/bin/mvn clean verify")).toBeInTheDocument()
+
+    const body = container.querySelector("main")?.textContent ?? ""
+    expect(body.indexOf("mvn clean verify")).toBeLessThan(body.indexOf("Build evidence"))
+  })
+
+  it("does not tell a run with recorded commands that it has no evidence", () => {
+    render(
+      <DetailPane
+        workspace={workspace}
+        detail={{ ...withReceipts, evidence: [] }}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole("button", { name: /^Evidence/ }))
+    expect(
+      screen.getByRole("table", { name: "Every command this run dispatched." }),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/Evidence is not available for this session/i)).not.toBeInTheDocument()
   })
 })
