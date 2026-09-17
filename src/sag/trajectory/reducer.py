@@ -1586,10 +1586,19 @@ def _as_utc(timestamp: str) -> datetime:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
 
 
+#: The public name for turn timing. A consumer that wants to say how long a
+#: turn took reads it from here rather than re-deriving it: two implementations
+#: of "seconds between two ledger stamps" is two chances to disagree about the
+#: same turn, and the mixed aware/naive handling above is the whole reason one
+#: of them would be wrong.
+elapsed = _elapsed
+
+
 __all__ = [
     "KNOWN_EVENT_KINDS",
     "UNKNOWN_PHASE",
     "DeltaAccumulator",
     "TrajectoryReducer",
+    "elapsed",
     "order_warnings",
 ]
