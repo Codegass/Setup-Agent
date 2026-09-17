@@ -48,3 +48,79 @@ def test_a_warning_is_an_immutable_statement_that_names_its_turn():
     assert len({hole, hole}) == 1  # hashable: a statement is held, or it is not
     with pytest.raises(Exception):
         hole.code = "something_else"
+
+
+def test_call_carries_an_optional_human_summary():
+    from sag.trajectory.schema import CallInfo
+
+    assert CallInfo(tool="build").summary is None
+    assert CallInfo(tool="build", summary="verify mvn clean verify").summary == (
+        "verify mvn clean verify"
+    )
+
+
+def test_a_summary_longer_than_the_cap_is_rejected():
+    import pytest
+    from pydantic import ValidationError
+
+    from sag.trajectory.schema import SUMMARY_MAX_CHARS, CallInfo
+
+    with pytest.raises(ValidationError):
+        CallInfo(tool="bash", summary="x" * (SUMMARY_MAX_CHARS + 1))
+
+
+def test_observation_states_how_the_call_came_out():
+    from sag.trajectory.schema import ObservationInfo
+
+    observation = ObservationInfo(outcome="failed", summary="exit 1 · enforcer")
+    assert observation.outcome == "failed"
+    assert observation.summary == "exit 1 · enforcer"
+    assert ObservationInfo().outcome is None
+
+
+def test_observation_outcome_is_a_closed_vocabulary():
+    import pytest
+    from pydantic import ValidationError
+
+    from sag.trajectory.schema import ObservationInfo
+
+    with pytest.raises(ValidationError):
+        ObservationInfo(outcome="probably fine")
+
+
+def test_phase_carries_what_its_gate_decided():
+    from sag.trajectory.schema import PhaseInfo
+
+    phase = PhaseInfo(
+        name="build",
+        termination="advance",
+        validator_state="green",
+        reason="JVM build execution validated",
+        key_results="Executed mvn clean verify",
+    )
+    assert phase.validator_state == "green"
+    assert PhaseInfo(name="build").reason is None
+
+
+def test_a_document_without_the_new_fields_still_validates():
+    from sag.trajectory.schema import Trajectory
+
+    document = Trajectory.model_validate(
+        {
+            "schema_version": 1,
+            "session": {"run_id": "r"},
+            "phases": [{"name": "build"}],
+            "turns": [
+                {
+                    "turn_id": 1,
+                    "phase": "build",
+                    "actor": "model",
+                    "call": {"tool": "build"},
+                    "observation": {"ref": "output_a"},
+                    "control_seq": [1],
+                }
+            ],
+        }
+    )
+    assert document.turns[0].call.summary is None
+    assert document.turns[0].observation.outcome is None

@@ -29,6 +29,15 @@ SCHEMA_VERSION = 1
 DETAIL_TIERS: tuple[str, ...] = ("summary", "full")
 DetailTier = Literal["summary", "full"]
 
+#: How long a one-line summary may be. Long enough for a Maven command, short
+#: enough that a turn stays one terminal row at 80 columns.
+SUMMARY_MAX_CHARS = 80
+#: A phase's key results are a paragraph the gate wrote, not a line.
+KEY_RESULTS_MAX_CHARS = 400
+
+ObservationOutcome = Literal["ok", "failed", "refused", "pending", "cancelled"]
+ValidatorState = Literal["green", "partial", "red", "unavailable"]
+
 #: Who moved. A model turn is one the model asked for; a controller turn is one
 #: the harness took on its own (forced actions, engine-generated gates).
 Actor = Literal["model", "controller"]
@@ -61,6 +70,10 @@ class CallInfo(_TrajectoryModel):
 
     tool: str
     params_ref: str | None = None
+    #: What this call asked for, in one line. Derived from the envelope's exact
+    #: params; `None` when the tool's shape is unknown to the summariser, never
+    #: an empty string, so "no summary" and "an empty summary" stay distinct.
+    summary: str | None = Field(default=None, max_length=SUMMARY_MAX_CHARS)
 
 
 class ObservationInfo(_TrajectoryModel):
@@ -78,6 +91,12 @@ class ObservationInfo(_TrajectoryModel):
     evidence_ref: str | None = None
     error_code: str | None = None
     failure_signature: str | None = None
+    #: How the call came out, as one of five words. `pending` is a dispatched
+    #: job with no terminal exit yet; `cancelled` is a call a batch break
+    #: stopped before it dispatched anything.
+    outcome: ObservationOutcome | None = None
+    #: What came back, in one line.
+    summary: str | None = Field(default=None, max_length=SUMMARY_MAX_CHARS)
 
 
 class GateInfo(_TrajectoryModel):
@@ -135,6 +154,12 @@ class PhaseInfo(_TrajectoryModel):
     name: str
     termination: str | None = None
     gates: list[GateInfo] = Field(default_factory=list)
+    #: What the validator observed when the phase closed.
+    validator_state: ValidatorState | None = None
+    #: Why the gate decided what it decided.
+    reason: str | None = None
+    #: What the phase reported it achieved, as the gate recorded it.
+    key_results: str | None = Field(default=None, max_length=KEY_RESULTS_MAX_CHARS)
 
 
 class Annotation(_TrajectoryModel):
@@ -241,6 +266,8 @@ class TrajectoryDelta(_TrajectoryModel):
 __all__ = [
     "SCHEMA_VERSION",
     "DETAIL_TIERS",
+    "SUMMARY_MAX_CHARS",
+    "KEY_RESULTS_MAX_CHARS",
     "Actor",
     "Annotation",
     "AnnotationKind",
@@ -248,12 +275,14 @@ __all__ = [
     "DetailTier",
     "GateInfo",
     "ObservationInfo",
+    "ObservationOutcome",
     "PhaseInfo",
     "SessionInfo",
     "TokenUsage",
     "Trajectory",
     "TrajectoryDelta",
     "Turn",
+    "ValidatorState",
     "Warning",
     "warning_order",
 ]
