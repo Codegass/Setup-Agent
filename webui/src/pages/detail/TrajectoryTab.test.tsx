@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { TrajectoryDocument, TrajectoryTurn } from "@/api/types"
 
-import { TimelineTab } from "./TimelineTab"
+import { TrajectoryTab } from "./TrajectoryTab"
 
 function turn(id: number, over: Partial<TrajectoryTurn> = {}): TrajectoryTurn {
   return {
@@ -43,7 +43,7 @@ async function settle(ms = 0) {
   })
 }
 
-describe("TimelineTab", () => {
+describe("TrajectoryTab", () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
@@ -56,7 +56,7 @@ describe("TimelineTab", () => {
       .spyOn(globalThis, "fetch")
       .mockImplementation(() => Promise.resolve(json(doc())))
 
-    render(<TimelineTab live={false} sessionId="S1" />)
+    render(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
 
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions/S1/trajectory?detail=summary")
@@ -72,7 +72,7 @@ describe("TimelineTab", () => {
         Promise.resolve(json(doc({ turns: [turn(2, { control_seq: [4, 5] })] }))),
       )
 
-    render(<TimelineTab live sessionId="S1" />)
+    render(<TrajectoryTab live sessionId="S1" />)
     await settle()
     await settle(5000)
 
@@ -120,7 +120,7 @@ describe("TimelineTab", () => {
         Promise.resolve(json(doc({ turns: [filled, turn(2, { control_seq: [7] })] }))),
       )
 
-    render(<TimelineTab live sessionId="S1" />)
+    render(<TrajectoryTab live sessionId="S1" />)
     await settle()
     await settle(5000)
 
@@ -138,7 +138,7 @@ describe("TimelineTab", () => {
       .spyOn(globalThis, "fetch")
       .mockImplementation(() => Promise.resolve(json(doc())))
 
-    render(<TimelineTab live={false} sessionId="S1" />)
+    render(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
     await settle(20000)
 
@@ -151,9 +151,9 @@ describe("TimelineTab", () => {
       .spyOn(globalThis, "fetch")
       .mockImplementation(() => Promise.resolve(json(doc())))
 
-    const view = render(<TimelineTab live sessionId="S1" />)
+    const view = render(<TrajectoryTab live sessionId="S1" />)
     await settle()
-    view.rerender(<TimelineTab live={false} sessionId="S1" />)
+    view.rerender(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
 
     expect(fetchMock).toHaveBeenLastCalledWith("/api/sessions/S1/trajectory?detail=summary")
@@ -184,14 +184,14 @@ describe("TimelineTab", () => {
       )
       .mockImplementation(() => Promise.resolve(json(billed)))
 
-    const view = render(<TimelineTab live sessionId="S1" />)
+    const view = render(<TrajectoryTab live sessionId="S1" />)
     await settle()
     // The heartbeat fires and does not answer.
     await settle(5000)
     expect(fetchMock).toHaveBeenCalledTimes(2)
 
     // The run stops while that poll is still out.
-    view.rerender(<TimelineTab live={false} sessionId="S1" />)
+    view.rerender(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
     expect(fetchMock).toHaveBeenCalledTimes(2)
 
@@ -223,7 +223,7 @@ describe("TimelineTab", () => {
       .mockImplementationOnce(() => Promise.resolve(json(ahead)))
       .mockImplementation(() => Promise.resolve(json(server)))
 
-    render(<TimelineTab live={false} sessionId="S1" />)
+    render(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
     expect(screen.getByTestId("turn-row-1")).toHaveTextContent("iter 4")
 
@@ -252,7 +252,7 @@ describe("TimelineTab", () => {
           : Promise.resolve(json(doc({ outputs: { output_1: "bash: mvn: not found" } }))),
       )
 
-    render(<TimelineTab live={false} sessionId="S1" />)
+    render(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
 
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
@@ -312,7 +312,7 @@ describe("TimelineTab", () => {
       return Promise.resolve(json(summaryReads > 1 ? fresh : asItStood))
     })
 
-    render(<TimelineTab live sessionId="S1" />)
+    render(<TrajectoryTab live sessionId="S1" />)
     await settle()
 
     // A row is expanded: the full tier is asked for, and does not answer yet.
@@ -349,7 +349,7 @@ describe("TimelineTab", () => {
       ),
     )
 
-    render(<TimelineTab live sessionId="S1" />)
+    render(<TrajectoryTab live sessionId="S1" />)
     await settle()
 
     expect(screen.getByText("missing_control_events")).toBeInTheDocument()
@@ -374,7 +374,7 @@ describe("TimelineTab", () => {
       ),
     )
 
-    render(<TimelineTab live={false} sessionId="S1" />)
+    render(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
 
     expect(screen.getByRole("img", { name: /model-response tokens per turn/i })).toBeInTheDocument()
@@ -391,7 +391,7 @@ describe("TimelineTab", () => {
       .mockImplementationOnce(() => Promise.resolve(json(doc())))
       .mockImplementation(() => new Promise<Response>(() => {}))
 
-    render(<TimelineTab live sessionId="S1" />)
+    render(<TrajectoryTab live sessionId="S1" />)
     await settle()
     await settle(5000)
     await settle(5000)
@@ -408,7 +408,7 @@ describe("TimelineTab", () => {
       .mockImplementationOnce(() => Promise.resolve(json(doc())))
       .mockImplementation(() => Promise.reject(new Error("connection reset")))
 
-    render(<TimelineTab live sessionId="S1" />)
+    render(<TrajectoryTab live sessionId="S1" />)
     await settle()
     expect(screen.getByText(/following/i)).toBeInTheDocument()
 
@@ -440,7 +440,7 @@ describe("TimelineTab", () => {
       ),
     )
 
-    render(<TimelineTab live={false} sessionId="S1" />)
+    render(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
 
     expect(screen.getByText(/cannot be attributed to a run/)).toBeInTheDocument()
@@ -456,7 +456,7 @@ describe("TimelineTab", () => {
       )
       .mockImplementation(() => Promise.resolve(json(doc())))
 
-    render(<TimelineTab live={false} sessionId="S1" />)
+    render(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
 
     expect(screen.getByText(/404 Not Found/)).toBeInTheDocument()

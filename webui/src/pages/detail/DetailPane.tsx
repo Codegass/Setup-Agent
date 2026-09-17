@@ -133,7 +133,9 @@ export function DetailPane({
         <div className="mx-auto max-w-[1000px]">
           <TabBody
             detail={detail}
-            onOpenFlow={() => setActive("flow")}
+            onOpenFlow={
+              tabIds.includes("trajectory") ? () => setActive("trajectory") : undefined
+            }
             onSubmitTask={onSubmitTask}
             tabId={active}
           />

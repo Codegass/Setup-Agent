@@ -30,9 +30,9 @@ const ctx: ContextTrace = {
 }
 
 describe("buildDetailFacets", () => {
-  it("returns the seven facets in order", () => {
+  it("returns the six facets in order", () => {
     const ids = buildDetailFacets(detail()).map((f) => f.id)
-    expect(ids).toEqual(["build", "test", "flow", "evidence", "files", "report", "logs"])
+    expect(ids).toEqual(["build", "test", "evidence", "files", "report", "logs"])
   })
 
   it("surfaces a red test-fail count and evidence/files counts, omitting zero counts", () => {
@@ -69,28 +69,24 @@ describe("buildDetailFacets", () => {
 })
 
 describe("buildDetailTabs", () => {
-  it("puts overview first and includes flow when context is present", () => {
-    const tabs = buildDetailTabs(detail({ context: ctx }))
+  it("puts overview first, then the run itself", () => {
+    const tabs = buildDetailTabs(detail())
     expect(tabs[0].id).toBe("overview")
-    expect(tabs.map((t) => t.id)).toContain("flow")
+    expect(tabs.map((t) => t.id).slice(0, 2)).toEqual(["overview", "trajectory"])
   })
 
-  it("puts the timeline right after overview, for every session that ran", () => {
-    expect(buildDetailTabs(detail()).map((t) => t.id).slice(0, 2)).toEqual([
-      "overview",
-      "timeline",
-    ])
-    // Unlike flow, it does not wait on a context trace: the timeline is derived
-    // from the control ledger, which every run writes.
-    expect(buildDetailTabs(detail({ context: ctx })).map((t) => t.id)).toContain("timeline")
+  it("keeps the trajectory tab for every session that ran", () => {
+    // It does not wait on a context trace: the trajectory is derived from the
+    // control ledger, which every run writes.
+    expect(buildDetailTabs(detail({ context: ctx })).map((t) => t.id)).toContain("trajectory")
   })
 
-  it("omits the timeline for a demo session, which never ran and wrote no ledger", () => {
+  it("omits the trajectory for a demo session, which never ran and wrote no ledger", () => {
     // `sag ui --demo` fabricates every read model; there is no session
     // directory behind one, which is why the builder refuses to name one. The
     // tab offered a reader a panel that could only ever say "unavailable".
     const tabs = buildDetailTabs(detail({ demo: true })).map((t) => t.id)
-    expect(tabs).not.toContain("timeline")
+    expect(tabs).not.toContain("trajectory")
     expect(tabs[0]).toBe("overview")
   })
 
@@ -108,7 +104,6 @@ describe("buildDetailTabs", () => {
 
   it("omits tabs whose data is absent", () => {
     const tabs = buildDetailTabs(detail()).map((t) => t.id)
-    expect(tabs).not.toContain("flow")
     expect(tabs).not.toContain("files")
     expect(tabs).not.toContain("evidence")
     expect(tabs).not.toContain("logs")

@@ -16,9 +16,9 @@ function message(error: unknown): string {
 }
 
 /**
- * The Timeline tab: one session's trajectory, live.
+ * The Trajectory tab: one session's trajectory, live.
  *
- * The timeline document is fed by `GET /api/sessions/{id}/trajectory`, one
+ * The trajectory document is fed by `GET /api/sessions/{id}/trajectory`, one
  * derivation shared with the CLI and golden fences (spec §1/§4). Exact call
  * parameters are resolved lazily from the envelope endpoint when a row opens.
  * The document itself has two reads, with different jobs:
@@ -47,7 +47,7 @@ function message(error: unknown): string {
  * state withdrew, and never returns a turn to the half-stated row it was
  * between its envelope and its result.
  *
- * When the run stops, the timeline reads it whole once more: the token ledger is
+ * When the run stops, the tab reads it whole once more: the token ledger is
  * exported at loop exit, so the last turns' bills land with no control event to
  * carry them, and no watermark cut can ask for a change the ledger never stated.
  * That read WAITS for whatever is on the wire rather than skipping on it — it is
@@ -59,7 +59,7 @@ function message(error: unknown): string {
  * not order: a person asking for the server's whole current answer is not one of
  * the two reads that race over this document.
  */
-export function TimelineTab({ sessionId, live }: { sessionId: string; live: boolean }) {
+export function TrajectoryTab({ sessionId, live }: { sessionId: string; live: boolean }) {
   const [doc, setDoc] = useState<TrajectoryDocument | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)

@@ -137,7 +137,9 @@ describe("TrajectoryTimeline", () => {
     expect(model).toHaveAttribute("data-actor", "model")
     expect(controller).toHaveAttribute("data-actor", "controller")
     expect(model.className).not.toBe(controller.className)
-    expect(within(controller).getByText("controller")).toBeInTheDocument()
+    // The row says who acted in the words the terminal uses, not the ledger's.
+    expect(within(controller).getByText("engine")).toBeInTheDocument()
+    expect(within(controller).queryByText("controller")).not.toBeInTheDocument()
   })
 
   it("badges the error code, the failure signature and the recurrence count", () => {
@@ -346,6 +348,48 @@ describe("TrajectoryTimeline", () => {
 
     const row = screen.getByTestId("turn-row-2")
     expect(within(row).getByText("missing_loop_decision")).toBeInTheDocument()
+  })
+
+  it("shows what each phase's checks decided, and what it reported", () => {
+    render(
+      <TrajectoryTimeline
+        doc={{
+          ...doc,
+          phases: [
+            {
+              name: "build",
+              termination: "advance",
+              gates: [{ word: "success" }],
+              validator_state: "green",
+              reason: "JVM build execution validated",
+              key_results: "Executed mvn clean verify in /workspace/commons-cli",
+            },
+          ],
+          turns: [doc.turns[0]],
+          annotations: [],
+          warnings: [],
+        }}
+      />,
+    )
+
+    const band = screen.getByRole("group", { name: /phase build/i })
+    expect(within(band).getByText(/green/)).toBeInTheDocument()
+    expect(within(band).getByText(/JVM build execution validated/)).toBeInTheDocument()
+
+    // The phase's own report is one click away rather than filling the header.
+    fireEvent.click(within(band).getByText("What this phase reported"))
+    expect(
+      within(band).getByText("Executed mvn clean verify in /workspace/commons-cli"),
+    ).toBeInTheDocument()
+  })
+
+  it("states nothing about checks a phase segment did not record", () => {
+    // `doc`'s own build segment carries no validator state, reason or report.
+    render(<TrajectoryTimeline doc={doc} />)
+
+    const band = screen.getByRole("group", { name: /phase build/i })
+    expect(within(band).queryByText(/checks/i)).not.toBeInTheDocument()
+    expect(within(band).queryByText("What this phase reported")).not.toBeInTheDocument()
   })
 
   it("says the run has no turns yet rather than drawing an empty frame", () => {

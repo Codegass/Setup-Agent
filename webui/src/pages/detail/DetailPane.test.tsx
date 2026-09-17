@@ -115,18 +115,8 @@ describe("DetailPane", () => {
   })
 
   it("honors initialFacet by opening that tab first", () => {
-    const withContext: ExecutionSessionDetail = {
-      ...detail,
-      context: {
-        trunk: { state: "completed", goal: "Set up the project", summary: "", progress: { done: 1, total: 1 } },
-        phases: [],
-        debug: {},
-      },
-    }
-    render(
-      <DetailPane workspace={workspace} detail={withContext} initialFacet="flow" {...handlers} />,
-    )
-    expect(screen.getByRole("button", { name: /^Flow/ })).toHaveAttribute("aria-current", "true")
+    render(<DetailPane workspace={workspace} detail={detail} initialFacet="tests" {...handlers} />)
+    expect(screen.getByRole("button", { name: /^Tests/ })).toHaveAttribute("aria-current", "true")
     expect(screen.getByRole("button", { name: /^Overview/ })).toHaveAttribute("aria-current", "false")
   })
 

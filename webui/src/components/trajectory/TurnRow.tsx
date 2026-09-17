@@ -5,6 +5,7 @@ import { fetchTrajectoryEnvelope } from "@/api/client"
 import type {
   TrajectoryAnnotation,
   TrajectoryEnvelope,
+  TrajectoryObservation,
   TrajectoryPhase,
   TrajectoryTurn,
   TrajectoryWarning,
@@ -49,6 +50,16 @@ function gateTone(word: string): string {
     return "border-status-failed-border bg-status-failed-soft text-status-failed"
   }
   return "border-status-idle-border bg-status-idle-soft text-status-idle"
+}
+
+/** How a call came out, toned the way the rest of the app tones an outcome.
+ *  The word itself is the run's — this only chooses a colour for it. */
+const OUTCOME_CHIP: Record<NonNullable<TrajectoryObservation["outcome"]>, string> = {
+  ok: "bg-status-success-soft text-status-success",
+  failed: "bg-status-failed-soft text-status-failed",
+  refused: "bg-status-attention-soft text-status-attention",
+  cancelled: "bg-status-attention-soft text-status-attention",
+  pending: "bg-status-running-soft text-status-running",
 }
 
 function durationLabel(turn: TrajectoryTurn): string | null {
@@ -229,6 +240,10 @@ export function TurnRow({
           <span className="font-mono text-[12px] font-semibold text-foreground">
             {`Turn ${turn.turn_id}`}
           </span>
+          {/* The harness taking a turn on its own is called what the terminal
+              calls it. "controller" is the ledger's word for the same actor;
+              a reader who has never read the ledger should not have to learn
+              it to see who acted. */}
           <span
             className={cn(
               "rounded-full px-2 py-0.5 text-[10.5px] font-semibold uppercase tracking-[0.06em]",
@@ -237,7 +252,7 @@ export function TurnRow({
                 : "bg-accent text-muted-foreground",
             )}
           >
-            {turn.actor}
+            {controller ? "engine" : turn.actor}
           </span>
           {turn.call ? (
             <span className="truncate font-mono text-[12px] text-foreground">
@@ -246,7 +261,35 @@ export function TurnRow({
           ) : (
             <span className="truncate text-[12px] italic text-muted-foreground">no call</span>
           )}
+          {/* What the call asked for, in the run's own line. A call the run
+              wrote no line for shows its tool name and nothing more — there is
+              no sentence to invent. */}
+          {turn.call?.summary ? (
+            <span className="min-w-0 flex-1 truncate text-[12px] text-foreground">
+              {turn.call.summary}
+            </span>
+          ) : null}
         </button>
+
+        {turn.observation?.outcome || turn.observation?.summary ? (
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            {turn.observation.outcome ? (
+              <span
+                className={cn(
+                  "shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold",
+                  OUTCOME_CHIP[turn.observation.outcome],
+                )}
+              >
+                {turn.observation.outcome}
+              </span>
+            ) : null}
+            {turn.observation.summary ? (
+              <span className="min-w-0 truncate text-[12px] text-muted-foreground">
+                {turn.observation.summary}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
 
         <div className="flex flex-wrap items-center gap-1.5">
           {/* Where the run BLED, in the ledger's own words. A mark is a fact

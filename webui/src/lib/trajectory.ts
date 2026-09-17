@@ -123,6 +123,15 @@ export interface PhaseBand {
   termination: string | null
   /** The gates decided inside THIS visit — never another visit's. */
   gates: TrajectoryGate[]
+  /** How this visit's checks came out, per the segment the reducer stated for
+   *  it. `null` when the segment recorded none, which is not the same as
+   *  "unavailable" — that is a state the run itself delivered. */
+  validatorState: TrajectoryPhase["validator_state"] | null
+  /** The phase's own word for why it ended that way; `null` when it gave none. */
+  reason: string | null
+  /** What the phase reported it achieved, verbatim; `null` when it reported
+   *  nothing. */
+  keyResults: string | null
   turns: TrajectoryTurn[]
 }
 
@@ -186,6 +195,9 @@ export function bandTurns(doc: TrajectoryDocument): PhaseBand[] {
       ordinal,
       termination: segment?.termination ?? null,
       gates: segment?.gates ?? [],
+      validatorState: segment?.validator_state ?? null,
+      reason: segment?.reason ?? null,
+      keyResults: segment?.key_results ?? null,
       turns: [turn],
     })
   }

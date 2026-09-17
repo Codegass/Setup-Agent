@@ -1,21 +1,19 @@
-import { Activity, Box, FileText, Layers, Sparkles, Terminal } from "lucide-react"
+import { Activity, Box, FileText, Sparkles, Terminal } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
 
 import type { ExecutionSessionDetail, SubmitTaskResponse, Tone } from "@/api/types"
 import { isLiveSessionStatus } from "@/components/common/status"
 import { BuildFacet } from "@/components/session/BuildFacet"
-import { ContextTrace } from "@/components/session/ContextTrace"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
 import { FilesDigest } from "@/components/session/FilesDigest"
 import { LogsView } from "@/components/session/LogsView"
 import { ReportDoc } from "@/components/session/ReportDoc"
 import { TestFacet } from "@/components/session/TestFacet"
 
-import { FlowTab } from "./FlowTab"
 import { OverviewTab } from "./OverviewTab"
-import { TimelineTab } from "./TimelineTab"
+import { TrajectoryTab } from "./TrajectoryTab"
 
-export type FacetId = "build" | "test" | "flow" | "evidence" | "files" | "report" | "logs"
+export type FacetId = "build" | "test" | "evidence" | "files" | "report" | "logs"
 
 export interface FacetMeta {
   id: FacetId
@@ -40,7 +38,6 @@ export function buildDetailFacets(d: ExecutionSessionDetail): FacetMeta[] {
   return [
     { id: "build", label: "Build", icon: Box, count: null, countTone: "neutral" },
     { id: "test", label: "Test", icon: Activity, count: testIssues(d), countTone: "red" },
-    { id: "flow", label: "Flow", icon: Layers, count: null, countTone: "neutral" },
     { id: "evidence", label: "Evidence", icon: Sparkles, count: nonZero(d.evidence.length), countTone: "neutral" },
     { id: "files", label: "Files", icon: FileText, count: nonZero(d.files?.items.length), countTone: "neutral" },
     { id: "report", label: "Report", icon: FileText, count: null, countTone: "neutral" },
@@ -63,12 +60,6 @@ export function FacetBody({ id, detail }: { id: FacetId; detail: ExecutionSessio
       return <BuildFacet detail={detail} />
     case "test":
       return <TestFacet detail={detail} />
-    case "flow":
-      return detail.context ? (
-        <ContextTrace ctx={detail.context} />
-      ) : (
-        <Empty label="Context trace unavailable for this session." />
-      )
     case "evidence":
       return <EvidenceTimeline groups={detail.evidence} />
     case "files":
@@ -113,7 +104,7 @@ export interface TabMeta {
  * data exists (mirroring `buildDetailFacets` gating). Order matches the design template.
  */
 export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
-  // Timeline leads the panels because it is the run itself, turn by turn, and
+  // Trajectory leads the panels because it is the run itself, turn by turn, and
   // for a real session it is never gated on data being present: it derives from
   // the control ledger every run writes, and a run with no ledger YET says so
   // in its own words. A demo session is the one case where there is no ledger
@@ -122,11 +113,7 @@ export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
   // not offered rather than left to answer "unavailable" forever.
   const tabs: TabMeta[] = [{ id: "overview", label: "Overview" }]
   if (!d.demo) {
-    tabs.push({ id: "timeline", label: "Timeline" })
-  }
-
-  if (d.context) {
-    tabs.push({ id: "flow", label: "Flow" })
+    tabs.push({ id: "trajectory", label: "Trajectory" })
   }
 
   const failing = testIssues(d)
@@ -159,7 +146,8 @@ export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
 export interface TabBodyProps {
   tabId: TabId
   detail: ExecutionSessionDetail
-  /** Used by the Overview goal button to jump into the Flow tab. */
+  /** Used by the Overview goal button to jump into the Trajectory tab. Omitted
+   *  when this run has no such tab, so the button is not offered at all. */
   onOpenFlow?: () => void
   onSubmitTask?: (
     workspaceId: string,
@@ -169,18 +157,16 @@ export interface TabBodyProps {
 }
 
 /**
- * Renders the panel body for a tab. `overview`/`flow` use the dedicated OverviewTab/FlowTab
- * panels; the rest delegate to the existing session renderers. `onOpenFlow` lets the Overview
- * goal button jump into the Flow tab.
+ * Renders the panel body for a tab. `overview` and `trajectory` use the dedicated
+ * OverviewTab/TrajectoryTab panels; the rest delegate to the existing session
+ * renderers. `onOpenFlow` lets the Overview goal button jump into Trajectory.
  */
 export function TabBody({ tabId, detail, onOpenFlow }: TabBodyProps) {
   switch (tabId) {
     case "overview":
-      return <OverviewTab detail={detail} onOpenFlow={onOpenFlow ?? (() => {})} />
-    case "timeline":
-      return <TimelineTab live={isLiveSessionStatus(detail.status)} sessionId={detail.id} />
-    case "flow":
-      return <FlowTab detail={detail} />
+      return <OverviewTab detail={detail} onOpenFlow={onOpenFlow} />
+    case "trajectory":
+      return <TrajectoryTab live={isLiveSessionStatus(detail.status)} sessionId={detail.id} />
     case "tests":
       return <TestFacet detail={detail} />
     case "build":

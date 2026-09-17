@@ -46,8 +46,8 @@ function Tile({
 }
 
 /**
- * Overview tab: the always-visible agent goal button (jumps to Flow), build and
- * test summaries, the per-module overview table,
+ * Overview tab: the always-visible agent goal button (jumps to Trajectory),
+ * build and test summaries, the per-module overview table,
  * and the "needs attention" card. Markup/styling mirrors WorkbenchDetail.dc.html
  * lines 100–200 (the Overview block in the AFTER template).
  */
@@ -56,7 +56,10 @@ export function OverviewTab({
   onOpenFlow,
 }: {
   detail: ExecutionSessionDetail
-  onOpenFlow: () => void
+  /** Opens the tab that shows the run turn by turn. Absent when this run has
+   *  no such tab — the goal is then stated rather than offered as a button
+   *  that would go nowhere. */
+  onOpenFlow?: () => void
 }) {
   const test = detail.test
   const ms = detail.moduleSummary
@@ -89,16 +92,24 @@ export function OverviewTab({
   return (
     <div>
       {goal ? (
-        <button
-          type="button"
-          onClick={onOpenFlow}
-          className="mb-3 flex w-full items-center gap-3 rounded-[10px] border border-border bg-card px-4 py-2.5 text-left"
-        >
-          <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground">Goal</span>
-          <span className="min-w-0 flex-1 truncate text-[13px] leading-snug text-foreground">{goal}</span>
-          {progress ? <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{progress}</span> : null}
-          <span className="shrink-0 text-[12px] font-semibold text-primary">View flow →</span>
-        </button>
+        onOpenFlow ? (
+          <button
+            type="button"
+            onClick={onOpenFlow}
+            className="mb-3 flex w-full items-center gap-3 rounded-[10px] border border-border bg-card px-4 py-2.5 text-left"
+          >
+            <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground">Goal</span>
+            <span className="min-w-0 flex-1 truncate text-[13px] leading-snug text-foreground">{goal}</span>
+            {progress ? <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{progress}</span> : null}
+            <span className="shrink-0 text-[12px] font-semibold text-primary">View the trajectory →</span>
+          </button>
+        ) : (
+          <div className="mb-3 flex w-full items-center gap-3 rounded-[10px] border border-border bg-card px-4 py-2.5 text-left">
+            <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground">Goal</span>
+            <span className="min-w-0 flex-1 truncate text-[13px] leading-snug text-foreground">{goal}</span>
+            {progress ? <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{progress}</span> : null}
+          </div>
+        )
       ) : null}
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

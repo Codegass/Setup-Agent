@@ -63,6 +63,19 @@ export function TrajectoryTimeline({
                 {`${band.gates.length} gate${band.gates.length === 1 ? "" : "s"}`}
               </span>
             ) : null}
+            {/* How the phase's checks came out, and the phase's own word for
+                why. A segment that recorded neither shows neither — a band
+                never fills in a state or a reason the run did not state. */}
+            {band.validatorState ? (
+              <span className="text-[11px] text-muted-foreground">
+                {`checks ${band.validatorState}`}
+              </span>
+            ) : null}
+            {band.reason ? (
+              <span className="min-w-0 truncate text-[11px] text-muted-foreground">
+                {band.reason}
+              </span>
+            ) : null}
             {band.termination ? (
               <span
                 className={cn(
@@ -74,6 +87,17 @@ export function TrajectoryTimeline({
               </span>
             ) : null}
           </div>
+
+          {band.keyResults ? (
+            <details className="border-b border-border px-3 py-1.5">
+              <summary className="cursor-pointer text-[11px] text-muted-foreground">
+                What this phase reported
+              </summary>
+              <p className="mt-1 whitespace-pre-wrap text-[11.5px] text-foreground">
+                {band.keyResults}
+              </p>
+            </details>
+          ) : null}
 
           <div className="space-y-1.5 p-2">
             {band.turns.map((turn) => (

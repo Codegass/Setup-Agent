@@ -148,8 +148,16 @@ describe("OverviewTab", () => {
   it("invokes onOpenFlow when the goal button is clicked", () => {
     const onOpenFlow = vi.fn()
     render(<OverviewTab detail={makeDetail()} onOpenFlow={onOpenFlow} />)
-    fireEvent.click(screen.getByRole("button", { name: /view flow/i }))
+    fireEvent.click(screen.getByRole("button", { name: /view the trajectory/i }))
     expect(onOpenFlow).toHaveBeenCalledTimes(1)
+  })
+
+  it("states the goal without offering a jump when there is no tab to jump to", () => {
+    // A demo session carries a goal and no trajectory, so the pane hands no
+    // handler down. The goal is still shown; only the affordance is withheld.
+    render(<OverviewTab detail={makeDetail()} />)
+    expect(screen.queryByRole("button", { name: /view the trajectory/i })).not.toBeInTheDocument()
+    expect(screen.getByText("Goal")).toBeInTheDocument()
   })
 
   it("shows the Commons CLI source and receipt outcome accounting", () => {
