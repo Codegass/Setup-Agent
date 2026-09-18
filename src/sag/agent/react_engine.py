@@ -2950,6 +2950,7 @@ class ReActEngine:
                 envelope_ref=envelope_id,
                 observation_ref=self._delivered_observation_ref(observation_step),
                 iteration=getattr(self, "current_iteration", None),
+                tool=tool,
             )
             return True
         finally:
@@ -6664,13 +6665,51 @@ class ReActEngine:
         claimed.add(iteration)
         return row.get("prompt_tokens"), row.get("completion_tokens")
 
+    def _advisor_bill(self, iteration: Optional[int]) -> tuple[Optional[int], Optional[int]]:
+        """What the ADVISOR's own call cost on this iteration, joined in process.
+
+        The engine is holding this number when it seals the consult's turn: the
+        advisor has already answered, and `react_llm._track_advisor_usage` put
+        its row in the tracker before the tool result came back. Reading it here
+        is what puts the advisor's spend in the control ledger, which is the
+        artifact a live reader meets first — `token_usage.csv` is not written
+        until the loop exits.
+
+        Every row the tracker writes for the advisor is counted, whatever it
+        calls the kind: a plain consult is `advisor` and the packing call a long
+        consult needs is `advisor_compression`, and matching the one word would
+        drop the second the day it appears.
+
+        One row, one turn, on the model bill's rule: the first consult of an
+        iteration keeps it and a second carries none, because copying it would
+        invent spend the run was never charged.
+        """
+        if iteration is None:
+            return None, None
+        claimed = getattr(self, "_advisor_bills_claimed", None)
+        if claimed is None:
+            claimed = set()
+            self._advisor_bills_claimed = claimed
+        if iteration in claimed:
+            return None, None
+        records = getattr(getattr(self, "token_tracker", None), "token_records", None) or ()
+        row = next(
+            (
+                record
+                for record in records
+                if str(record.get("type") or "").startswith("advisor")
+                and record.get("iteration") == iteration
+            ),
+            None,
+        )
+        if row is None:
+            return None, None
+        claimed.add(iteration)
+        return row.get("prompt_tokens"), row.get("completion_tokens")
+
     @staticmethod
-    def _billed(
-        payload: TurnRecordPayload,
-        tokens_in: Optional[int],
-        tokens_out: Optional[int],
-    ) -> TurnRecordPayload:
-        """Join the bill onto the record — through the record's own constraints.
+    def _billed(payload: TurnRecordPayload, **bills: Optional[int]) -> TurnRecordPayload:
+        """Join a bill onto the record — through the record's own constraints.
 
         The bill is known only after the payload is built, and `model_copy`
         does not validate: `update=` writes what it is handed straight past
@@ -6683,17 +6722,11 @@ class ReActEngine:
         sequence (§2.2 rule 5); a record with no tokens on it is a record.
         """
         try:
-            return TurnRecordPayload.model_validate(
-                {
-                    **payload.model_dump(mode="json"),
-                    "tokens_in": tokens_in,
-                    "tokens_out": tokens_out,
-                }
-            )
+            return TurnRecordPayload.model_validate({**payload.model_dump(mode="json"), **bills})
         except Exception as exc:  # observability never ends a run
+            stated = ", ".join(f"{name}={value}" for name, value in bills.items())
             logger.warning(
-                f"turn record {payload.turn_id} sealed without its bill "
-                f"({tokens_in}/{tokens_out}): {exc}"
+                f"turn record {payload.turn_id} sealed without its bill ({stated}): {exc}"
             )
             return payload
 
@@ -6708,6 +6741,7 @@ class ReActEngine:
         gate_decision_id: Optional[str] = None,
         iteration: Optional[int] = None,
         window_digest: Optional[WindowDigestPayload] = None,
+        tool: Optional[str] = None,
     ) -> None:
         """Seal one turn through the same publication path as every other event.
 
@@ -6716,6 +6750,11 @@ class ReActEngine:
         one failure this layer must never cause. A record that does not appear
         becomes a hole the trajectory states as a warning (spec §3), which is
         exactly what a hole is supposed to look like.
+
+        `tool` names the call this turn made, and the only thing it decides is
+        whether the advisor's own bill belongs here. It is not written to the
+        record: the envelope already says which tool ran, and a second copy of
+        that fact could disagree with the first.
         """
         sink = getattr(self, "control_event_sink", None)
         if sink is None:
@@ -6748,7 +6787,16 @@ class ReActEngine:
                 t1=t1,
             )
             if actor == "model":
-                payload = self._billed(payload, *self._turn_bill(iteration))
+                tokens_in, tokens_out = self._turn_bill(iteration)
+                payload = self._billed(payload, tokens_in=tokens_in, tokens_out=tokens_out)
+            # The ADVISOR's bill follows the CALL, not the actor: the harness
+            # forces most consults, and the advisor spends the same tokens
+            # whether the model asked for one or the loop did.
+            if tool == "advisor":
+                advisor_in, advisor_out = self._advisor_bill(iteration)
+                payload = self._billed(
+                    payload, advisor_tokens_in=advisor_in, advisor_tokens_out=advisor_out
+                )
             self._emit_control_event("turn_record", payload.model_dump(mode="json"))
         except Exception as exc:  # observability never ends a run
             logger.warning(f"turn record {turn_id} was not sealed: {exc}")
@@ -7992,6 +8040,7 @@ class ReActEngine:
             envelope_ref=envelope_id,
             observation_ref=self._delivered_observation_ref(observation_step),
             iteration=getattr(self, "current_iteration", None),
+            tool="advisor",
         )
 
     def _advisor_messages(self) -> List[Dict[str, str]]:
@@ -8807,6 +8856,7 @@ class ReActEngine:
             observation_ref=self._delivered_observation_ref(observation_step),
             gate_decision_id=self._claim_turn_gate(gate_before_turn),
             iteration=getattr(self, "current_iteration", None),
+            tool=call.name,
         )
 
         # Log tool result in verbose mode

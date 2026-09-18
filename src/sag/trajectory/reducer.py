@@ -207,6 +207,8 @@ class _TurnState:
     window_ref: str | None = None
     window_components: list[str] | None = None
     tokens: TokenUsage | None = None
+    #: The advisor's own bill, when this turn consulted it.
+    advisor_tokens: TokenUsage | None = None
     t0: str | None = None
     t1: str | None = None
     control_seq: list[int] = field(default_factory=list)
@@ -258,6 +260,7 @@ class _TurnState:
             observation=self.observation,
             gate=self.gate,
             tokens=self.tokens,
+            advisor_tokens=self.advisor_tokens,
             t0=self.t0,
             t1=self.t1,
             control_seq=list(self.control_seq),
@@ -830,6 +833,12 @@ class TrajectoryReducer:
         tokens_out = payload.get("tokens_out")
         if isinstance(tokens_in, int) and isinstance(tokens_out, int):
             turn.tokens = TokenUsage(input=tokens_in, output=tokens_out)
+        # The advisor's own call, on the turn that consulted it — read beside
+        # the model's bill and never added to it.
+        advisor_in = payload.get("advisor_tokens_in")
+        advisor_out = payload.get("advisor_tokens_out")
+        if isinstance(advisor_in, int) and isinstance(advisor_out, int):
+            turn.advisor_tokens = TokenUsage(input=advisor_in, output=advisor_out)
         delivered = _text(payload.get("observation_ref"))
         if delivered:
             turn.observation, displaced = _delivered_observation(turn.observation, delivered)

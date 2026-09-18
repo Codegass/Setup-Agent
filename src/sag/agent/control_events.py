@@ -1097,7 +1097,8 @@ class TurnRecordPayload(_StrictPayload):
 
     Absence is stated, never implied: a turn whose call was refused before an
     envelope existed carries `envelope_ref: None`, a turn nobody was billed for
-    carries no tokens, and a turn taken before this run rendered anything at
+    carries no tokens, a turn that consulted nobody carries no advisor tokens,
+    and a turn taken before this run rendered anything at
     all — a controller move ahead of the first model window — carries
     `window_digest: None`. Hashing the empty string instead would have put a
     64-hex prompt identity on the record that resolves to nothing, reads like
@@ -1115,6 +1116,13 @@ class TurnRecordPayload(_StrictPayload):
     gate_decision_id: str | None = Field(default=None, min_length=1)
     tokens_in: int | None = Field(default=None, ge=0)
     tokens_out: int | None = Field(default=None, ge=0)
+    #: What the ADVISOR's own model call cost, on a turn that consulted it.
+    #: Never folded into `tokens_in`/`tokens_out`: those are what the run paid
+    #: for the executor's response, and these are what it paid a second model
+    #: for a second answer. A turn that asked for advice was charged both, and
+    #: one added number would say the run spent it all in one place.
+    advisor_tokens_in: int | None = Field(default=None, ge=0)
+    advisor_tokens_out: int | None = Field(default=None, ge=0)
     t0: str = Field(min_length=1)
     t1: str = Field(min_length=1)
 

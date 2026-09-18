@@ -120,6 +120,22 @@ def test_an_invented_field_is_refused():
         TurnRecordPayload.model_validate(_payload(invented_field=1))
 
 
+def test_a_record_states_the_two_bills_separately_and_never_their_sum():
+    """Two spenders, two pairs of fields. The advisor's is optional and absent
+    on every turn that consulted nobody, which is most of them."""
+    sealed = ControlEvent(
+        sequence=41,
+        kind="turn_record",
+        payload=_payload(advisor_tokens_in=2575, advisor_tokens_out=138),
+    ).typed_payload
+
+    assert (sealed.tokens_in, sealed.tokens_out) == (4134, 211)
+    assert (sealed.advisor_tokens_in, sealed.advisor_tokens_out) == (2575, 138)
+    assert TurnRecordPayload.model_validate(_payload()).advisor_tokens_in is None
+    with pytest.raises(ValidationError):
+        TurnRecordPayload.model_validate(_payload(advisor_tokens_in=-1))
+
+
 def test_a_turn_is_numbered_from_one():
     with pytest.raises(ValidationError):
         TurnRecordPayload.model_validate(_payload(turn_id=0))
@@ -601,6 +617,143 @@ def test_a_bill_that_would_not_validate_costs_the_bill_and_never_the_record(tmp_
     sealed = records[0]["payload"]
     assert sealed["turn_id"] == 1 and sealed["actor"] == "model"
     assert sealed["tokens_in"] is None and sealed["tokens_out"] is None
+
+
+# ---------------------------------------------------------------------------
+# The advisor's own spend, on the turn that consulted it
+# ---------------------------------------------------------------------------
+
+ADVISOR_PROMPT_TOKENS = 2575
+ADVISOR_COMPLETION_TOKENS = 138
+
+
+def _advisor_usage(tracker, iteration, *, kind="advisor", prompt=ADVISOR_PROMPT_TOKENS):
+    """Record a consult the way `react_llm._track_advisor_usage` records one."""
+    tracker.set_iteration(iteration)
+    tracker.track_token_usage(
+        SimpleNamespace(
+            usage=SimpleNamespace(
+                total_tokens=prompt + ADVISOR_COMPLETION_TOKENS,
+                prompt_tokens=prompt,
+                completion_tokens=ADVISOR_COMPLETION_TOKENS,
+            )
+        ),
+        "advisor-model",
+        kind,
+    )
+
+
+def _seal(engine, *, tool=None, actor="model", iteration=1):
+    engine._seal_turn_record(
+        actor=actor,
+        tool=tool,
+        t0="2026-08-15T00:00:00Z",
+        t1="2026-08-15T00:00:01Z",
+        iteration=iteration,
+    )
+
+
+def test_an_advisor_turn_records_what_the_advisor_spent(tmp_path):
+    """The consult's own bill belongs on the consult's own turn.
+
+    `token_usage.csv` lands at loop exit, so the ledger is where a reader meets
+    this run first — and until now the advisor's spend reached it through
+    nothing at all. The engine is holding the number when it seals the turn: the
+    consult has already run.
+
+    A forced consult is still the advisor spending, so the record carries the
+    advisor's bill and no model bill: nobody asked the model for anything.
+    """
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    _advisor_usage(engine.token_tracker, 4)
+
+    _seal(engine, actor="controller", tool="advisor", iteration=4)
+
+    sealed = _events(engine, "turn_record")[0]["payload"]
+    assert sealed["advisor_tokens_in"] == ADVISOR_PROMPT_TOKENS
+    assert sealed["advisor_tokens_out"] == ADVISOR_COMPLETION_TOKENS
+    assert sealed["tokens_in"] is None and sealed["tokens_out"] is None
+
+
+def test_a_turn_that_called_no_advisor_is_never_given_the_advisors_bill(tmp_path):
+    """One iteration can hold both, and only the consult carries the consult."""
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    _advisor_usage(engine.token_tracker, 4)
+
+    _seal(engine, tool="bash", iteration=4)
+
+    assert _events(engine, "turn_record")[0]["payload"]["advisor_tokens_in"] is None
+
+
+def test_a_second_consult_on_one_iteration_does_not_pay_the_first_rows_bill(tmp_path):
+    """One row, one turn — the rule the model's bill already follows.
+
+    Copying the row onto both turns would invent spend, so the first consult of
+    an iteration keeps it and the second carries none.
+    """
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    _advisor_usage(engine.token_tracker, 4)
+
+    _seal(engine, actor="controller", tool="advisor", iteration=4)
+    _seal(engine, actor="controller", tool="advisor", iteration=4)
+
+    assert [row["payload"]["advisor_tokens_in"] for row in _events(engine, "turn_record")] == [
+        ADVISOR_PROMPT_TOKENS,
+        None,
+    ]
+
+
+def test_a_packing_call_is_the_advisors_spend_under_a_longer_name(tmp_path):
+    """`advisor_compression` is written by the same tracker on the same consult.
+
+    A join matching the word `advisor` exactly would drop it, which is how the
+    advisor's rows went unread for two rounds in the first place.
+    """
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    _advisor_usage(engine.token_tracker, 4, kind="advisor_compression", prompt=600)
+
+    _seal(engine, actor="controller", tool="advisor", iteration=4)
+
+    assert _events(engine, "turn_record")[0]["payload"]["advisor_tokens_in"] == 600
+
+
+def test_an_advisor_bill_that_would_not_validate_costs_the_bill_never_the_record(tmp_path):
+    """Same rule as the model's bill: a record with no tokens is still a record."""
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    engine._advisor_bill = lambda iteration: (-5, 138)
+
+    _seal(engine, actor="controller", tool="advisor", iteration=4)
+
+    records = _events(engine, "turn_record")
+    assert len(records) == 1, "the record was lost with the bill"
+    assert records[0]["payload"]["advisor_tokens_in"] is None
+
+
+def test_the_phase_entry_consult_seals_its_own_bill(tmp_path):
+    """The harness's forced consult, through the loop that actually forces it.
+
+    This run's two phase-entry consults are controller turns, and the advisor
+    row for each is written before the turn is sealed — so the wiring holds on
+    the real path, not only where a test hands the seal a tool name.
+    """
+    engine = _sealing_engine(tmp_path, [_phase_turn(index) for index in range(1, 6)])
+    consulted = engine.consult_advisor
+
+    def billed_consult():
+        _advisor_usage(engine.token_tracker, getattr(engine, "current_iteration", 0))
+        return consulted()
+
+    engine.consult_advisor = billed_consult
+    engine.run_setup_loop("set up the project", max_iterations=12)
+
+    controller = [
+        row for row in _events(engine, "turn_record") if row["payload"]["actor"] == "controller"
+    ]
+    assert len(controller) == 2
+    assert [row["payload"]["advisor_tokens_in"] for row in controller] == [
+        ADVISOR_PROMPT_TOKENS
+    ] * 2
+    assert all(row["payload"]["tokens_in"] is None for row in controller)
 
 
 # ---------------------------------------------------------------------------

@@ -849,6 +849,39 @@ def test_the_synthetic_turn_records_are_the_shape_the_engine_would_seal():
         TurnRecordPayload.model_validate(json.loads(line)["payload"])
 
 
+def test_a_sealed_record_carries_the_advisors_bill_beside_the_models():
+    """A consult's own spend reaches the row from the ledger, not from the CSV.
+
+    The CSV is exported at loop exit, so on a live run the ledger is the only
+    thing that has said anything about this turn yet. The two bills land in two
+    fields and are never added: they were paid to two different models.
+    """
+    r = TrajectoryReducer()
+    for line in REAL_TRIPLE:
+        r.feed(line)
+    r.feed(
+        SYNTHETIC_TURN_RECORD_JSONL.replace(
+            '"tokens_in":4134,"tokens_out":71,',
+            '"tokens_in":4134,"tokens_out":71,'
+            '"advisor_tokens_in":2575,"advisor_tokens_out":138,',
+        )
+    )
+
+    turn = r.snapshot().turns[0]
+    assert (turn.tokens.input, turn.tokens.output) == (4134, 71)
+    assert (turn.advisor_tokens.input, turn.advisor_tokens.output) == (2575, 138)
+
+
+def test_a_record_with_no_consult_states_no_advisor_bill():
+    """Most turns consulted nobody; absence is absence, not zero."""
+    r = TrajectoryReducer()
+    for line in REAL_TRIPLE:
+        r.feed(line)
+    r.feed(SYNTHETIC_TURN_RECORD_JSONL)
+
+    assert r.snapshot().turns[0].advisor_tokens is None
+
+
 def test_the_row_names_every_component_and_still_carries_one_handle():
     """[A] is a list; the row keeps the list AND the one handle it had before.
 
