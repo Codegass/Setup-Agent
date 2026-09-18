@@ -264,6 +264,34 @@ def console_level(config) -> str:
     return level
 
 
+#: Run before every line the console sink writes, while a turn stream owns the
+#: screen. The stream holds a dispatch line open until its answer arrives and
+#: cannot see another writer; told first, it finishes that line, and the answer
+#: comes back under its own `↳ #N`. `None` whenever no stream is attached.
+_before_console_line: Callable[[], None] | None = None
+
+
+def before_each_console_line(hook: Callable[[], None] | None) -> None:
+    """Register what the console sink calls before each line, or clear it."""
+
+    global _before_console_line
+    _before_console_line = hook
+
+
+def _console_sink(message: str) -> None:
+    """The console sink: let the stream finish its line, then write to stderr.
+
+    A callable rather than `sys.stderr` itself, so the yield can happen. The
+    stream is looked up per call so a redirected or captured stderr sees it.
+    """
+
+    hook = _before_console_line
+    if hook is not None:
+        hook()
+    sys.stderr.write(message)
+    sys.stderr.flush()
+
+
 def setup_console_logging(config) -> None:
     """Configure the console sink. One implementation, used by both callers.
 
@@ -279,7 +307,7 @@ def setup_console_logging(config) -> None:
     # level is a record the console wants, and a second gate saying the same
     # thing only reads as though some case still needed it.
     logger.add(
-        sys.stderr,
+        _console_sink,
         level=console_level(config),
         format=_get_console_format(config),
         colorize=True,

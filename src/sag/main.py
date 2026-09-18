@@ -30,6 +30,7 @@ from sag.agent.verdict_finalizer import (
 from sag.config import (
     Config,
     LogLevel,
+    before_each_console_line,
     ensure_session_logging,
     get_config,
     get_session_logger,
@@ -212,16 +213,22 @@ def _attach_turn_stream() -> Optional[TurnStreamRenderer]:
         tty=console.is_terminal,
     )
     session_logger.get_control_event_sink().add_observer(renderer.feed)
+    # The log's console sink writes to the same screen. It asks the renderer to
+    # finish its open line first, or a warning lands on the dispatch line it
+    # interrupted and the answer follows with no turn id.
+    before_each_console_line(renderer.give_way)
     return renderer
 
 
 def _close_turn_stream(renderer: Optional[TurnStreamRenderer]) -> None:
-    """End the stream: stop watching, then flush. Never raises.
+    """End the stream: stop watching, give the console back, then flush. Never raises.
 
-    Both halves matter. The renderer comes off the sink first because the sink
-    outlives it and a finished renderer refuses to be fed — that refusal would
-    travel through stdlib `logging`, which nothing here routes, and land on the
-    console this layer just quieted. And nothing in here may raise: this runs
+    All three matter, in this order. The renderer comes off the sink first
+    because the sink outlives it and a finished renderer refuses to be fed —
+    that refusal would travel through stdlib `logging`, which nothing here
+    routes, and land on the console this layer just quieted. The console hook
+    comes off next, so a warning logged while the renderer closes has no
+    renderer to ask. And nothing in here may raise: this runs
     from the `finally` of a command that ends in a broad `except`, so a write
     that fails while closing — a closed terminal, a `BrokenPipeError` from
     `sag project … | head` — would otherwise replace whatever the run actually
@@ -237,6 +244,7 @@ def _close_turn_stream(renderer: Optional[TurnStreamRenderer]) -> None:
             session_logger.get_control_event_sink().remove_observer(renderer.feed)
         except Exception as exc:
             logger.warning(f"Could not detach the turn stream from the control stream: {exc}")
+    before_each_console_line(None)
     try:
         renderer.close()
     except Exception as exc:
@@ -1765,6 +1773,7 @@ def _trajectory_table(session_dir: Path, *, follow: bool) -> None:
     if header:
         console.print(header, markup=False, highlight=False)
     stream = TurnStreamRenderer(_turn_stream_sink(), width=console.width, tty=console.is_terminal)
+    before_each_console_line(stream.give_way)
     try:
         if follow:
             tail = follow_trajectory(directory, on_line=stream.note_event)
@@ -1788,6 +1797,7 @@ def _trajectory_table(session_dir: Path, *, follow: bool) -> None:
         # from the lines is the same statement by value and is shown once.
         stream.render_delta(TrajectoryDelta(warnings=document.warnings))
     finally:
+        before_each_console_line(None)
         stream.close()
 
 

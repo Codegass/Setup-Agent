@@ -88,3 +88,42 @@ def test_the_console_sink_replaces_the_default_instead_of_stacking_on_it():
     assert (
         result.stderr.count("PROBE-WARNING") == 1
     ), "a warning printed twice means two stderr sinks are open"
+
+
+_GIVE_WAY_PROBE = """
+import sys
+
+from loguru import logger
+
+from sag.config.logger import before_each_console_line, setup_console_logging
+from sag.config.settings import Config
+
+setup_console_logging(Config())
+before_each_console_line(lambda: sys.stderr.write("GAVE-WAY\\n"))
+logger.warning("PROBE-WARNING")
+before_each_console_line(None)
+logger.warning("PROBE-AFTER")
+"""
+
+
+def test_the_console_sink_lets_the_turn_stream_finish_its_line_before_it_writes():
+    """One screen, two writers: the log yields to the stream before every line.
+
+    The turn stream holds a dispatch line open on stdout until the answer comes;
+    a warning written to stderr in that window lands on the same screen line.
+    The renderer cannot see another writer, so the console sink tells it first.
+    Driven in a real process so the order on stderr is the order a terminal
+    sees: the hook runs once per line, before the line, and not once cleared.
+    """
+
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_GIVE_WAY_PROBE)],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.count("GAVE-WAY") == 1, result.stderr
+    assert result.stderr.index("GAVE-WAY") < result.stderr.index("PROBE-WARNING")
+    assert result.stderr.index("PROBE-WARNING") < result.stderr.index("PROBE-AFTER")

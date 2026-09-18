@@ -224,6 +224,42 @@ def test_the_outcome_gets_its_own_line_when_something_was_printed_between():
     assert "↳ #1 exit 0" in sink.text
 
 
+def test_a_line_from_outside_the_ledger_closes_the_open_line_first():
+    """A warning arriving while a turn is in flight lands on a line of its own.
+
+    In the first real run loguru wrote `18:32:56 | WARNING | …` to stderr while
+    the renderer was holding `#3 project provision openjdk 8` open on stdout.
+    The two met on one screen line, and the answer, arriving after, landed on
+    the next line with no turn id. The renderer cannot see another writer, so
+    the other writer tells it first: `give_way()` finishes the open line, and
+    the answer then comes back under its own `↳ #N`.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "build", {"command": "mvn test"}, "e1"))
+    assert not sink.text.endswith("\n")
+    stream.give_way()
+    assert sink.text.endswith("\n")
+    written = sink.text
+    # Nothing is open now: a second caller gets the screen with no blank line.
+    stream.give_way()
+    assert sink.text == written
+    stream.feed(_result(2, "build", "e1", _build_ok()))
+    stream.close()
+    assert "↳ #1 exit 0" in sink.text
+
+
+def test_give_way_after_close_is_a_no_op_because_a_log_sink_must_never_raise():
+    """A warning logged during shutdown finds a finished renderer and moves on."""
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.close()
+    stream.give_way()
+    assert sink.text == ""
+
+
 def test_a_turn_still_in_flight_leaves_no_trailing_blanks_on_the_screen():
     """An open line is not padded out to the outcome column it may never reach."""
 
@@ -546,18 +582,53 @@ def test_a_gate_already_in_hand_stays_on_the_turns_own_line():
     line by itself, which marked the turn as having spoken; the result then
     landed on a turn already spoken for and its outcome was never rendered at
     all. Gates follow results in every archived session, so only this reaches it.
+    The gate disagrees with the claim here: an agreeing one says nothing (R49).
     """
 
     sink = _Sink()
     stream = TurnStreamRenderer(sink, width=100)
     stream.feed(_envelope(1, "phase", {"action": "done", "outcome": "success"}, "e1"))
-    stream.feed(_gate(2, "success", "build"))
+    stream.feed(_gate(2, "partial", "build"))
     stream.feed(_result(3, "phase", "e1", {"operation_outcome": "success"}))
     stream.close()
     line = _turn_lines(sink)[0]
-    assert "gate: success" in line
+    assert "gate: partial" in line
     assert "ok" in line
     assert "↳" not in sink.text
+
+
+def test_a_gate_that_agrees_with_the_claim_adds_no_line():
+    """R49: `done success` graded `success` is one fact, and is said once.
+
+    Five of the nineteen turns of the first real run carried `↳ #N gate:
+    success` under a line already reading `done success`. Where the gate
+    disagrees — `done success` graded `partial`, kafka turn 16 — the
+    continuation is the most valuable line in the stream, and suppressing
+    agreement is what lets that one stand out.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "phase", {"action": "done", "outcome": "success"}, "e1"))
+    stream.feed(_result(2, "phase", "e1", {"operation_outcome": "success"}))
+    stream.feed(_gate(3, "success", "build"))
+    stream.feed(_decision(4, "phase", "build"))
+    stream.close()
+    assert "gate:" not in sink.text
+    assert len(_turn_lines(sink)) == 1
+
+
+def test_a_gate_in_hand_that_agrees_with_the_claim_is_not_repeated_on_the_line():
+    """The same rule when the grading arrived before the line was written."""
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "phase", {"action": "blocked", "outcome": "failed"}, "e1"))
+    stream.feed(_gate(2, "failed", "build"))
+    stream.feed(_result(3, "phase", "e1", {"operation_outcome": "success"}))
+    stream.close()
+    assert "gate:" not in sink.text
+    assert "blocked failed" in _turn_lines(sink)[0]
 
 
 # --- phases ----------------------------------------------------------------
@@ -1409,7 +1480,7 @@ CORPUS = {
         "standing": 11,
         "inline": 0,
         "counted": {"conservation_violation": 1, "missing_loop_decision": 10},
-        "lines": 43,
+        "lines": 39,
     },
     "camel-quarkus-d2r3": {
         "turns": 58,
@@ -1417,7 +1488,7 @@ CORPUS = {
         "standing": 24,
         "inline": 6,
         "counted": {"conservation_violation": 1, "missing_loop_decision": 17},
-        "lines": 90,
+        "lines": 86,
     },
     "ignite-d2r3": {
         "turns": 35,
@@ -1425,7 +1496,7 @@ CORPUS = {
         "standing": 9,
         "inline": 0,
         "counted": {"conservation_violation": 1, "missing_loop_decision": 8},
-        "lines": 50,
+        "lines": 49,
     },
     # The only one of the four whose ledger closes with nothing standing: 21
     # turns, every one sealed by a `turn_record`, no hole anywhere. It is what a
@@ -1438,7 +1509,7 @@ CORPUS = {
         "standing": 0,
         "inline": 0,
         "counted": {},
-        "lines": 31,
+        "lines": 28,
     },
 }
 
@@ -1717,7 +1788,9 @@ VERBATIM = [
         "kafka-d2r3",
         "  #7   phase     done success                workspace_present · workspace /workspace/kafka e…  0.2s",
     ),
-    ("kafka-d2r3", "      ↳ #7 gate: success"),
+    # The gate here DISAGREES with the claim (`done success`), which is the only
+    # kind of gate continuation that prints (R49).
+    ("kafka-d2r3", "      ↳ #16 gate: partial"),
     ("kafka-d2r3", "▸ provision"),
     ("kafka-d2r3", "✓ provision advanced"),
     # This one used to read `✓ test evidence_close · test_terminal`: a green
@@ -1800,7 +1873,20 @@ def test_a_phase_reason_code_is_rendered_bare_like_every_other_reason_code():
     turn = [line for line in lines if line.lstrip().startswith("#7 ")][0]
     assert "workspace_present · workspace" in turn
     assert "gate workspace_present" not in turn
-    assert "      ↳ #7 gate: success" in lines
+    assert "      ↳ #16 gate: partial" in lines
+
+
+def test_an_archived_gate_that_agrees_with_its_claim_is_not_restated():
+    """R49 on the archive: kafka's four agreeing gates say nothing, its three
+    disagreeing ones (#16 partial, #21 failed, #24 success) each take a line."""
+
+    lines = _render("kafka-d2r3").lines
+    continuations = [line for line in lines if "gate:" in line]
+    assert continuations == [
+        "      ↳ #16 gate: partial",
+        "      ↳ #21 gate: failed",
+        "      ↳ #24 gate: success",
+    ]
 
 
 def test_the_counted_notes_say_where_to_read_them_in_full():

@@ -387,6 +387,24 @@ class TurnStreamRenderer:
         observation = turn.observation
         return observation is not None and observation.outcome is not None
 
+    @staticmethod
+    def _gate_adds(turn: Turn) -> bool:
+        """Does the gate's word say anything the turn's own line has not?
+
+        R49. Where the model claimed `done success` and the gate delivered
+        `success`, the word costs a line and adds nothing: five of the nineteen
+        turns of the first real run. Where it claimed `done success` and the
+        gate delivered `partial`, the disagreement is the single most valuable
+        thing in the stream. Show disagreement, suppress agreement — which is
+        also what makes the disagreements visible. A gate on a turn that
+        claimed nothing always adds.
+        """
+
+        if turn.gate is None:
+            return False
+        claimed = turn.call.claimed_outcome if turn.call is not None else None
+        return turn.gate.word != claimed
+
     def _outcome_at(self, used: int) -> int:
         """The column this line's outcome starts in, given the head it has."""
 
@@ -404,7 +422,7 @@ class TurnStreamRenderer:
         outcome = observation.outcome if observation is not None else None
         summary = observation.summary if observation is not None else None
         word = None if outcome == _UNMARKED_OUTCOME and summary else outcome
-        gate_word = turn.gate.word if (gate and turn.gate is not None) else None
+        gate_word = turn.gate.word if (gate and self._gate_adds(turn)) else None
         line = _Line()
         if word is not None:
             line.add(word, _OUTCOME_STYLE.get(word))
@@ -489,7 +507,10 @@ class TurnStreamRenderer:
                 self._complete(turn, settled)
         elif turn.gate is not None and turn.turn_id not in self._gated:
             self._gated.add(turn.turn_id)
-            self._emit(_Line(self._continuation(turn.turn_id)).add(f"{_GATE} {turn.gate.word}"))
+            if self._gate_adds(turn):
+                self._emit(
+                    _Line(self._continuation(turn.turn_id)).add(f"{_GATE} {turn.gate.word}")
+                )
         self._band(turn)
 
     def _dispatch(self, turn: Turn) -> None:
@@ -710,6 +731,23 @@ class TurnStreamRenderer:
             f"{total} more note{'' if total == 1 else 's'} about the ledger itself: "
             f"{named} — read them in full with: {_TRAJECTORY_COMMAND}"
         )
+
+    def give_way(self) -> None:
+        """Finish the open line: something not from the ledger needs the screen.
+
+        The console log sink calls this before every line it writes. The
+        renderer holds a dispatch line open until the answer arrives and cannot
+        see another writer — so the other writer says so first: the held first
+        line is placed, the open line is closed, and the answer, when it comes,
+        takes a `↳ #N` line of its own. Never raises: a log sink that raises
+        prints a traceback over the very screen it was making room on, so after
+        `close()` this does nothing at all.
+        """
+
+        if self._closed:
+            return
+        self._flush()
+        self._close_line()
 
     def feed(self, raw_line: str) -> None:
         """Fold one control-event line and write whatever it produced.

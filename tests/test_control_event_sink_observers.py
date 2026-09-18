@@ -480,6 +480,9 @@ class _RecordingRenderer:
     def feed(self, raw_line: str) -> None:
         self.lines.append(raw_line)
 
+    def give_way(self) -> None:
+        pass
+
     def close(self) -> None:
         self.closed = True
 
@@ -803,3 +806,93 @@ def test_a_crashing_task_still_closes_its_stream(monkeypatch, tmp_path, recordin
     assert result.exit_code == 1
     assert len(recording_renderer.instances) == 1
     assert recording_renderer.instances[0].closed is True
+
+
+# --- the console shares the screen with the stream --------------------------
+
+
+def _ledger_line(sequence: int, kind: str, payload: dict) -> str:
+    return json.dumps(
+        {
+            "sequence": sequence,
+            "kind": kind,
+            "payload": payload,
+            "source": None,
+            "timestamp": f"2026-09-15T01:00:{sequence:02d}Z",
+            "event_id": f"control-{sequence:06d}",
+            "run_id": "run-1",
+        }
+    )
+
+
+def test_a_console_line_written_while_a_turn_is_open_lands_on_its_own_line(
+    tmp_path, monkeypatch, capsys
+):
+    """The CLI hands the log's console sink to the renderer it attached.
+
+    `_attach_turn_stream` registers `renderer.give_way` with the logger, so a
+    warning logged while a dispatch line is open finishes that line first and
+    the answer comes back under `↳ #N`. `_close_turn_stream` takes the hook back
+    before the renderer is closed, so a warning logged during shutdown has no
+    renderer to ask and reaches stderr all the same.
+    """
+
+    buffer = _terminal(monkeypatch)
+    session_logger = _session_logger(tmp_path, monkeypatch)
+    monkeypatch.setattr(logger_module, "_session_logger", session_logger)
+
+    renderer = main_module._attach_turn_stream()
+    assert renderer is not None
+    renderer.feed(
+        _ledger_line(
+            1,
+            "loop_decision",
+            {
+                "event": {"tool_name": "project", "phase": "provision", "iteration": 1},
+                "expected_decision": "continue",
+                "expected_reason_code": "ok",
+            },
+        )
+    )
+    renderer.feed(
+        _ledger_line(
+            2,
+            "action_envelope",
+            {
+                "envelope_id": "e1",
+                "tool_call_id": "call-2",
+                "tool": "project",
+                "exact_params": {"action": "provision", "tool": "openjdk", "version": "8"},
+                "envelope_sha256": "a" * 64,
+            },
+        )
+    )
+    assert not buffer.getvalue().endswith("\n"), "the dispatch line should be open"
+
+    logger_module._console_sink("18:32:56 | WARNING  | something\n")
+
+    assert buffer.getvalue().endswith("\n"), "the open line was not finished first"
+    renderer.feed(
+        _ledger_line(
+            3,
+            "tool_result",
+            {
+                "envelope_id": "e1",
+                "execution_id": "x3",
+                "tool": "project",
+                "params": {},
+                "scope": "environment",
+                "result": {"operation_outcome": "success"},
+            },
+        )
+    )
+    # The turn is #2: a `loop_decision` ahead of its envelope opens a call-less
+    # #1, which is how these fixtures state the phase before the dispatch.
+    assert "↳ #2" in buffer.getvalue()
+
+    main_module._close_turn_stream(renderer)
+    logger_module._console_sink("18:32:57 | WARNING  | after\n")
+
+    assert capsys.readouterr().err == (
+        "18:32:56 | WARNING  | something\n18:32:57 | WARNING  | after\n"
+    )
