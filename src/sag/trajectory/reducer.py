@@ -148,6 +148,7 @@ from sag.trajectory.schema import (
 )
 from sag.trajectory.summaries import (
     call_summary,
+    claimed_outcome,
     observation_outcome,
     observation_summary,
     refusal_summary,
@@ -730,6 +731,7 @@ class TrajectoryReducer:
             tool=tool,
             params_ref=envelope_id,
             summary=call_summary(tool, payload.get("exact_params")),
+            claimed_outcome=claimed_outcome(tool, payload.get("exact_params")),
         )
         turn.envelope_id = envelope_id
         turn.t0 = timestamp
@@ -754,6 +756,7 @@ class TrajectoryReducer:
             tool=tool,
             params_ref=envelope_id,
             summary=call_summary(tool, payload.get("exact_params")),
+            claimed_outcome=claimed_outcome(tool, payload.get("exact_params")),
         )
         turn.envelope_id = envelope_id
         turn.t0 = timestamp

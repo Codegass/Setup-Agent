@@ -79,6 +79,13 @@ class CallInfo(_TrajectoryModel):
     #: params; `None` when the tool's shape is unknown to the summariser, never
     #: an empty string, so "no summary" and "an empty summary" stay distinct.
     summary: str | None = Field(default=None, min_length=1, max_length=SUMMARY_MAX_CHARS)
+    #: The outcome the model claimed, when the call was a phase call.
+    #: `GateInfo.word` is what the gate delivered; this is what the model said,
+    #: and the two are carried apart so a reader can see them disagree. `None`
+    #: for every other tool, and never an empty string.
+    claimed_outcome: str | None = Field(
+        default=None, min_length=1, max_length=SUMMARY_MAX_CHARS
+    )
 
 
 class ObservationInfo(_TrajectoryModel):

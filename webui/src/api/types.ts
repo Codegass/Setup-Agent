@@ -605,6 +605,9 @@ export interface TrajectoryCall {
   params_ref?: string | null
   /** What this call asked for, in one line. */
   summary?: string | null
+  /** The outcome the model claimed, when the call was a phase call. `gate.word`
+   *  is what the gate delivered; this is what the model said. */
+  claimed_outcome?: string | null
 }
 
 /** Exact call parameters resolved lazily from one control-ledger envelope. */

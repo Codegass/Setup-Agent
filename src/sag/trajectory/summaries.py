@@ -210,6 +210,20 @@ def call_summary(tool: str, params: Mapping[str, Any] | None) -> str | None:
     return _clip(_scalar_params(values))
 
 
+def claimed_outcome(tool: str, params: Mapping[str, Any] | None) -> str | None:
+    """The outcome the model asserted, when the call was a phase call.
+
+    `GateInfo.word` is what the gate delivered; this is what the model claimed,
+    from the same `exact_params` the phase summary is built from. Only a phase
+    call claims one; a stray `outcome` param on any other tool is not a claim
+    about a phase.
+    """
+
+    if tool != "phase":
+        return None
+    return _clip(_first_line(_mapping(params).get("outcome")))
+
+
 def observation_outcome(result: Mapping[str, Any] | None) -> ObservationOutcome | None:
     """How the call came out, as one of the engine's own words.
 

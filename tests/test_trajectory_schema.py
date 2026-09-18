@@ -196,3 +196,20 @@ def test_the_validator_state_words_are_the_engine_s_own():
 
     engine = ValidatorObservationPayload.model_fields["validator_state"].annotation
     assert set(get_args(ValidatorState)) == set(get_args(engine))
+
+
+def test_a_call_can_carry_the_outcome_the_model_claimed():
+    """Phase calls claim an outcome; `GateInfo.word` is what the gate delivered.
+
+    Optional, one word, never empty — the same discipline as `summary`, so
+    "no claim" and "an empty claim" stay distinct.
+    """
+
+    from pydantic import ValidationError
+
+    from sag.trajectory.schema import CallInfo
+
+    assert CallInfo(tool="phase").claimed_outcome is None
+    assert CallInfo(tool="phase", claimed_outcome="partial").claimed_outcome == "partial"
+    with pytest.raises(ValidationError):
+        CallInfo(tool="phase", claimed_outcome="")

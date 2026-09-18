@@ -9,6 +9,7 @@ archived sessions so an invented shape cannot pass again.
 from sag.trajectory.schema import SUMMARY_MAX_CHARS
 from sag.trajectory.summaries import (
     call_summary,
+    claimed_outcome,
     observation_outcome,
     observation_summary,
     refusal_summary,
@@ -669,3 +670,21 @@ def test_the_cancellation_code_is_the_engine_s_own():
 
     outcome, _ = refusal_summary({"refusal_code": CANCELLED_CALL_REFUSAL_CODE})
     assert outcome == "cancelled"
+
+
+def test_a_phase_call_states_the_outcome_the_model_claimed():
+    """`GateInfo.word` is what the gate delivered; this is what the model said.
+
+    The two sit one above the other in the stream, and the line between them is
+    the one a reader wants. So the claim is carried as its own fact, from the
+    same `exact_params` the phase summary is built from — never parsed back out
+    of the summary that happens to contain it.
+    """
+
+    assert claimed_outcome("phase", {"action": "done", "outcome": "success"}) == "success"
+    assert claimed_outcome("phase", {"action": "blocked", "outcome": "failed"}) == "failed"
+    assert claimed_outcome("phase", {"action": "done"}) is None
+    assert claimed_outcome("phase", None) is None
+    # Only a phase call claims an outcome; a stray `outcome` param on any other
+    # tool is not a claim about a phase.
+    assert claimed_outcome("bash", {"command": "ls", "outcome": "success"}) is None
