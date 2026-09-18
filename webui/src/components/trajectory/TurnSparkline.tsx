@@ -1,6 +1,9 @@
+import { Fragment, useState } from "react"
+
 import type { TrajectoryDocument } from "@/api/types"
 import type { SparkColumn } from "@/lib/trajectory"
 import { formatDuration, formatTokens, sparkColumns } from "@/lib/trajectory"
+import { cn } from "@/lib/utils"
 
 /** One column per turn, wide enough to be a target and thin enough to be a spark. */
 const COLUMN = 6
@@ -80,10 +83,24 @@ function peakColumn(
   return peak
 }
 
-function Plot({ columns, series }: { columns: SparkColumn[]; series: Series }) {
+function Plot({
+  columns,
+  series,
+  hoveredTurn,
+  onHoverTurn,
+}: {
+  columns: SparkColumn[]
+  series: Series
+  /** The turn the reader is pointing at, in either plot. Both plots draw the
+   *  same columns, so pointing at one turn names it in both. */
+  hoveredTurn: number | null
+  onHoverTurn: (turnId: number | null) => void
+}) {
   const peak = peakColumn(columns, series.value)
   const peakValue = peak?.value ?? null
   const width = Math.max(columns.length * PITCH - GAP, 1)
+  const hovered = hoveredTurn == null ? null : columns.find((c) => c.turnId === hoveredTurn) ?? null
+  const hoveredValue = hovered ? series.value(hovered) : null
 
   return (
     <div className="space-y-1">
@@ -96,6 +113,7 @@ function Plot({ columns, series }: { columns: SparkColumn[]; series: Series }) {
           aria-label={series.label}
           className="shrink-0"
           height={PLOT}
+          onMouseLeave={() => onHoverTurn(null)}
           role="img"
           viewBox={`0 0 ${width} ${PLOT}`}
           width={width}
@@ -103,50 +121,83 @@ function Plot({ columns, series }: { columns: SparkColumn[]; series: Series }) {
           {columns.map((column, index) => {
             const value = series.value(column)
             const x = index * PITCH
-            if (value == null || peakValue == null) {
-              // An absence is drawn as an absence. A zero-height bar would be a
-              // turn that cost nothing, which is a different fact.
-              return (
+            const stated = value != null && peakValue != null
+            // Pointing at one column is a claim about that column, so the rest
+            // step back rather than the pointed-at one shouting over them.
+            const faded = hoveredTurn != null && hoveredTurn !== column.turnId
+            // An absence is drawn as an absence. A zero-height bar would be a
+            // turn that cost nothing, which is a different fact. A peak of zero
+            // is a series every column of which stated zero, and a stated value
+            // keeps a visible baseline whatever its size.
+            const height = stated
+              ? peakValue > 0
+                ? Math.max(BASELINE, (value / peakValue) * PLOT)
+                : BASELINE
+              : BASELINE
+            return (
+              // A column is one thing: the bar that states its value and the
+              // area a reader can point at to ask about it. The bar is the wrong
+              // target on its own — a turn that cost almost nothing is drawn
+              // 1.5px tall, and the 2px between columns catches nothing at all —
+              // so the group carries a full-height target a whole pitch wide.
+              // Targets cannot overlap a neighbour's bar: this one ends exactly
+              // where the next column begins.
+              <Fragment key={column.turnId}>
                 <rect
-                  className="fill-muted-foreground/35"
-                  height={BASELINE}
-                  key={column.turnId}
+                  className={cn(
+                    stated ? INK : "fill-muted-foreground/35",
+                    faded && "opacity-30",
+                  )}
+                  data-bar={column.turnId}
+                  height={height}
+                  rx={stated ? 1.5 : undefined}
                   width={COLUMN}
                   x={x}
-                  y={PLOT - BASELINE}
+                  y={PLOT - height}
+                />
+                <rect
+                  data-hit={column.turnId}
+                  fill="transparent"
+                  height={PLOT}
+                  onMouseEnter={() => onHoverTurn(column.turnId)}
+                  width={PITCH}
+                  x={x}
+                  y={0}
                 >
-                  <title>{`turn ${column.turnId} · ${series.unstated}`}</title>
+                  <title>
+                    {`turn ${column.turnId} · ${stated ? exact(series, value) : series.unstated}`}
+                  </title>
                 </rect>
-              )
-            }
-            // A peak of zero is a series every column of which stated zero. A
-            // stated value keeps a visible baseline and its title supplies the
-            // exact value.
-            const height =
-              peakValue > 0 ? Math.max(BASELINE, (value / peakValue) * PLOT) : BASELINE
-            return (
-              <rect
-                className={INK}
-                height={height}
-                key={column.turnId}
-                rx={1.5}
-                width={COLUMN}
-                x={x}
-                y={PLOT - height}
-              >
-                <title>{`turn ${column.turnId} · ${exact(series, value)}`}</title>
-              </rect>
+              </Fragment>
             )
           })}
         </svg>
+        {/* The readout already had the shape a hover wants — a value and the
+            turn it belongs to — so pointing at a column answers here rather
+            than in a floating tooltip that would have to be positioned, sized
+            and kept out of its own way. Let go and it returns to the peak. */}
         <div className="flex min-w-0 flex-col leading-tight">
           <span className="font-mono text-[10.5px] text-foreground">
-            {peakValue == null ? "—" : series.format(peakValue)}
+            {hovered
+              ? hoveredValue == null
+                ? "—"
+                : exact(series, hoveredValue)
+              : peakValue == null
+                ? "—"
+                : series.format(peakValue)}
           </span>
           <span className="whitespace-nowrap text-[10px] text-muted-foreground">
-            {peak
-              ? `Max at Turn ${peak.column.turnId}${peak.column.tool ? ` · ${peak.column.tool}` : ""}`
-              : `No ${series.key} stated`}
+            {hovered
+              ? `Turn ${hovered.turnId}${
+                  hoveredValue == null
+                    ? ` · ${series.unstated}`
+                    : hovered.tool
+                      ? ` · ${hovered.tool}`
+                      : ""
+                }`
+              : peak
+                ? `Max at Turn ${peak.column.turnId}${peak.column.tool ? ` · ${peak.column.tool}` : ""}`
+                : `No ${series.key} stated`}
           </span>
         </div>
       </div>
@@ -165,6 +216,10 @@ function Plot({ columns, series }: { columns: SparkColumn[]; series: Series }) {
  * a turn the ledger has not billed yet is a gap, and says so on hover.
  */
 export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
+  // Held here rather than in each plot: the strips are drawn on one set of
+  // columns and the docstring above promises they are aligned turn-for-turn, so
+  // pointing at a turn should name that turn everywhere it appears.
+  const [hoveredTurn, setHoveredTurn] = useState<number | null>(null)
   const columns = sparkColumns(doc)
   if (!columns.length) {
     return null
@@ -196,7 +251,7 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
         )}
       </figcaption>
 
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto" onMouseLeave={() => setHoveredTurn(null)}>
         <div className="flex flex-col gap-1" style={{ minWidth: width }}>
           {totalMarks ? (
             <svg
@@ -209,9 +264,13 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
               {columns.map((column, index) =>
                 column.anomalies.length ? (
                   <rect
-                    className="fill-status-failed"
+                    className={cn(
+                      "fill-status-failed",
+                      hoveredTurn != null && hoveredTurn !== column.turnId && "opacity-30",
+                    )}
                     height={MARKS - 3}
                     key={column.turnId}
+                    onMouseEnter={() => setHoveredTurn(column.turnId)}
                     rx={1.5}
                     width={COLUMN}
                     x={index * PITCH}
@@ -231,7 +290,13 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
           ) : null}
 
           {SERIES.map((series) => (
-            <Plot columns={columns} key={series.key} series={series} />
+            <Plot
+              columns={columns}
+              hoveredTurn={hoveredTurn}
+              key={series.key}
+              onHoverTurn={setHoveredTurn}
+              series={series}
+            />
           ))}
         </div>
       </div>
