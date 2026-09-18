@@ -3,6 +3,8 @@ import shlex
 import subprocess
 import sys
 
+from loguru import logger as loguru_logger
+
 from sag.agent.control_events import ControlEventSink
 from sag.agent.evidence_publications import EvidencePublicationAuthority
 from sag.docker_orch import orch
@@ -659,3 +661,47 @@ def test_execute_command_with_monitoring_preserves_quoted_workdir_in_timeout_wra
     base_command = timeout_args[-1]
     assert f"cd {shlex.quote(workdir)} && echo hi" in base_command
     assert "cd /workspace/project with" not in base_command
+
+
+def test_a_long_output_is_cut_quietly_and_the_log_says_what_was_kept():
+    """The 25+25 cut is bookkeeping, not an alarm.
+
+    Any output over 100 lines and 10,000 characters is cut to its first and
+    last 25 lines. In the first real commons-cli run this fired five times —
+    twice on `apt-get install`, three times on a `find` listing — and none of
+    the five was ever read: every consumer on this path checks the exit code,
+    and the model-facing tools opt out of the cut (`bash` passes
+    `truncate_output=False`; the detached build log is read whole). The old
+    line said `🚨 … to prevent context pollution` at WARNING, naming a danger
+    the output was never headed for. The fact belongs at DEBUG in plain words;
+    the marker inside the output stays, because it is true.
+    """
+
+    body = "\n".join(
+        f"Unpacking package-{n:03d} ({n}.0.0-1ubuntu0.6_amd64.deb) over ({n}.0.0-1ubuntu0.4) ..."
+        for n in range(200)
+    )
+    assert len(body) > 10_000
+    container = FakeContainer(FakeExecResult(exit_code=0, output=(body.encode(), b"")))
+    orchestrator = build_orchestrator(container)
+    seen: list[tuple[str, str]] = []
+    handle = loguru_logger.add(
+        lambda m: seen.append((m.record["level"].name, m.record["message"])), level="DEBUG"
+    )
+    try:
+        result = orchestrator.execute_command("apt-get install -y -qq curl wget git")
+    finally:
+        loguru_logger.remove(handle)
+
+    assert "[ORCHESTRATOR TRUNCATED: 200 lines" in result["output"]
+    assert result["output"].count("\n") == 50  # 25 kept, the marker line, 25 kept
+    assert [message for level, message in seen if level == "WARNING"] == []
+    said = [
+        message
+        for level, message in seen
+        if level == "DEBUG" and "kept the first 25 and last 25" in message
+    ]
+    assert said, seen
+    assert said[0].startswith("apt-get install -y -qq curl wget git: ")
+    assert "200 lines" in said[0]
+    assert "pollution" not in said[0] and "🚨" not in said[0]

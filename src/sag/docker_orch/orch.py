@@ -663,14 +663,20 @@ class DockerOrchestrator:
                             f"🔧 Applied XML-aware truncation to preserve error-prone sections"
                         )
                     else:
-                        # Apply normal truncation for non-JSON/XML content
+                        # Head and tail only. Bookkeeping, not an alarm: every
+                        # caller left on this path reads the exit code, and the
+                        # model-facing tools opt out of the cut (`bash` passes
+                        # truncate_output=False; a detached build log is read
+                        # whole). The marker stays in the output because it is
+                        # true; the log states what was kept, at DEBUG.
                         truncated = (
                             "\n".join(lines[:25])
                             + f"\n... [ORCHESTRATOR TRUNCATED: {len(lines)} lines, {original_length} chars] ...\n"
                             + "\n".join(lines[-25:])
                         )
-                        logger.warning(
-                            f"🚨 Orchestrator applied emergency truncation: {len(lines)} lines → 50 lines to prevent context pollution"
+                        logger.debug(
+                            f"{command[:60]}: {len(lines)} lines ({original_length} chars); "
+                            "kept the first 25 and last 25"
                         )
                         output = truncated
 
