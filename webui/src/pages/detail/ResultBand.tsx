@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { type ReactNode, useState } from "react"
 
 import type { CardTone, ResultCard, ResultRow, RowKey, SnapshotStatus } from "@/api/types"
 import { RECORD_UNREADABLE, recordWasRead } from "@/evidencePresentation"
@@ -85,6 +85,7 @@ function Row({
   linkedTab,
   onOpenTab,
   compact = false,
+  trailing,
 }: {
   row: ResultRow
   /** The tab that answers this row, when this run has it. `null` when it does
@@ -96,6 +97,10 @@ function Row({
    *  items are the rest of the answer, not a shorter version of it — a
    *  collapsed band hides them rather than trimming them. */
   compact?: boolean
+  /** Rendered at the row's right edge. The band's collapse control rides the
+   *  first row rather than taking a line of its own: alone on a line it has
+   *  nothing to align to and reads as floating above the band. */
+  trailing?: ReactNode
 }) {
   const status = row.status.replace(/_/g, " ")
   return (
@@ -146,6 +151,7 @@ function Row({
           </>
         )}
       </div>
+      {trailing}
     </div>
   )
 }
@@ -198,34 +204,35 @@ export function ResultBand({
           from the run that wrote it, and looks identical to one unless the page
           says so — which the terminal and the report both do, in these words.
           `tests/test_gloss_parity.py` holds the three copies together. */}
-      <div className="flex items-baseline gap-3 py-1">
-        {card.verdictSource === "legacy" ? (
-          <p className="text-[11px] text-muted-foreground">
-            <span className="font-mono uppercase tracking-[0.1em]">Record</span>
-            {" — "}
-            {"reconstructed from an older run record"}
-          </p>
-        ) : null}
-        {/* The band is the first thing on the page and the tabs are under it,
-            so on a run with long reasons it can hold the whole screen. Collapsed
-            it keeps the first row — the run's own verdict and headline — and
-            drops the other six. The choice is this browser's and is remembered. */}
-        <button
-          aria-expanded={!collapsed}
-          className="ml-auto shrink-0 text-[11px] text-muted-foreground underline-offset-2 hover:underline"
-          onClick={toggle}
-          type="button"
-        >
-          {collapsed ? `Show all ${card.rows.length} rows` : "Collapse"}
-        </button>
-      </div>
-      {(collapsed ? card.rows.slice(0, 1) : card.rows).map((row) => (
+      {card.verdictSource === "legacy" ? (
+        <p className="py-1 text-[11px] text-muted-foreground">
+          <span className="font-mono uppercase tracking-[0.1em]">Record</span>
+          {" — "}
+          {"reconstructed from an older run record"}
+        </p>
+      ) : null}
+      {(collapsed ? card.rows.slice(0, 1) : card.rows).map((row, index) => (
         <Row
           compact={collapsed}
           key={row.key}
           linkedTab={linkable(ROW_TAB[row.key])}
           onOpenTab={onOpenTab}
           row={row}
+          trailing={
+            index === 0 ? (
+              // `mt-0.5` is what the status chip beside it uses to sit on the
+              // 13px headline's line: this is 11px text solving the same
+              // problem, so it solves it the same way.
+              <button
+                aria-expanded={!collapsed}
+                className="mt-0.5 shrink-0 text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                onClick={toggle}
+                type="button"
+              >
+                {collapsed ? `Show all ${card.rows.length} rows` : "Collapse"}
+              </button>
+            ) : undefined
+          }
         />
       ))}
     </div>
