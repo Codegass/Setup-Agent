@@ -1338,13 +1338,17 @@ class PhysicalValidator:
             output = result.get("output", "")
             success = exit_code == 0
 
-            # Log command execution details
+            # A non-zero exit is the command's answer, not this helper's failure:
+            # `test -d X` exiting 1 says X is not there, and every caller in this
+            # file branches on exactly that. The helper cannot know what the exit
+            # means, so it states it at DEBUG; a caller that treats the negative
+            # as an error says so itself, with the meaning only it has.
             if success:
-                logger.debug(f"✅ {operation} succeeded: {command[:100]}...")
+                logger.debug(f"{operation}: exit 0: {command[:100]}")
             else:
-                logger.warning(f"❌ {operation} failed (exit_code={exit_code}): {command[:100]}...")
+                logger.debug(f"{operation}: exit {exit_code}: {command[:100]}")
                 if output:
-                    logger.warning(f"Command output: {output[:200]}...")
+                    logger.debug(f"{operation}: output: {output[:200]}")
 
             return {
                 "success": success,
