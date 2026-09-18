@@ -87,10 +87,44 @@ describe("TurnSparkline", () => {
     // Pointing at turn 2 in the tokens chart.
     fireEvent.mouseEnter(container.querySelectorAll('rect[data-hit="2"]')[0])
 
-    // Both readouts answer for turn 2: its bill, and its wall time.
-    expect(screen.getAllByText(/^Turn 2/)).toHaveLength(2)
+    // Each chart keeps its own number beside its own plot, and both are turn
+    // 2's: its bill, and its wall time.
     expect(screen.getByText("840 tokens")).toBeInTheDocument()
     expect(screen.getByText("400ms")).toBeInTheDocument()
+  })
+
+  it("says what the pointed-at turn actually did", () => {
+    // The two readouts carry one number each. What the turn ran, and how it came
+    // out, is the question a reader is really asking of a tall bar.
+    const { container } = render(
+      <TurnSparkline
+        doc={doc({
+          turns: [
+            turn(1, { tokens: { input: 10, output: 1 } }),
+            turn(2, {
+              call: { tool: "build", summary: "verify mvn clean verify" },
+              observation: { outcome: "failed", summary: "exit 1 · MAVEN_VERSION_ERROR" },
+              gate: { word: "partial" },
+              tokens: { input: 800, output: 40 },
+              t0: "2026-08-14T11:29:00.000Z",
+              t1: "2026-08-14T11:29:00.400Z",
+            }),
+          ],
+        })}
+      />,
+    )
+
+    fireEvent.mouseEnter(container.querySelectorAll('rect[data-hit="2"]')[0])
+    const panel = screen.getByText("Turn 2").parentElement?.parentElement as HTMLElement
+    expect(within(panel).getByText(/verify mvn clean verify/)).toBeInTheDocument()
+    expect(within(panel).getByText("failed")).toBeInTheDocument()
+    expect(within(panel).getByText(/exit 1 · MAVEN_VERSION_ERROR/)).toBeInTheDocument()
+    expect(within(panel).getByText("gate: partial")).toBeInTheDocument()
+    expect(within(panel).getByText("840 tokens · 400ms")).toBeInTheDocument()
+
+    // And it goes away with the pointer.
+    fireEvent.mouseLeave(container.querySelector(".overflow-x-auto") as Element)
+    expect(screen.queryByText("gate: partial")).not.toBeInTheDocument()
   })
 
   it("says a pointed-at column stated nothing rather than showing a number for it", () => {

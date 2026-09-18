@@ -9,6 +9,7 @@
  */
 
 import type {
+  ObservationOutcome,
   TrajectoryActor,
   TrajectoryAnnotation,
   TrajectoryDocument,
@@ -437,6 +438,15 @@ export interface SparkColumn {
   actor: TrajectoryActor
   /** Tool named by the turn, used to identify a peak without opening the row. */
   tool: string | null
+  /** What the call asked for, in the reducer's own one line — the same sentence
+   *  the terminal prints for this turn. `null` when the ledger stated none. */
+  summary: string | null
+  /** How the call came out, in one word, or `null` when nothing answered it. */
+  outcome: ObservationOutcome | null
+  /** What came back, in one line. */
+  result: string | null
+  /** The word the gate delivered on this turn, when one did. */
+  gate: string | null
   /** Prompt + completion tokens, or null when no bill has been stated yet. */
   tokens: number | null
   /** Wall time, or null when the turn has only one of its two stamps. */
@@ -462,6 +472,10 @@ export function sparkColumns(doc: TrajectoryDocument): SparkColumn[] {
       phase: turn.phase,
       actor: turn.actor,
       tool: turn.call?.tool ?? null,
+      summary: turn.call?.summary ?? null,
+      outcome: turn.observation?.outcome ?? null,
+      result: turn.observation?.summary ?? null,
+      gate: turn.gate?.word ?? null,
       tokens: turn.tokens ? turn.tokens.input + turn.tokens.output : null,
       durationMs: turnDurationMs(turn),
       anomalies: anomalies(marks.get(turn.turn_id) ?? []),

@@ -1,4 +1,4 @@
-import { Fragment, useState } from "react"
+import { Fragment, useRef, useState } from "react"
 
 import type { TrajectoryDocument } from "@/api/types"
 import type { SparkColumn } from "@/lib/trajectory"
@@ -94,7 +94,9 @@ function Plot({
   /** The turn the reader is pointing at, in either plot. Both plots draw the
    *  same columns, so pointing at one turn names it in both. */
   hoveredTurn: number | null
-  onHoverTurn: (turnId: number | null) => void
+  /** Called with the turn and the column's own box, so the panel can be put
+   *  under the column it is about rather than under the pointer. */
+  onHoverTurn: (turnId: number | null, box?: DOMRect) => void
 }) {
   const peak = peakColumn(columns, series.value)
   const peakValue = peak?.value ?? null
@@ -159,7 +161,9 @@ function Plot({
                   data-hit={column.turnId}
                   fill="transparent"
                   height={PLOT}
-                  onMouseEnter={() => onHoverTurn(column.turnId)}
+                  onMouseEnter={(event) =>
+                    onHoverTurn(column.turnId, event.currentTarget.getBoundingClientRect())
+                  }
                   width={PITCH}
                   x={x}
                   y={0}
@@ -172,10 +176,11 @@ function Plot({
             )
           })}
         </svg>
-        {/* The readout already had the shape a hover wants — a value and the
-            turn it belongs to — so pointing at a column answers here rather
-            than in a floating tooltip that would have to be positioned, sized
-            and kept out of its own way. Let go and it returns to the peak. */}
+        {/* This readout answers for the measure it labels — a value and the turn
+            it belongs to — while the panel below carries what that turn did.
+            Splitting them keeps each plot's own number beside its own plot, so
+            comparing tokens against seconds does not mean reading a tooltip
+            twice. Let go and both return to the peak. */}
         <div className="flex min-w-0 flex-col leading-tight">
           <span className="font-mono text-[10.5px] text-foreground">
             {hovered
@@ -215,15 +220,109 @@ function Plot({
  * and the wall time it took. Nothing is interpolated, smoothed, or filled in;
  * a turn the ledger has not billed yet is a gap, and says so on hover.
  */
+/** Wide enough for a Maven command line, narrow enough to sit under a plot. */
+const PANEL = 280
+
+/**
+ * What one turn did, for the column being pointed at.
+ *
+ * The same four facts the terminal prints for a turn, in the same order and the
+ * same words — the tool and what it asked for, how it came out, what it cost —
+ * because a reader who has watched a run in the terminal should not have to
+ * learn a second vocabulary to read it here.
+ */
+function TurnPanel({ column }: { column: SparkColumn }) {
+  return (
+    <div className="pointer-events-none space-y-1 rounded-md border border-border bg-popover px-2.5 py-2 shadow-md">
+      <div className="flex items-baseline gap-2">
+        <span className="text-[11px] font-semibold text-foreground">{`Turn ${column.turnId}`}</span>
+        <span className="text-[10px] text-muted-foreground">{column.phase}</span>
+        {column.actor === "controller" ? (
+          <span className="rounded-full bg-accent px-1.5 text-[9.5px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
+            engine
+          </span>
+        ) : null}
+      </div>
+      {column.tool ? (
+        <p className="font-mono text-[10.5px] leading-snug text-foreground">
+          <span className="text-muted-foreground">{column.tool}</span>
+          {column.summary ? ` ${column.summary}` : ""}
+        </p>
+      ) : (
+        <p className="text-[10.5px] text-muted-foreground">this turn called no tool</p>
+      )}
+      {column.outcome ? (
+        <p className="font-mono text-[10.5px] leading-snug">
+          <span
+            className={cn(
+              "font-semibold",
+              column.outcome === "ok" ? "text-status-success" : "text-status-failed",
+            )}
+          >
+            {column.outcome}
+          </span>
+          {column.result ? <span className="text-muted-foreground">{` · ${column.result}`}</span> : null}
+        </p>
+      ) : null}
+      {column.gate ? (
+        <p className="text-[10px] text-muted-foreground">{`gate: ${column.gate}`}</p>
+      ) : null}
+      <p className="font-mono text-[10px] text-muted-foreground">
+        {[
+          column.tokens == null ? "no tokens stated" : `${column.tokens.toLocaleString("en-US")} tokens`,
+          column.durationMs == null ? "no duration stated" : formatDuration(column.durationMs),
+        ].join(" · ")}
+      </p>
+      {column.anomalies.length ? (
+        <p className="text-[10px] font-semibold text-status-failed">
+          {column.anomalies.map((mark) => mark.label).join(" · ")}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
 export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
   // Held here rather than in each plot: the strips are drawn on one set of
   // columns and the docstring above promises they are aligned turn-for-turn, so
   // pointing at a turn should name that turn everywhere it appears.
-  const [hoveredTurn, setHoveredTurn] = useState<number | null>(null)
+  const [hover, setHover] = useState<{ turnId: number; left: number; top: number } | null>(null)
+  const figureRef = useRef<HTMLElement>(null)
+  const stripsRef = useRef<HTMLDivElement>(null)
+  const hoveredTurn = hover?.turnId ?? null
+
+  /** Place the panel under the column it is about, kept inside the figure.
+   *
+   *  Horizontally: from the column's own box rather than from the pointer, so
+   *  the panel does not shiver as the mouse moves inside one column, and read at
+   *  hover time so a horizontally scrolled strip needs no separate bookkeeping.
+   *
+   *  Vertically: under BOTH strips, never under the one being pointed at. The
+   *  two plots are drawn on one set of columns so that a reader can compare a
+   *  turn's bill against its wall time, and a panel that covers the other plot
+   *  takes away the comparison it was opened to explain. */
+  const point = (turnId: number | null, box?: DOMRect) => {
+    const figure = figureRef.current
+    if (turnId == null || !box || !figure) {
+      setHover(null)
+      return
+    }
+    const frame = figure.getBoundingClientRect()
+    const strips = stripsRef.current?.getBoundingClientRect()
+    const centre = box.left + box.width / 2 - frame.left
+    const room = Math.max(frame.width - PANEL - 8, 8)
+    setHover({
+      left: Math.min(Math.max(centre - PANEL / 2, 8), room),
+      top: (strips ? strips.bottom : box.bottom) - frame.top + 6,
+      turnId,
+    })
+  }
+
   const columns = sparkColumns(doc)
   if (!columns.length) {
     return null
   }
+  const pointed = hover ? columns.find((column) => column.turnId === hover.turnId) ?? null : null
 
   const marked = columns.filter((column) => column.anomalies.length)
   const totalMarks = marked.reduce((sum, column) => sum + column.anomalies.length, 0)
@@ -231,7 +330,7 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
   const billed = columns.some((column) => column.tokens != null)
 
   return (
-    <figure className="rounded-lg border border-border bg-card px-3 py-2">
+    <figure className="relative rounded-lg border border-border bg-card px-3 py-2" ref={figureRef}>
       <figcaption className="mb-1.5 flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <span className="text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
           per turn
@@ -251,7 +350,7 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
         )}
       </figcaption>
 
-      <div className="overflow-x-auto" onMouseLeave={() => setHoveredTurn(null)}>
+      <div className="overflow-x-auto" onMouseLeave={() => point(null)} ref={stripsRef}>
         <div className="flex flex-col gap-1" style={{ minWidth: width }}>
           {totalMarks ? (
             <svg
@@ -270,7 +369,7 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
                     )}
                     height={MARKS - 3}
                     key={column.turnId}
-                    onMouseEnter={() => setHoveredTurn(column.turnId)}
+                    onMouseEnter={(event) => point(column.turnId, event.currentTarget.getBoundingClientRect())}
                     rx={1.5}
                     width={COLUMN}
                     x={index * PITCH}
@@ -294,12 +393,20 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
               columns={columns}
               hoveredTurn={hoveredTurn}
               key={series.key}
-              onHoverTurn={setHoveredTurn}
+              onHoverTurn={point}
               series={series}
             />
           ))}
         </div>
       </div>
+      {pointed ? (
+        <div
+          className="absolute z-10"
+          style={{ left: hover?.left, top: hover?.top, width: PANEL }}
+        >
+          <TurnPanel column={pointed} />
+        </div>
+      ) : null}
       <p className="mt-2 text-[10.5px] leading-relaxed text-muted-foreground">
         Blue columns are stated values. Gray ticks mean no value is attributed to that turn.
         Tokens are recorded once per model response; duration is elapsed time for the turn.
