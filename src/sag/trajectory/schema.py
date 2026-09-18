@@ -155,6 +155,13 @@ class Turn(_TrajectoryModel):
     observation: ObservationInfo | None = None
     gate: GateInfo | None = None
     tokens: TokenUsage | None = None
+    #: What the advisor's own model call cost, on the turn that consulted it.
+    #: Separate from `tokens` and never added to it: `tokens` is what the run
+    #: paid for the MODEL's response, this is what it paid the advisor, and a
+    #: turn that asked for advice was charged both. One sum would report a turn
+    #: the run was never billed for as one thing, and would hide which of the
+    #: two models a run's spend actually went to.
+    advisor_tokens: TokenUsage | None = None
     t0: str | None = None
     t1: str | None = None
     control_seq: list[int] = Field(default_factory=list)

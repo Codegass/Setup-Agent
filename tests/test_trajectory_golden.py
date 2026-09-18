@@ -51,6 +51,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "trajectory"
 KAFKA = FIXTURES / "kafka-d2r3"
 CAMEL_QUARKUS = FIXTURES / "camel-quarkus-d2r3"
 IGNITE = FIXTURES / "ignite-d2r3"
+SLING = FIXTURES / "sling-commons-osgi-v4"
 
 #: The warning codes that name a call the ledger never fully accounted for.
 SILENT_CALL_CODES = ("missing_loop_decision", "missing_tool_result")
@@ -113,6 +114,18 @@ def _accumulated(
 def _executor_rows(session_dir: Path) -> list[dict]:
     text = (session_dir / "token_usage.csv").read_text(encoding="utf-8")
     return [r for r in csv.DictReader(io.StringIO(text)) if r["type"] == "executor"]
+
+
+def _advisor_rows(session_dir: Path) -> list[dict]:
+    """The advisor's own model calls. `advisor_compression` is one of them.
+
+    The tracker writes `advisor` for a consult and `advisor_compression` for the
+    packing call a long consult needs, and both are the advisor spending. A
+    reader that matched `advisor` exactly would drop the second kind the day one
+    appears, which is the shape of the hole this join was written to close.
+    """
+    text = (session_dir / "token_usage.csv").read_text(encoding="utf-8")
+    return [r for r in csv.DictReader(io.StringIO(text)) if r["type"].startswith("advisor")]
 
 
 def test_kafka_d2r3_replays_to_exactly_24_calls():
@@ -498,6 +511,135 @@ def test_the_executor_rows_that_bill_nobody_are_counted_out_loud():
     assert len(unattributed) == 1
     assert str(len(orphans)) in unattributed[0].detail
     assert len(orphans) == 8 and len(_executor_rows(KAFKA)) == 19
+
+
+# ---------------------------------------------------------------------------
+# What the advisor spent, on the advisor's turn, never inside the model's.
+#
+# The advisor's own model calls are `type=advisor` rows in the same ledger, and
+# for two rounds nothing read them: the four fixtures below hold nine such rows
+# between them, and every one of those tokens surfaced nowhere. The numbers are
+# literals taken from the fixtures' own `token_usage.csv`.
+#
+# `billed` is keyed by TURN id, because that is the join's whole claim: a row on
+# iteration N belongs to the advisor turn of iteration N. `stated` is what the
+# rows that reach no turn say out loud. Three fixtures predate the per-turn seal
+# and their advisor calls emit no `loop_decision`, so those turns carry no
+# iteration at all and their rows can only be stated — which is the honest
+# answer, and the one this fence pins so that a later join cannot start guessing
+# by position instead.
+# ---------------------------------------------------------------------------
+
+ADVISOR_SPEND = {
+    "camel-quarkus-d2r3": {
+        "rows": 2,
+        "tokens": 4736,
+        "billed": {},
+        "stated": "2 advisor row(s) bill no turn: iteration(s) 4, 6",
+    },
+    "ignite-d2r3": {
+        "rows": 3,
+        "tokens": 6470,
+        # Turn 1 asked for the advisor inside iteration 1, so it carries the
+        # model's bill for that response AND the advisor's bill for the consult.
+        "billed": {1: (332, 120)},
+        "stated": "2 advisor row(s) bill no turn: iteration(s) 10, 16",
+    },
+    "kafka-d2r3": {
+        "rows": 2,
+        "tokens": 5458,
+        "billed": {},
+        "stated": "2 advisor row(s) bill no turn: iteration(s) 10, 13",
+    },
+    # The one fixture whose advisor turns carry an iteration: both consults were
+    # forced by the harness, and a forced consult spends the advisor's tokens
+    # exactly as an asked-for one does.
+    "sling-commons-osgi-v4": {
+        "rows": 2,
+        "tokens": 4909,
+        "billed": {13: (1984, 148), 18: (2652, 125)},
+        "stated": None,
+    },
+}
+
+ADVISOR_DIRS = {
+    "camel-quarkus-d2r3": CAMEL_QUARKUS,
+    "ignite-d2r3": IGNITE,
+    "kafka-d2r3": KAFKA,
+    "sling-commons-osgi-v4": SLING,
+}
+
+
+@pytest.mark.parametrize("session", sorted(ADVISOR_DIRS))
+def test_every_archived_advisor_row_is_either_billed_to_a_turn_or_said_out_loud(session):
+    """Nine rows across four runs, and not one of them may go missing."""
+    pinned = ADVISOR_SPEND[session]
+    rows = _advisor_rows(ADVISOR_DIRS[session])
+    assert len(rows) == pinned["rows"]
+    assert sum(int(r["total_tokens"]) for r in rows) == pinned["tokens"]
+
+    snap = build_trajectory(ADVISOR_DIRS[session])
+    billed = {
+        t.turn_id: (t.advisor_tokens.input, t.advisor_tokens.output)
+        for t in snap.turns
+        if t.advisor_tokens is not None
+    }
+    assert billed == pinned["billed"]
+    assert all(snap.turns[t - 1].call.tool == "advisor" for t in billed)
+
+    stated = [w.detail for w in snap.warnings if w.code == "advisor_tokens_unattributed"]
+    assert stated == ([pinned["stated"]] if pinned["stated"] else [])
+    assert len(billed) + sum(len(s.split("iteration(s) ")[1].split(", ")) for s in stated) == len(
+        rows
+    )
+
+
+def test_ignites_first_turn_states_two_bills_and_never_one_sum():
+    """One turn, two spenders: the model's response and the consult it asked for.
+
+    Iteration 1 of ignite is a model response that called the advisor, so the
+    executor row pays for the response and the advisor row pays for the consult.
+    Adding them would report a 4,587-token turn the run was never charged for as
+    one thing; the turn carries both numbers, each under its own name.
+    """
+    snap = build_trajectory(IGNITE)
+    turn = snap.turns[0]
+    assert turn.call.tool == "advisor" and turn.iteration == 1
+    assert (turn.tokens.input, turn.tokens.output) == (4133, 82)
+    assert (turn.advisor_tokens.input, turn.advisor_tokens.output) == (332, 120)
+
+
+def test_slings_forced_consults_are_billed_the_advisor_they_forced():
+    """The actor does not matter: the advisor ran, so the advisor's row is its.
+
+    Both of sling's consults are the harness moving, and the model was never
+    charged for either — `tokens` stays empty on both turns. The advisor was
+    charged, and that is what the advisor's own row says.
+    """
+    snap = build_trajectory(SLING)
+    forced = [t for t in snap.turns if t.call is not None and t.call.tool == "advisor"]
+    assert [t.actor for t in forced] == ["controller", "controller"]
+    assert [t.tokens for t in forced] == [None, None]
+    assert [(t.advisor_tokens.input, t.advisor_tokens.output) for t in forced] == [
+        (1984, 148),
+        (2652, 125),
+    ]
+
+
+def test_an_advisor_bill_that_lands_after_the_run_still_reaches_its_turn(tmp_path):
+    """The ledger is exported at loop exit, so a follow meets the turn first.
+
+    The model's bills already retry; the advisor's has to retry the same way or
+    a followed run shows the advisor spending nothing while its replay shows
+    4,909 tokens — the two feeds disagreeing about the same run.
+    """
+    accumulated = _accumulated(SLING, tmp_path, withheld=("token_usage.csv",))
+    assert [
+        (t.turn_id, t.advisor_tokens.input, t.advisor_tokens.output)
+        for t in accumulated.turns
+        if t.advisor_tokens is not None
+    ] == [(13, 1984, 148), (18, 2652, 125)]
+    assert accumulated.turns == build_trajectory(SLING).turns
 
 
 # ---------------------------------------------------------------------------

@@ -84,6 +84,51 @@ def test_only_executor_rows_may_claim_a_turns_tokens(tmp_path):
     assert snap.turns[0].tokens.input == 4134
 
 
+#: kafka's own advisor row for iteration 1, the bytes the tracker wrote.
+ADVISOR_ROW = "1,2026-08-14T07:28:30.000000,advisor,Unknown,gpt-5.4-mini,2713,2575,138,0,138\n"
+#: What the same tracker writes when a consult's context had to be packed first
+#: (`react_llm.summarize_advisor_context`). Still the advisor spending.
+COMPRESSION_ROW = (
+    "1,2026-08-14T07:28:31.000000,advisor_compression,Unknown,gpt-5.4-mini,600,560,40,0,40\n"
+)
+
+
+def test_an_advisor_row_that_reaches_no_advisor_turn_is_stated_not_dropped(tmp_path):
+    """Neither turn below asked for advice, so the row pays nobody — out loud.
+
+    This is the hole the join was written to close. For two rounds the reader
+    skipped every advisor row and said nothing, so 38% of a real run's spend
+    appeared on no turn, in no total and in no warning. A row that bills nobody
+    is stated exactly as an executor row that bills nobody is.
+    """
+    tokens = REAL_TOKEN_CSV + ADVISOR_ROW
+    snap = build_trajectory(_session(tmp_path, events="\n".join(EVENT_LINES) + "\n", tokens=tokens))
+    assert all(t.advisor_tokens is None for t in snap.turns)
+    assert [(w.code, w.detail) for w in snap.warnings] == [
+        ("advisor_tokens_unattributed", "1 advisor row(s) bill no turn: iteration(s) 1")
+    ]
+
+
+def test_a_packing_call_is_the_advisor_spending_too(tmp_path):
+    """`advisor_compression` is the advisor's own call under a longer name.
+
+    The row is written by the same tracker on the same consult, and a reader
+    matching the word `advisor` exactly would drop it. Two advisor-side rows on
+    one iteration bill one turn between them, on the same first-row-wins rule
+    the model's bills follow — and the second says so.
+    """
+    tokens = REAL_TOKEN_CSV + ADVISOR_ROW + COMPRESSION_ROW
+    snap = build_trajectory(_session(tmp_path, events="\n".join(EVENT_LINES) + "\n", tokens=tokens))
+    assert [(w.code, w.detail) for w in snap.warnings] == [
+        (
+            "advisor_tokens_duplicate_row",
+            "1 duplicate advisor row(s) for iteration 1 bill nothing; "
+            "the first row keeps the bill",
+        ),
+        ("advisor_tokens_unattributed", "1 advisor row(s) bill no turn: iteration(s) 1"),
+    ]
+
+
 def test_two_calls_from_one_model_response_are_billed_once_between_them(tmp_path):
     """`iteration` counts model responses, not turns; the bill follows the response.
 

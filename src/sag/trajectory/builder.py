@@ -23,8 +23,13 @@ control stream does not carry:
   a forced action is the harness moving, not the model. Every row that ends up
   billing nobody is STATED rather than dropped: `tokens_unattributed` for a row
   no turn claims, `tokens_duplicate_row` for a second row on an iteration the
-  first row already paid. Advisor rows are that advisor's own spend and never a
-  turn's. The engine exports this file when the ReAct loop EXITS, so live it
+  first row already paid. The advisor's rows are billed the same way, one rule
+  over: a row on iteration N pays the turn that CALLED the advisor on iteration
+  N, whoever asked for it, and lands on `advisor_tokens` — never inside
+  `tokens`, because the two went to two different models and one sum would
+  report spend nobody was charged. `advisor_tokens_unattributed` and
+  `advisor_tokens_duplicate_row` are those rows' own statements. The engine
+  exports this file when the ReAct loop EXITS, so live it
   lands AFTER every turn it pays for: the follower therefore re-states a turn
   whose bill arrived late instead of leaving it unbilled forever, which is the
   only way the two feeds can agree about spend.
@@ -377,10 +382,10 @@ class _SessionSources:
                 found.append(candidate)
         return tuple(found)
 
-    def token_ledger(self) -> tuple[dict[int, TokenUsage], list[Warning]]:
+    def token_ledger(self) -> tuple[dict[int, TokenUsage], dict[int, TokenUsage], list[Warning]]:
         path = self._locate(TOKEN_USAGE_NAME)
         if path is None:
-            return {}, []
+            return {}, {}, []
         return _read_token_usage(path)
 
     def document(self, name: str) -> dict[str, Any] | None:
@@ -395,10 +400,17 @@ class _SessionSources:
 
     def finish(self, snapshot: Trajectory, *, extra: list[Warning] | None = None) -> Trajectory:
         """Join the artifacts the control stream does not carry."""
-        tokens, token_warnings = self.token_ledger()
+        tokens, advisor_tokens, token_warnings = self.token_ledger()
         biller = _TokenBiller()
-        turns = [biller.bill(turn, tokens) for turn in snapshot.turns]
-        unattributed = biller.unattributed(tokens)
+        turns = [biller.bill(turn, tokens, advisor_tokens) for turn in snapshot.turns]
+        unattributed = [
+            warning
+            for warning in (
+                biller.unattributed(tokens),
+                biller.advisor_unattributed(advisor_tokens),
+            )
+            if warning is not None
+        ]
         refs, elsewhere = _turn_refs(turns)
         resolved: dict[str, str] | None = None
         output_warnings: list[Warning] = []
@@ -414,7 +426,7 @@ class _SessionSources:
                 "warnings": order_warnings(
                     snapshot.warnings
                     + token_warnings
-                    + ([unattributed] if unattributed else [])
+                    + unattributed
                     + output_warnings
                     + list(extra or [])
                 ),
@@ -640,52 +652,98 @@ def _torn_tail(partial: bytes, offset: int) -> Warning | None:
     )
 
 
-def _read_token_usage(path: Path) -> tuple[dict[int, TokenUsage], list[Warning]]:
-    """Bill each iteration from its executor row; the first row wins, out loud.
+#: The ledger's two spenders, as its `type` column writes them. An executor row
+#: is the model's own response. Every other kind the tracker writes for the
+#: advisor begins with `advisor` — a plain consult is `advisor`, and the packing
+#: call a long consult needs is `advisor_compression` — so the advisor side is
+#: matched by prefix rather than by the one word, which is what keeps a kind
+#: added later from silently going unread the way `advisor` itself did.
+_ADVISOR_TYPE_PREFIX = "advisor"
 
-    One response, one bill: a second executor row for an iteration already billed
-    cannot be added (that would invent spend) and cannot replace the first
-    (that would make the bill depend on read order). So the first row keeps it —
-    and the ones that did not are STATED, on the same terms as the rows that
-    bill no turn at all. A total assembled by dropping rows in silence is the
-    same lie either way.
+
+def _read_token_usage(
+    path: Path,
+) -> tuple[dict[int, TokenUsage], dict[int, TokenUsage], list[Warning]]:
+    """Bill each iteration from its own rows; the first row of a kind wins, out loud.
+
+    Two bills come back, never one: the model's, from the `executor` rows, and
+    the advisor's, from the rows whose type names the advisor. They are kept
+    apart the whole way down because they were paid to two different models, and
+    a reader adding them would report spend nobody was charged as one number.
+
+    One response, one bill: a second row of the same kind for an iteration
+    already billed cannot be added (that would invent spend) and cannot replace
+    the first (that would make the bill depend on read order). So the first row
+    keeps it — and the ones that did not are STATED, on the same terms as the
+    rows that bill no turn at all. A total assembled by dropping rows in silence
+    is the same lie either way.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        return {}, [_token_warning(f"{path.name} could not be read: {exc}")]
+        return {}, {}, [_token_warning(f"{path.name} could not be read: {exc}")]
 
     billed: dict[int, TokenUsage] = {}
+    advised: dict[int, TokenUsage] = {}
     rows: Counter[int] = Counter()
+    advisor_rows: Counter[int] = Counter()
     try:
         for row in csv.DictReader(io.StringIO(text)):
-            if (row.get("type") or "").strip() != "executor":
+            kind = (row.get("type") or "").strip()
+            if kind == "executor":
+                into, counted = billed, rows
+            elif kind.startswith(_ADVISOR_TYPE_PREFIX):
+                into, counted = advised, advisor_rows
+            else:
                 continue
             iteration = int(str(row.get("iteration", "")).strip())
-            rows[iteration] += 1
-            if iteration in billed:
+            counted[iteration] += 1
+            if iteration in into:
                 continue
-            billed[iteration] = TokenUsage(
+            into[iteration] = TokenUsage(
                 input=int(str(row.get("prompt_tokens", "")).strip()),
                 output=int(str(row.get("completion_tokens", "")).strip()),
             )
     except (ValueError, csv.Error) as exc:
-        return {}, [_token_warning(f"{path.name} is not the expected token ledger: {exc}")]
-    return billed, [
-        _duplicate_rows(iteration, count) for iteration, count in sorted(rows.items()) if count > 1
-    ]
+        return {}, {}, [_token_warning(f"{path.name} is not the expected token ledger: {exc}")]
+    return (
+        billed,
+        advised,
+        [
+            _duplicate_rows(iteration, count, kind)
+            for kind, counter in (("executor", rows), ("advisor", advisor_rows))
+            for iteration, count in sorted(counter.items())
+            if count > 1
+        ],
+    )
 
 
 def _token_warning(detail: str) -> Warning:
     return Warning(code="token_usage_unreadable", detail=detail, control_seq=None)
 
 
-def _duplicate_rows(iteration: int, count: int) -> Warning:
+def _duplicate_rows(iteration: int, count: int, kind: str) -> Warning:
     return Warning(
-        code="tokens_duplicate_row",
+        code="tokens_duplicate_row" if kind == "executor" else "advisor_tokens_duplicate_row",
         detail=(
-            f"{count - 1} duplicate executor row(s) for iteration {iteration} "
+            f"{count - 1} duplicate {kind} row(s) for iteration {iteration} "
             f"bill nothing; the first row keeps the bill"
+        ),
+        control_seq=None,
+    )
+
+
+def _orphan_rows(
+    kind: str, rows: dict[int, TokenUsage], claimed: dict[int, int]
+) -> Warning | None:
+    orphans = sorted(set(rows) - set(claimed))
+    if not orphans:
+        return None
+    return Warning(
+        code="tokens_unattributed" if kind == "executor" else "advisor_tokens_unattributed",
+        detail=(
+            f"{len(orphans)} {kind} row(s) bill no turn: "
+            f"iteration(s) {', '.join(str(i) for i in orphans)}"
         ),
         control_seq=None,
     )
@@ -760,6 +818,7 @@ class _TokenBiller:
 
     def __init__(self) -> None:
         self._claimed: dict[int, int] = {}
+        self._advised: dict[int, int] = {}
 
     def claims(self, turn: Turn) -> bool:
         """Whether this turn is the one its response's row bills, row or no row.
@@ -778,12 +837,49 @@ class _TokenBiller:
             return False
         return self._claimed.setdefault(iteration, turn.turn_id) == turn.turn_id
 
-    def bill(self, turn: Turn, billed: dict[int, TokenUsage]) -> Turn:
+    def consults(self, turn: Turn) -> bool:
+        """Whether this turn is the one its iteration's advisor row bills.
+
+        The actor is not asked, and that is the rule: the advisor spent those
+        tokens whether the model asked for the consult or the harness forced it,
+        and a forced consult with no bill would put the advisor's largest spends
+        (both of sling's, both of the real commons-cli run's) on no turn at all.
+        What IS asked is whether the turn called the advisor, because that is
+        the only thing in the ledger that says a consult happened here.
+
+        Claimed on sight, like the model's bill and for the same reason: the
+        ledger lands at loop exit, so a claim that waited for its row would
+        settle on a different turn in a follow than in a replay.
+        """
         iteration = turn.iteration
-        if iteration is None or not self.claims(turn):
+        if iteration is None or turn.call is None or turn.call.tool != "advisor":
+            return False
+        return self._advised.setdefault(iteration, turn.turn_id) == turn.turn_id
+
+    def bill(
+        self,
+        turn: Turn,
+        billed: dict[int, TokenUsage],
+        advised: dict[int, TokenUsage] | None = None,
+    ) -> Turn:
+        """Put each spender's bill on the turn under its own name.
+
+        A turn can take both — ignite's first turn is a model response that
+        called the advisor — and they are written to two fields, never added.
+        """
+        iteration = turn.iteration
+        if iteration is None:
             return turn
-        usage = billed.get(iteration)
-        return turn if usage is None else turn.model_copy(update={"tokens": usage})
+        update: dict[str, TokenUsage] = {}
+        if self.claims(turn):
+            usage = billed.get(iteration)
+            if usage is not None:
+                update["tokens"] = usage
+        if self.consults(turn):
+            advice = (advised or {}).get(iteration)
+            if advice is not None:
+                update["advisor_tokens"] = advice
+        return turn.model_copy(update=update) if update else turn
 
     def unattributed(self, billed: dict[int, TokenUsage]) -> Warning | None:
         """Name the rows that billed nobody. Unattributable spend is a finding.
@@ -792,17 +888,18 @@ class _TokenBiller:
         advisor calls emit no `loop_decision`, so 8 of its 19 rows join nothing.
         A token total that quietly omits 42% of a run is worse than no total.
         """
-        orphans = sorted(set(billed) - set(self._claimed))
-        if not orphans:
-            return None
-        return Warning(
-            code="tokens_unattributed",
-            detail=(
-                f"{len(orphans)} executor row(s) bill no turn: "
-                f"iteration(s) {', '.join(str(i) for i in orphans)}"
-            ),
-            control_seq=None,
-        )
+        return _orphan_rows("executor", billed, self._claimed)
+
+    def advisor_unattributed(self, advised: dict[int, TokenUsage]) -> Warning | None:
+        """The same statement for the advisor's rows, for the same reason.
+
+        Three of the four archived fixtures predate the per-turn seal and their
+        advisor calls emit no `loop_decision`, so those turns carry no iteration
+        and their rows reach nobody. Saying so is the honest answer; guessing at
+        the turn by position would put real spend on a turn that never consulted
+        anyone.
+        """
+        return _orphan_rows("advisor", advised, self._advised)
 
 
 class _Joiner:
@@ -827,6 +924,10 @@ class _Joiner:
         self._sources = sources
         self._biller = _TokenBiller()
         self._tokens: dict[int, TokenUsage] = {}
+        self._advisor_tokens: dict[int, TokenUsage] = {}
+        #: Keyed by TURN id, not by iteration: one turn can claim both bills
+        #: (ignite's first turn does), and two maps keyed by iteration would
+        #: restate it twice, each copy dropping the other's field.
         self._claimants: dict[int, Turn] = {}
         self._reledgered = False
         self._token_warnings: list[Warning] = []
@@ -849,9 +950,13 @@ class _Joiner:
         """
         self._ledger_missing = ledger_missing
         self._unreadable = unreadable
-        tokens, self._token_warnings = self._sources.token_ledger()
-        self._reledgered = self._reledgered or tokens != self._tokens
+        tokens, advisor_tokens, self._token_warnings = self._sources.token_ledger()
+        self._reledgered = self._reledgered or (tokens, advisor_tokens) != (
+            self._tokens,
+            self._advisor_tokens,
+        )
         self._tokens = tokens
+        self._advisor_tokens = advisor_tokens
         self._around = _session_join("", self._sources)
 
     def wrap(self, delta: TrajectoryDelta) -> TrajectoryDelta | None:
@@ -879,16 +984,17 @@ class _Joiner:
         return None if _is_empty(joined) else joined
 
     def _bill(self, turn: Turn) -> Turn:
-        """Bill a turn by `finish`'s rules, and remember it if it is a claimant.
+        """Bill a turn by `finish`'s rules, and remember it if it claims a bill.
 
         Only a claimant's bill can ever change, so only a claimant is worth
-        holding on to: its sibling turns ride along unbilled forever and a
-        controller turn is never billed at all.
+        holding on to: a sibling turn of the same response rides along unbilled
+        forever, and a controller turn is never billed for a model response.
+        A turn that consulted the advisor is a claimant of the advisor's bill
+        however it was billed for the model's — including not at all.
         """
-        billed = self._biller.bill(turn, self._tokens)
-        iteration = turn.iteration
-        if iteration is not None and self._biller.claims(turn):
-            self._claimants[iteration] = billed
+        billed = self._biller.bill(turn, self._tokens, self._advisor_tokens)
+        if self._biller.claims(turn) or self._biller.consults(turn):
+            self._claimants[turn.turn_id] = billed
         return billed
 
     def _rebilled(self, sent: set[int]) -> list[Turn]:
@@ -909,12 +1015,20 @@ class _Joiner:
             return []
         self._reledgered = False
         restated: list[Turn] = []
-        for iteration, turn in list(self._claimants.items()):
-            usage = self._tokens.get(iteration)
-            if usage == turn.tokens or turn.turn_id in sent:
+        for turn_id, turn in list(self._claimants.items()):
+            update: dict[str, TokenUsage | None] = {}
+            if self._biller.claims(turn):
+                usage = self._tokens.get(turn.iteration)
+                if usage != turn.tokens:
+                    update["tokens"] = usage
+            if self._biller.consults(turn):
+                advice = self._advisor_tokens.get(turn.iteration)
+                if advice != turn.advisor_tokens:
+                    update["advisor_tokens"] = advice
+            if not update or turn_id in sent:
                 continue
-            restated.append(turn.model_copy(update={"tokens": usage}))
-            self._claimants[iteration] = restated[-1]
+            restated.append(turn.model_copy(update=update))
+            self._claimants[turn_id] = restated[-1]
         return restated
 
     def _resolve(self) -> tuple[dict[str, str] | None, list[Warning]]:
@@ -936,9 +1050,12 @@ class _Joiner:
 
     def _restate(self, unresolved: list[Warning]) -> tuple[list[Warning], list[Warning]]:
         current = list(self._token_warnings)
-        orphans = self._biller.unattributed(self._tokens)
-        if orphans is not None:
-            current.append(orphans)
+        for orphans in (
+            self._biller.unattributed(self._tokens),
+            self._biller.advisor_unattributed(self._advisor_tokens),
+        ):
+            if orphans is not None:
+                current.append(orphans)
         if self._ledger_missing:
             current.append(_missing_ledger(self._sources.path))
         if self._unreadable is not None:
