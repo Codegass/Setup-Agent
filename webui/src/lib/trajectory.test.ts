@@ -599,4 +599,21 @@ describe("sparkColumns and seriesPeak", () => {
     expect(seriesPeak([], (c) => c.tokens)).toBeNull()
     expect(seriesPeak(sparkColumns(doc({ turns: [unbilled] })), (c) => c.tokens)).toBeNull()
   })
+
+  it("carries the advisor's own bill as its own measure, never inside the model's", () => {
+    // A consult the run paid a second model for. Folding it into `tokens` would
+    // put 60,420 tokens on a turn whose own response cost 8,648 — and would
+    // flatten every other column against a peak nothing in that series reached.
+    const consulted = turn(3, {
+      call: { tool: "advisor" },
+      tokens: { input: 8648, output: 199 },
+      advisor_tokens: { input: 60239, output: 181 },
+    })
+    const columns = sparkColumns(doc({ turns: [billed, consulted] }))
+
+    expect(columns.map((c) => c.tokens)).toEqual([4205, 8847])
+    expect(columns.map((c) => c.advisorTokens)).toEqual([null, 60420])
+    expect(seriesPeak(columns, (c) => c.advisorTokens)).toBe(60420)
+    expect(seriesPeak(columns, (c) => c.tokens)).toBe(8847)
+  })
 })

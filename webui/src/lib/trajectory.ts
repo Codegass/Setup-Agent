@@ -449,6 +449,12 @@ export interface SparkColumn {
   gate: string | null
   /** Prompt + completion tokens, or null when no bill has been stated yet. */
   tokens: number | null
+  /** What the ADVISOR's own call cost on this turn, or null when this turn
+   *  consulted nobody. Its own measure, on its own scale: a 60,420-token
+   *  consult drawn against the model's peak flattens every model column to a
+   *  hairline, and added into `tokens` it would report a turn the run was never
+   *  billed for as one thing. */
+  advisorTokens: number | null
   /** Wall time, or null when the turn has only one of its two stamps. */
   durationMs: number | null
   /** The marks the reducer drew on this turn, if any. */
@@ -477,6 +483,9 @@ export function sparkColumns(doc: TrajectoryDocument): SparkColumn[] {
       result: turn.observation?.summary ?? null,
       gate: turn.gate?.word ?? null,
       tokens: turn.tokens ? turn.tokens.input + turn.tokens.output : null,
+      advisorTokens: turn.advisor_tokens
+        ? turn.advisor_tokens.input + turn.advisor_tokens.output
+        : null,
       durationMs: turnDurationMs(turn),
       anomalies: anomalies(marks.get(turn.turn_id) ?? []),
     }))

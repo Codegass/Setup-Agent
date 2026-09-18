@@ -28,10 +28,18 @@ interface Series {
   detail: string
   /** The value this series reads off a column, or null when none was stated. */
   value: (column: SparkColumn) => number | null
-  /** How a value is spoken, in the axis label and in a column's own title. */
+  /** How a value is spoken in the axis label, where a plot has room for four
+   *  characters and not for a thousands separator. */
   format: (value: number) => string
+  /** The same value in full, for the title a reader hovers. */
+  exact: (value: number) => string
   /** What one column is called when nothing was stated for it. */
   unstated: string
+  /** What the readout says when no column in the series stated anything. */
+  empty: string
+  /** Whether this series is drawn at all. A measure nothing in the run states
+   *  is a strip of gray ticks that answers a question nobody asked. */
+  drawn?: (columns: SparkColumn[]) => boolean
 }
 
 /**
@@ -45,6 +53,11 @@ interface Series {
  */
 const INK = "fill-primary"
 
+/** Exact counts belong in the title a reader hovers, not in a 6px column. */
+function tokenCount(value: number, noun = "tokens"): string {
+  return `${value.toLocaleString("en-US")} ${noun}`
+}
+
 const SERIES: Series[] = [
   {
     key: "tokens",
@@ -52,7 +65,26 @@ const SERIES: Series[] = [
     detail: "Input plus output tokens attributed to this turn",
     value: (column) => column.tokens,
     format: formatTokens,
+    exact: (value) => tokenCount(value),
     unstated: "no tokens stated",
+    empty: "No tokens stated",
+  },
+  {
+    // The advisor is a second model answering a second question, and its bill
+    // has no business on the executor's axis: one 60,420-token consult against
+    // an 8,847-token peak draws every model column as a hairline. Same rule as
+    // seconds against tokens — different measures, different scales. The strip
+    // appears only on a run that consulted someone, because a row of gray ticks
+    // on every other run answers a question nobody asked.
+    key: "advisor",
+    label: "Advisor tokens per consult",
+    detail: "Input plus output tokens the advisor's own call cost",
+    value: (column) => column.advisorTokens,
+    format: formatTokens,
+    exact: (value) => tokenCount(value, "advisor tokens"),
+    unstated: "no advisor tokens stated",
+    empty: "No advisor tokens stated",
+    drawn: (columns) => columns.some((column) => column.advisorTokens != null),
   },
   {
     key: "duration",
@@ -60,14 +92,11 @@ const SERIES: Series[] = [
     detail: "Elapsed wall time recorded for this turn",
     value: (column) => column.durationMs,
     format: formatDuration,
+    exact: formatDuration,
     unstated: "no duration stated",
+    empty: "No duration stated",
   },
 ]
-
-/** Exact counts belong in the title a reader hovers, not in a 6px column. */
-function exact(series: Series, value: number): string {
-  return series.key === "tokens" ? `${value.toLocaleString("en-US")} tokens` : formatDuration(value)
-}
 
 function peakColumn(
   columns: SparkColumn[],
@@ -169,7 +198,7 @@ function Plot({
                   y={0}
                 >
                   <title>
-                    {`turn ${column.turnId} · ${stated ? exact(series, value) : series.unstated}`}
+                    {`turn ${column.turnId} · ${stated ? series.exact(value) : series.unstated}`}
                   </title>
                 </rect>
               </Fragment>
@@ -186,7 +215,7 @@ function Plot({
             {hovered
               ? hoveredValue == null
                 ? "—"
-                : exact(series, hoveredValue)
+                : series.exact(hoveredValue)
               : peakValue == null
                 ? "—"
                 : series.format(peakValue)}
@@ -202,7 +231,7 @@ function Plot({
                 }`
               : peak
                 ? `Max at Turn ${peak.column.turnId}${peak.column.tool ? ` · ${peak.column.tool}` : ""}`
-                : `No ${series.key} stated`}
+                : series.empty}
           </span>
         </div>
       </div>
@@ -215,9 +244,11 @@ function Plot({
  *
  * Everything drawn here was stated by the trajectory reducer at the SUMMARY
  * tier — the tier a live run is polled at — so the header keeps up with the
- * timeline underneath it without ever asking for bytes. Three strips over one
- * set of columns: the marks the reducer drew, the tokens each turn was billed,
- * and the wall time it took. Nothing is interpolated, smoothed, or filled in;
+ * timeline underneath it without ever asking for bytes. Strips over one set of
+ * columns: the marks the reducer drew, the tokens each turn was billed, what
+ * the advisor charged where a turn consulted it, and the wall time it took.
+ * The advisor's is drawn only where there is any, and never on the model's
+ * scale — two models, two bills, and no sum of the two anywhere. Nothing is interpolated, smoothed, or filled in;
  * a turn the ledger has not billed yet is a gap, and says so on hover.
  */
 /** Wide enough for a Maven command line, narrow enough to sit under a plot. */
@@ -269,10 +300,20 @@ function TurnPanel({ column }: { column: SparkColumn }) {
       ) : null}
       <p className="font-mono text-[10px] text-muted-foreground">
         {[
-          column.tokens == null ? "no tokens stated" : `${column.tokens.toLocaleString("en-US")} tokens`,
+          column.tokens == null ? "no tokens stated" : tokenCount(column.tokens),
           column.durationMs == null ? "no duration stated" : formatDuration(column.durationMs),
         ].join(" · ")}
       </p>
+      {/* A line of its own, under its own name. This turn was billed twice —
+          once for the response it made and once for the advice it asked for —
+          and the two went to two different models, so they are never added and
+          never printed as one figure. A turn that consulted nobody says
+          nothing here rather than saying zero. */}
+      {column.advisorTokens == null ? null : (
+        <p className="font-mono text-[10px] text-muted-foreground">
+          {`advisor ${tokenCount(column.advisorTokens)}`}
+        </p>
+      )}
       {column.anomalies.length ? (
         <p className="text-[10px] font-semibold text-status-failed">
           {column.anomalies.map((mark) => mark.label).join(" · ")}
@@ -388,7 +429,7 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
             </svg>
           ) : null}
 
-          {SERIES.map((series) => (
+          {SERIES.filter((series) => series.drawn?.(columns) ?? true).map((series) => (
             <Plot
               columns={columns}
               hoveredTurn={hoveredTurn}
@@ -409,7 +450,8 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
       ) : null}
       <p className="mt-2 text-[10.5px] leading-relaxed text-muted-foreground">
         Blue columns are stated values. Gray ticks mean no value is attributed to that turn.
-        Tokens are recorded once per model response; duration is elapsed time for the turn.
+        Tokens are recorded once per model response; advisor tokens are what a consult itself
+        cost and are never added to them; duration is elapsed time for the turn.
       </p>
     </figure>
   )

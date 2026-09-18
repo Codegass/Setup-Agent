@@ -661,6 +661,10 @@ export interface TrajectoryTurn {
   observation?: TrajectoryObservation | null
   gate?: TrajectoryGate | null
   tokens?: TrajectoryTokens | null
+  /** What the advisor's own call cost, on a turn that consulted it. Its own
+   *  field, never folded into `tokens`: that is what the run paid for THIS
+   *  model's response, and a turn that asked for advice was charged both. */
+  advisor_tokens?: TrajectoryTokens | null
   t0?: string | null
   t1?: string | null
   control_seq: number[]

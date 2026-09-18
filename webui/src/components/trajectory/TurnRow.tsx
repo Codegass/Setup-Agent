@@ -340,9 +340,19 @@ export function TurnRow({
               {`iter ${turn.iteration}`}
             </span>
           ) : null}
+          {/* Two models can answer on one turn — the executor's own response,
+              and the advisor a consult paid for — so each bill is printed under
+              the name of the model that sent it. Side by side and unlabelled
+              they read as one measure stated twice; added together they are a
+              bill nobody was ever sent. */}
           {turn.tokens ? (
             <span className="font-mono text-[10.5px] text-muted-foreground">
-              {`${turn.tokens.input} in / ${turn.tokens.output} out`}
+              {`model ${turn.tokens.input} in / ${turn.tokens.output} out`}
+            </span>
+          ) : null}
+          {turn.advisor_tokens ? (
+            <span className="font-mono text-[10.5px] text-muted-foreground">
+              {`advisor ${turn.advisor_tokens.input} in / ${turn.advisor_tokens.output} out`}
             </span>
           ) : null}
           {duration ? (

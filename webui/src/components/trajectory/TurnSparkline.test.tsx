@@ -212,6 +212,67 @@ describe("TurnSparkline", () => {
     expect(screen.queryByText(/no tokens stated/i)).not.toBeInTheDocument()
   })
 
+  it("draws the advisor's spend as a third strip on its own scale", () => {
+    // A 60,420-token consult on the model's axis flattens every model bar to a
+    // hairline — two measures, two scales, the same rule the duration strip
+    // already follows. The strip is drawn only on runs that consulted anyone.
+    render(
+      <TurnSparkline
+        doc={doc({
+          turns: [
+            turn(1, { tokens: { input: 8648, output: 199 } }),
+            turn(2, {
+              call: { tool: "advisor", summary: "consult" },
+              advisor_tokens: { input: 60239, output: 181 },
+            }),
+          ],
+        })}
+      />,
+    )
+
+    const advisor = screen.getByRole("img", { name: /advisor tokens per consult/i })
+    expect(within(advisor).getByText(/turn 2 · 60,420 advisor tokens/i)).toBeInTheDocument()
+    // Its own peak, and the model strip keeps its own.
+    expect(screen.getByText("60.4k")).toBeInTheDocument()
+    expect(screen.getByText("8.8k")).toBeInTheDocument()
+    // A turn that consulted nobody states nothing here, and says so.
+    expect(within(advisor).getByText(/turn 1 · no advisor tokens stated/i)).toBeInTheDocument()
+  })
+
+  it("leaves the third strip off a run that consulted nobody", () => {
+    render(<TurnSparkline doc={doc()} />)
+    expect(screen.queryByRole("img", { name: /advisor tokens per consult/i })).not.toBeInTheDocument()
+  })
+
+  it("says what the advisor cost on the turn being pointed at", () => {
+    const { container } = render(
+      <TurnSparkline
+        doc={doc({
+          turns: [
+            turn(1, { tokens: { input: 10, output: 1 } }),
+            turn(2, {
+              call: { tool: "advisor", summary: "consult" },
+              advisor_tokens: { input: 8645, output: 147 },
+              t0: "2026-08-14T11:29:00.000Z",
+              t1: "2026-08-14T11:29:00.400Z",
+            }),
+          ],
+        })}
+      />,
+    )
+
+    fireEvent.mouseEnter(container.querySelectorAll('rect[data-hit="2"]')[0])
+    const panel = screen.getByText("Turn 2").parentElement?.parentElement as HTMLElement
+    // Its own line, under its own name: the turn's own response and the advice
+    // it paid for are two bills, and one sum would report neither.
+    expect(within(panel).getByText("advisor 8,792 tokens")).toBeInTheDocument()
+    expect(within(panel).getByText("no tokens stated · 400ms")).toBeInTheDocument()
+
+    // A turn that consulted nobody says nothing about the advisor at all.
+    fireEvent.mouseEnter(container.querySelectorAll('rect[data-hit="1"]')[0])
+    expect(screen.queryByText(/advisor .* tokens/)).not.toBeInTheDocument()
+  })
+
   it("draws nothing at all before the first turn is on the record", () => {
     const { container } = render(<TurnSparkline doc={doc({ turns: [] })} />)
     expect(container).toBeEmptyDOMElement()

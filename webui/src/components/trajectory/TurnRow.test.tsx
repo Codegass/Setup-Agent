@@ -58,6 +58,29 @@ describe("TurnRow", () => {
     expect(screen.getByText("exit 1 · MAVEN_VERSION_ERROR")).toBeInTheDocument()
   })
 
+  it("states both bills a consult turn carries, each under its own name", () => {
+    // The run paid two models on this turn: its own response, and the advice it
+    // asked for. Unlabelled numbers side by side would read as one measure
+    // stated twice, and added together they would be a bill nobody was sent.
+    render(
+      row({
+        call: { tool: "advisor", summary: "consult" },
+        tokens: { input: 8648, output: 199 },
+        advisor_tokens: { input: 60239, output: 181 },
+      }),
+    )
+
+    expect(screen.getByText("model 8648 in / 199 out")).toBeInTheDocument()
+    expect(screen.getByText("advisor 60239 in / 181 out")).toBeInTheDocument()
+  })
+
+  it("says nothing about the advisor on a turn that consulted nobody", () => {
+    render(row({ tokens: { input: 8648, output: 199 } }))
+
+    expect(screen.getByText("model 8648 in / 199 out")).toBeInTheDocument()
+    expect(screen.queryByText(/advisor/)).not.toBeInTheDocument()
+  })
+
   it("marks a controller turn as the engine", () => {
     render(row({ turn_id: 9, actor: "controller" }))
 
