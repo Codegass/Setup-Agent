@@ -11,11 +11,11 @@ So there is one reader, and it answers with a mapping whose keys are the
 keyword names `build_result_card` takes. Every site splats it whole
 (`build_result_card(payload, **read_run_counts(directory))`), which is what
 makes the next divergence impossible rather than merely unlikely: a surface
-cannot fill four of the five counts and forget the fifth, because it never
-names them one at a time.
+cannot fill every count but one and forget that one, because it never names
+them one at a time.
 
-The counts travel as a group for the same reason. They are five readings of one
-replay; asking the ledger five separate times could answer five different
+The counts travel as a group for the same reason. They are readings of one
+replay; asking the ledger for them one at a time could answer several different
 things about one run.
 """
 
@@ -39,6 +39,7 @@ RUN_COUNT_KEYS = (
     "tool_calls",
     "tool_failures",
     "token_usage",
+    "advisor_token_usage",
 )
 
 #: What a mirrored report is called beside the ledger. The report tool writes
@@ -58,8 +59,9 @@ def read_run_counts(session_dir: Path | str | None) -> dict[str, Any]:
     """Fold a run's own ledger into the counts every result card states.
 
     Every count is absent unless the ledger supplied it: a run whose turns were
-    never recorded reports no turns, not zero turns, and a directory that
-    cannot be read leaves the whole group absent rather than raising.
+    never recorded reports no turns, not zero turns, a run that consulted nobody
+    reports no advisor spend rather than zero, and a directory that cannot be
+    read leaves the whole group absent rather than raising.
 
     The failure signal is the error code or failure signature the observation
     carries, which is the one definition of a failed call shared by all four
@@ -98,6 +100,17 @@ def read_run_counts(session_dir: Path | str | None) -> dict[str, Any]:
         if turn.tokens is not None
     )
     counts["token_usage"] = billed or None
+    # The advisor's own calls, on the same terms: the turn each one was billed
+    # to, never the file's raw rows. They travel in this group rather than
+    # beside it, because a surface that has to ask for them separately is a
+    # surface that can forget to — which is how the executor's total came to be
+    # shown on its own as though it were the run's.
+    consulted = tuple(
+        {"prompt_tokens": turn.advisor_tokens.input, "output_tokens": turn.advisor_tokens.output}
+        for turn in turns
+        if turn.advisor_tokens is not None
+    )
+    counts["advisor_token_usage"] = consulted or None
     return counts
 
 

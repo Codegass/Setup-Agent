@@ -70,11 +70,28 @@ def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _totalled(
+    rows: Iterable[Mapping[str, Any]] | None,
+) -> tuple[int | None, int | None]:
+    """Add up one spender's rows. Absent until a row actually supplies a number:
+    a run whose usage was never recorded reports no tokens, not zero tokens."""
+    prompt_total = output_total = None
+    for row in rows or ():
+        prompt = row.get("prompt_tokens")
+        output = row.get("output_tokens")
+        if isinstance(prompt, int):
+            prompt_total = prompt if prompt_total is None else prompt_total + prompt
+        if isinstance(output, int):
+            output_total = output if output_total is None else output_total + output
+    return prompt_total, output_total
+
+
 def _stats(
     snapshot: Any,
     *,
     run_pin: Any,
     token_usage: Iterable[Mapping[str, Any]] | None,
+    advisor_token_usage: Iterable[Mapping[str, Any]] | None,
     trajectory_session: Any,
     turn_count: int | None,
     tool_calls: int | None,
@@ -90,14 +107,10 @@ def _stats(
 
     # Absent until a row actually supplies a number: a run whose usage was never
     # recorded reports no tokens, not zero tokens.
-    tokens_in = tokens_out = None
-    for row in token_usage or ():
-        prompt = row.get("prompt_tokens")
-        output = row.get("output_tokens")
-        if isinstance(prompt, int):
-            tokens_in = prompt if tokens_in is None else tokens_in + prompt
-        if isinstance(output, int):
-            tokens_out = output if tokens_out is None else tokens_out + output
+    tokens_in, tokens_out = _totalled(token_usage)
+    # Summed apart and kept apart. The executor and the advisor are two models,
+    # and one number for both would say the run spent it all in one place.
+    advisor_tokens_in, advisor_tokens_out = _totalled(advisor_token_usage)
 
     pin = _mapping(run_pin)
     advisor = _mapping(pin.get("advisor"))
@@ -112,6 +125,8 @@ def _stats(
         tool_failures=tool_failures,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        advisor_tokens_in=advisor_tokens_in,
+        advisor_tokens_out=advisor_tokens_out,
         wall_clock_seconds=wall_clock if isinstance(wall_clock, (int, float)) else None,
         model=pin.get("action_model") or None,
         advisor_model=advisor.get("model") or None,
@@ -251,6 +266,7 @@ def build_result_card(
     report_metrics: Any = None,
     run_pin: Any = None,
     token_usage: Iterable[Mapping[str, Any]] | None = None,
+    advisor_token_usage: Iterable[Mapping[str, Any]] | None = None,
     trajectory_session: Any = None,
     turn_count: int | None = None,
     tool_calls: int | None = None,
@@ -270,6 +286,7 @@ def build_result_card(
         sealed,
         run_pin=run_pin,
         token_usage=token_usage,
+        advisor_token_usage=advisor_token_usage,
         trajectory_session=trajectory_session,
         turn_count=turn_count,
         tool_calls=tool_calls,

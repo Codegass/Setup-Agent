@@ -1781,6 +1781,12 @@ def test_the_run_counts_a_card_states_come_from_one_reader():
     assert card.stats.tokens_in and card.stats.tokens_out
     assert counts["token_usage"], "the kafka session bills tokens; the reader must carry them"
 
+    # The advisor's spend travels in the same group, for the same reason: a
+    # surface that had to ask for it separately is a surface that can forget to.
+    sling = Path(__file__).parent / "fixtures" / "trajectory" / "sling-commons-osgi-v4"
+    consulted = build_result_card(snapshot_dict(), **read_run_counts(sling))
+    assert (consulted.stats.advisor_tokens_in, consulted.stats.advisor_tokens_out) == (4636, 273)
+
 
 def test_no_surface_names_the_run_counts_one_at_a_time():
     """The keywords may only reach `build_result_card` through the shared group.

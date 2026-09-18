@@ -121,9 +121,17 @@ describe("result card types", () => {
       toolCalls: 24,
       wallClockSeconds: 156,
       advisorModel: "claude-opus-4.1",
+      tokensIn: 133007,
+      tokensOut: 2062,
+      advisorTokensIn: 81516,
+      advisorTokensOut: 477,
     }
     expect(stats.wallClockSeconds).toBe(156)
     expect(stats.advisorModel).toBe("claude-opus-4.1")
+    // Two models answered, so two bills. The card never states their sum: one
+    // number would say the executor spent what the advisor spent.
+    expect(stats.tokensIn).toBe(133007)
+    expect(stats.advisorTokensIn).toBe(81516)
   })
 
   it("carries the whole attainment payload, not just a verdict word", () => {

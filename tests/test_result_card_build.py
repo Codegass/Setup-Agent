@@ -84,6 +84,34 @@ def test_tokens_come_from_the_token_usage_rows():
     assert card.stats.tokens_out == 7
 
 
+def test_the_advisor_is_counted_on_its_own_and_never_inside_the_models_total():
+    """Two models, two totals. Adding them says one model spent it all.
+
+    A run's advisor can outspend a third of its executor — the commons-cli run
+    this came from paid 81,993 advisor tokens against 133,000 of its own — and a
+    single number hides which model the bill went to and what turning the
+    advisor off would save.
+    """
+    card = build_result_card(
+        snapshot_dict(),
+        token_usage=[{"prompt_tokens": 100, "output_tokens": 7}],
+        advisor_token_usage=[
+            {"prompt_tokens": 8645, "output_tokens": 147},
+            {"prompt_tokens": 12632, "output_tokens": 149},
+        ],
+    )
+    assert (card.stats.tokens_in, card.stats.tokens_out) == (100, 7)
+    assert (card.stats.advisor_tokens_in, card.stats.advisor_tokens_out) == (21277, 296)
+
+
+def test_a_run_that_consulted_nobody_states_no_advisor_tokens():
+    """Absent, not zero: a run with the advisor off spent nothing to report."""
+    card = build_result_card(
+        snapshot_dict(), token_usage=[{"prompt_tokens": 100, "output_tokens": 7}]
+    )
+    assert card.stats.advisor_tokens_in is None and card.stats.advisor_tokens_out is None
+
+
 def test_attention_leads_with_incomplete_task_steps():
     card = build_result_card(
         snapshot_dict(

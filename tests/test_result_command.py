@@ -31,6 +31,7 @@ from result_card_fakes import snapshot_dict
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trajectory"
 KAFKA = FIXTURES / "kafka-d2r3"
+SLING = FIXTURES / "sling-commons-osgi-v4"
 
 
 @pytest.fixture(autouse=True)
@@ -51,10 +52,10 @@ def _recorded(tmp_path, **overrides) -> Path:
     return directory
 
 
-def _with_ledger(directory: Path) -> Path:
-    """Add the kafka run's own ledger, token ledger and run pin to a session."""
+def _with_ledger(directory: Path, session: Path = KAFKA) -> Path:
+    """Add a real run's own ledger, token ledger and run pin to a session."""
     for name in ("control_events.jsonl", "token_usage.csv", "run-pin.json"):
-        (directory / name).write_bytes((KAFKA / name).read_bytes())
+        (directory / name).write_bytes((session / name).read_bytes())
     return directory
 
 
@@ -210,6 +211,23 @@ def test_the_card_bills_the_tokens_the_session_recorded(tmp_path):
     stats = json.loads(result.output)["stats"]
     assert stats["tokens_in"] and stats["tokens_in"] > 4134
     assert stats["tokens_out"] and stats["tokens_out"] > 0
+
+
+def test_the_card_states_the_advisors_spend_beside_the_models(tmp_path):
+    """Two models are named on this card, so both their bills are on it.
+
+    `sag result --json` already carried `advisor_model`. Carrying the model it
+    names and nothing it cost invited the reader to read the executor's total as
+    the run's — which, for the run this came from, was 62% of the truth.
+    """
+    directory = _with_ledger(_recorded(tmp_path), SLING)
+
+    result = CliRunner().invoke(cli, ["result", str(directory), "--json"])
+
+    assert result.exit_code == 0, result.output
+    stats = json.loads(result.output)["stats"]
+    assert (stats["advisor_tokens_in"], stats["advisor_tokens_out"]) == (4636, 273)
+    assert stats["tokens_in"] and stats["tokens_in"] != stats["advisor_tokens_in"]
 
 
 def test_the_command_writes_nothing_into_the_session_it_read(tmp_path):

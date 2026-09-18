@@ -289,6 +289,11 @@ export interface ResultStats {
   toolFailures?: number | null
   tokensIn?: number | null
   tokensOut?: number | null
+  /** What the advisor's own model calls cost. Held apart from `tokensIn` /
+   *  `tokensOut`, which are the executor's: two models answered in this run,
+   *  and one added total would say the first spent it all. */
+  advisorTokensIn?: number | null
+  advisorTokensOut?: number | null
   wallClockSeconds?: number | null
   model?: string | null
   advisorModel?: string | null
