@@ -803,6 +803,31 @@ def test_the_close_that_ends_the_run_is_not_attributed_to_a_phase():
     assert closes == ["✓ run ended"]
 
 
+def test_the_run_ending_on_a_failed_grading_is_not_a_tick():
+    """The last band is a band, and the glyph is the count a reader can see.
+
+    `flow_close` ends the run, and the line says so rather than naming the
+    phase that happened to be open. But the tick in front of it is this
+    stream's copy of the fraction the result card keeps, and the one rule both
+    surfaces read refuses a band that closed on a grading saying the phase had
+    not passed. Ticking it anyway is the two surfaces disagreeing about one
+    run — the same defect `✗ test blocked` was written to fix, one branch
+    further on. Zero archived runs end this way (`flow_close` is `success` 85
+    times and `partial` 3), so the corpus cannot catch it and this can.
+    """
+
+    from sag.trajectory.phases import band_finished
+
+    closes = [
+        line
+        for line in _run_to_close("flow_close", "report_terminal", gate="failed")
+        if line[0] in "✓✗→"
+    ]
+
+    assert closes == ["✗ test blocked"]
+    assert not band_finished({"termination": "flow_close", "gates": [{"word": "failed"}]})
+
+
 def test_an_advance_states_the_phase_and_nothing_machine_made():
     closes = [line for line in _run_to_close("advance", "workspace_ready") if line[0] in "✓✗→"]
 

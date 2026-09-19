@@ -781,16 +781,21 @@ class TurnStreamRenderer:
             self._emit(_Line().add(text, _REPAIR_STYLE))
             return
 
-        # `flow_close` ends the RUN. Naming it after whichever phase happened to
-        # be open attributed a run-level event to a phase that did not cause it.
-        if kind == "flow_close":
-            self._emit(_Line().add("✓ run ended", _CLOSE_STYLE))
-            return
-
         # One rule, two surfaces: the same call decides the fraction of phases
         # the result card says finished, so a band this line ticks is a band
-        # that card counts.
+        # that card counts. It is consulted before the run-level close as well
+        # as after — the last band is still a band, and a tick over one the
+        # card refuses is the two surfaces disagreeing about one run.
         blocked = blocked_close(kind, self._phase_gate)
+
+        # `flow_close` ends the RUN. Naming it after whichever phase happened to
+        # be open attributed a run-level event to a phase that did not cause it.
+        # A grading that said the phase had not passed is the exception: there
+        # the glyph matters more than the wording, so the run-level line gives
+        # way to the one every other blocked close prints.
+        if kind == "flow_close" and not blocked:
+            self._emit(_Line().add("✓ run ended", _CLOSE_STYLE))
+            return
         if blocked:
             # No reason here: the measured close codes (`test_terminal`,
             # `build_evidence_closed`, …) say which close fired, not why the
