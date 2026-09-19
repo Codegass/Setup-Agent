@@ -81,7 +81,9 @@ const SERIES: Series[] = [
     detail: "Input plus output tokens the advisor's own call cost",
     value: (column) => column.advisorTokens,
     format: formatTokens,
-    exact: (value) => tokenCount(value, "advisor tokens"),
+    // The same words the hover panel uses a few pixels below. Two forms of one
+    // measure on screen at once invites a reader to look for the difference.
+    exact: (value) => `advisor ${tokenCount(value)}`,
     unstated: "no advisor tokens stated",
     empty: "No advisor tokens stated",
     drawn: (columns) => columns.some((column) => column.advisorTokens != null),
@@ -248,8 +250,9 @@ function Plot({
  * columns: the marks the reducer drew, the tokens each turn was billed, what
  * the advisor charged where a turn consulted it, and the wall time it took.
  * The advisor's is drawn only where there is any, and never on the model's
- * scale — two models, two bills, and no sum of the two anywhere. Nothing is interpolated, smoothed, or filled in;
- * a turn the ledger has not billed yet is a gap, and says so on hover.
+ * scale — two models, two bills, and no sum of the two anywhere. Nothing is
+ * interpolated, smoothed, or filled in; a turn the ledger has not billed yet is
+ * a gap, and says so on hover.
  */
 /** Wide enough for a Maven command line, narrow enough to sit under a plot. */
 const PANEL = 280
@@ -338,10 +341,12 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
    *  the panel does not shiver as the mouse moves inside one column, and read at
    *  hover time so a horizontally scrolled strip needs no separate bookkeeping.
    *
-   *  Vertically: under BOTH strips, never under the one being pointed at. The
-   *  two plots are drawn on one set of columns so that a reader can compare a
-   *  turn's bill against its wall time, and a panel that covers the other plot
-   *  takes away the comparison it was opened to explain. */
+   *  Vertically: under every strip, never under the one being pointed at. The
+   *  plots are drawn on one set of columns so that a reader can compare a
+   *  turn's bill against what its consult cost and against its wall time, and a
+   *  panel that covers another plot takes away a comparison it was opened to
+   *  explain. Anchored to the strips' own box rather than to a count of them,
+   *  so a strip that appears only on some runs needs no arithmetic here. */
   const point = (turnId: number | null, box?: DOMRect) => {
     const figure = figureRef.current
     if (turnId == null || !box || !figure) {

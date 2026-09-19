@@ -231,7 +231,7 @@ describe("TurnSparkline", () => {
     )
 
     const advisor = screen.getByRole("img", { name: /advisor tokens per consult/i })
-    expect(within(advisor).getByText(/turn 2 · 60,420 advisor tokens/i)).toBeInTheDocument()
+    expect(within(advisor).getByText(/turn 2 · advisor 60,420 tokens/i)).toBeInTheDocument()
     // Its own peak, and the model strip keeps its own.
     expect(screen.getByText("60.4k")).toBeInTheDocument()
     expect(screen.getByText("8.8k")).toBeInTheDocument()
@@ -265,12 +265,18 @@ describe("TurnSparkline", () => {
     const panel = screen.getByText("Turn 2").parentElement?.parentElement as HTMLElement
     // Its own line, under its own name: the turn's own response and the advice
     // it paid for are two bills, and one sum would report neither.
+    // The strip's own readout and the panel say it the same way.
     expect(within(panel).getByText("advisor 8,792 tokens")).toBeInTheDocument()
+    expect(screen.getAllByText("advisor 8,792 tokens")).toHaveLength(2)
     expect(within(panel).getByText("no tokens stated · 400ms")).toBeInTheDocument()
 
-    // A turn that consulted nobody says nothing about the advisor at all.
+    // A turn that consulted nobody says nothing about the advisor in its panel.
+    // Scoped to the panel: the advisor strip still draws a column for turn 1,
+    // and that column's own title is about the strip, not about this turn.
     fireEvent.mouseEnter(container.querySelectorAll('rect[data-hit="1"]')[0])
-    expect(screen.queryByText(/advisor .* tokens/)).not.toBeInTheDocument()
+    const quiet = container.querySelector(".bg-popover") as HTMLElement
+    expect(within(quiet).getByText("Turn 1")).toBeInTheDocument()
+    expect(within(quiet).queryByText(/advisor/)).not.toBeInTheDocument()
   })
 
   it("draws nothing at all before the first turn is on the record", () => {
