@@ -109,7 +109,6 @@ def _stats(
     advisor_tokens_in, advisor_tokens_out = _totalled(advisor_token_usage)
 
     pin = _mapping(run_pin)
-    advisor = _mapping(pin.get("advisor"))
     session = _mapping(trajectory_session)
     wall_clock = session.get("wall_clock_seconds")
 
@@ -125,8 +124,33 @@ def _stats(
         advisor_tokens_out=advisor_tokens_out,
         wall_clock_seconds=wall_clock if isinstance(wall_clock, (int, float)) else None,
         model=pin.get("action_model") or None,
-        advisor_model=advisor.get("model") or None,
+        advisor_model=_advisor_model(pin),
     )
+
+
+#: How the pin says the advisor was configured when it names no model of its
+#: own. Measured over the 193 archived run pins: every one of them records
+#: this mode, none records an explicit model, and no advisor call ever ran
+#: against a model other than the one the run was already running.
+_SAME_MODEL = "same-model"
+
+
+def _advisor_model(pin: Mapping[str, Any]) -> str | None:
+    """Which model answered when the run asked for advice, or nothing.
+
+    A pin that names the advisor's model states it; a pin that says the
+    advisor ran the same model as the run states it just as plainly, one step
+    further along. Reading only the first spelling printed an em dash beside a
+    bill of 81,516 tokens for a model the record names.
+    """
+
+    advisor = _mapping(pin.get("advisor"))
+    stated = advisor.get("model")
+    if stated:
+        return str(stated)
+    if str(advisor.get("mode") or "") == _SAME_MODEL:
+        return pin.get("action_model") or None
+    return None
 
 
 def _phases(

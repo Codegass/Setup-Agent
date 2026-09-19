@@ -249,9 +249,10 @@ def test_the_document_bills_the_model_and_the_advisor_apart():
 
     assert "## Tokens" in document
     assert "| **Model** | gpt-5.4-mini | 14 | 129,567 | 1,932 |" in document
-    # This run's pin records the advisor's mode (`same-model`) and not its
-    # model, so the cell states the absence rather than guessing the name.
-    assert "| **Advisor** | — | 3 | 81,516 | 477 |" in document
+    # The pin records the advisor's mode rather than its model, and
+    # `same-model` names the model as plainly as a second copy of the name
+    # would: this run consulted the model it was already running.
+    assert "| **Advisor** | gpt-5.4-mini | 3 | 81,516 | 477 |" in document
     assert "211,083" not in document
 
 
@@ -883,3 +884,20 @@ def test_the_web_tab_shows_the_commands_as_commands():
         for block in blocks
         if block.get("type") == "p"
     )
+
+
+def test_sag_result_answers_which_model_the_advisor_was():
+    """The card carries it, so every surface that reads the card has it."""
+
+    import json
+
+    from click.testing import CliRunner
+
+    import sag.main as main_module
+
+    result = CliRunner().invoke(main_module.cli, ["result", str(FIXTURE), "--json"])
+
+    assert result.exit_code == 0, result.output
+    card = json.loads(result.output)
+    assert card["stats"]["model"] == "gpt-5.4-mini"
+    assert card["stats"]["advisor_model"] == "gpt-5.4-mini"
