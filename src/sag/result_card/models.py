@@ -81,9 +81,11 @@ class ResultStats(_Frozen):
     tokens_in: int | None = None
     tokens_out: int | None = None
     #: What the ADVISOR spent, kept apart from what the executor spent. Two
-    #: models answered in this run and `advisor_model` already names the second
-    #: one; a single added total would say the first spent it all, and hide what
-    #: turning the advisor off would save.
+    #: models answered, and a single added total would say the first spent it
+    #: all — hiding which model the bill went to and what turning the advisor
+    #: off would save. `advisor_model` names that second model when the run pin
+    #: recorded one, which not every run does; these two counts come from the
+    #: turns themselves and stand whether it did or not.
     advisor_tokens_in: int | None = None
     advisor_tokens_out: int | None = None
     wall_clock_seconds: float | None = None
