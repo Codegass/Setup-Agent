@@ -756,3 +756,32 @@ def test_the_evidence_sentence_still_adds_up_for_the_archived_run():
         "13 stored tool outputs, 6 compiled classes, 4 jars, "
         "1 validator observation, 1 workspace directory."
     ) in document
+
+
+def test_a_half_recorded_token_bill_is_still_printed():
+    """One side of a bill missing is not a reason to lose the whole document.
+
+    `_totalled` answers with whichever side the rows supplied, so a run whose
+    completion tokens were never recorded carries an input total and no output
+    total. Formatting both together raised, the guard around the write caught
+    it, and the run ended with no document at all.
+    """
+
+    from sag.report_document.render import render_setup_report as render
+    from sag.result_card import build_result_card
+    from sag.result_card.run_evidence import read_run_counts
+
+    counts = read_run_counts(FIXTURE)
+    counts["token_usage"] = [{"prompt_tokens": 1234, "output_tokens": None}]
+    counts["advisor_token_usage"] = None
+    card = build_result_card(
+        __import__("json").loads(
+            (FIXTURE / ".setup_agent" / "verdict.json").read_text(encoding="utf-8")
+        ),
+        **counts,
+    )
+
+    document = render(FIXTURE, card=card)
+
+    assert "| **Model** | — | 14 | 1,234 | — |" in document
+    assert "| **Advisor** |" not in document

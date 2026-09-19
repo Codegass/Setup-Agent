@@ -55,6 +55,10 @@ _COMMIT_CHARS = 7
 #: comparing them should not have to apply an offset in their head.
 _WRITTEN_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+#: What a cell says when the run did not record the thing it is for. Absence
+#: is stated; it is never rendered as a zero a reader would take for a count.
+_ABSENT = "—"
+
 #: What marks a turn the harness took rather than one the model asked for.
 _HARNESS_MARK = "(the harness asked)"
 
@@ -270,6 +274,12 @@ def _header(
     return lines
 
 
+def _counts(value: Any) -> str:
+    """One number, grouped — or the dash that says nobody recorded it."""
+
+    return f"{value:,}" if isinstance(value, int) else _ABSENT
+
+
 def _clipped(value: Any) -> str | None:
     """One reason, cut to a row's worth of it and marked where it was cut."""
 
@@ -448,9 +458,12 @@ def _tokens(card: RunResultCard, document: Trajectory) -> list[str]:
     ):
         if tokens_in is None and tokens_out is None:
             continue
+        # Each side on its own: a run whose completion tokens were never
+        # recorded still has an input total, and a dash is what the record
+        # says about the other side.
         rows.append(
-            f"| **{label}** | {_cell(model) or '—'} | {calls:,} "
-            f"| {tokens_in:,} | {tokens_out:,} |"
+            f"| **{label}** | {_cell(model) or _ABSENT} | {calls:,} "
+            f"| {_counts(tokens_in)} | {_counts(tokens_out)} |"
         )
     if not rows:
         return []
