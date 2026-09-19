@@ -211,3 +211,32 @@ def test_the_turns_the_harness_took_are_marked_as_its_own():
     assert "| 14 | advisor | consult (the harness asked) |" in document
     # Turn 2 was the same call, asked for by the model.
     assert "| 2 | advisor | consult |" in document
+
+
+def test_the_document_bills_the_model_and_the_advisor_apart():
+    """Two models answered; one added total would say the first spent it all."""
+
+    document = render_setup_report(FIXTURE)
+
+    assert "## Tokens" in document
+    assert "| **Model** | gpt-5.4-mini | 14 | 129,567 | 1,932 |" in document
+    # This run's pin records the advisor's mode (`same-model`) and not its
+    # model, so the cell states the absence rather than guessing the name.
+    assert "| **Advisor** | — | 3 | 81,516 | 477 |" in document
+    assert "211,083" not in document
+
+
+def test_a_run_that_consulted_nobody_bills_no_advisor(tmp_path):
+    """The advisor row is a bill, and an unsent bill is not printed as zero."""
+
+    session = _session(tmp_path)
+    ledger = session / "control_events.jsonl"
+    kept = [
+        line for line in ledger.read_text(encoding="utf-8").splitlines() if '"advisor"' not in line
+    ]
+    ledger.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    document = render_setup_report(session)
+
+    assert "| **Model** |" in document
+    assert "| **Advisor** |" not in document

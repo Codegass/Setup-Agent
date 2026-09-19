@@ -358,6 +358,52 @@ def _the_run(document: Trajectory) -> list[str]:
     return lines
 
 
+def _tokens(card: RunResultCard, document: Trajectory) -> list[str]:
+    """What the run was billed, one row per model. Section C.5 of the spec.
+
+    Never one number. The executor and the advisor are two models, and a sum
+    would say the first spent it all — hiding which model the bill went to and
+    what turning the advisor off would save. A row is printed only for a model
+    the run actually paid.
+    """
+
+    stats = card.stats
+    turns = tuple(document.turns)
+    rows = []
+    for label, model, tokens_in, tokens_out, calls in (
+        (
+            "Model",
+            stats.model,
+            stats.tokens_in,
+            stats.tokens_out,
+            sum(1 for turn in turns if turn.tokens is not None),
+        ),
+        (
+            "Advisor",
+            stats.advisor_model,
+            stats.advisor_tokens_in,
+            stats.advisor_tokens_out,
+            sum(1 for turn in turns if turn.advisor_tokens is not None),
+        ),
+    ):
+        if tokens_in is None and tokens_out is None:
+            continue
+        rows.append(
+            f"| **{label}** | {_cell(model) or '—'} | {calls:,} "
+            f"| {tokens_in:,} | {tokens_out:,} |"
+        )
+    if not rows:
+        return []
+    return [
+        "## Tokens",
+        "",
+        "| | Model | Calls | In | Out |",
+        "|---|---|---|---|---|",
+        *rows,
+        "",
+    ]
+
+
 def render_setup_report(
     session_dir: Path | str,
     *,
@@ -403,7 +449,9 @@ def render_setup_report(
     lines.extend(
         _what_was_set_up(_mapping(env_overlay) or read_run_document(base, _ENV_OVERLAY_NAME) or {})
     )
-    lines.extend(_the_run(_trajectory_of(base)))
+    turns = _trajectory_of(base)
+    lines.extend(_the_run(turns))
+    lines.extend(_tokens(resolved_card, turns))
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
