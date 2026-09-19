@@ -1860,10 +1860,25 @@ def _build_state_value(value: Any) -> str:
 
 
 def _report_generated_at(report_raw: str | None) -> str:
+    """When the document says it was written, however it says it.
+
+    The reader's report states the run's end on its `**Run**` line; the
+    in-loop tool stated the moment it ran on a `**Generated:**` line, and
+    archived runs still carry that. Both are read, and both are the run's own
+    local clock, which is why the session list can subtract one from the time
+    the run started.
+    """
+
     if not report_raw:
         return ""
-    match = re.search(r"\*\*Generated:\*\*\s*([^\n]+)", report_raw)
-    return match.group(1).strip() if match else ""
+    for pattern in (
+        r"\*\*Generated:\*\*\s*([^\n]+)",
+        r"^\*\*Run\*\*[^\n]*?\bwritten\s+([^\n·]+)",
+    ):
+        match = re.search(pattern, report_raw, flags=re.MULTILINE)
+        if match:
+            return match.group(1).strip()
+    return ""
 
 
 def _setup_outcome(

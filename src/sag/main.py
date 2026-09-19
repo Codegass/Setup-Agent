@@ -435,6 +435,7 @@ def _write_reader_report(
     card: RunResultCard,
     *,
     session_dir: str | None,
+    orchestrator: DockerOrchestrator | None = None,
     verdict: Any = None,
     report_metrics: Mapping[str, Any] | None = None,
     project_url: str | None = None,
@@ -466,7 +467,54 @@ def _write_reader_report(
         logger.warning(f"Could not write the setup report to {target}: {exc}")
         return None
     logger.info(f"✅ Setup report written to {target}")
+    # And into the container, over the stub the report phase left there, so a
+    # reader of either copy reads the same bytes. Best-effort on its own: the
+    # host document above is already written, and a container that cannot take
+    # it is not a reason to fail a run that has finished.
+    if orchestrator is not None:
+        try:
+            _write_report_into_container(orchestrator, document, name=target.name)
+        except Exception as exc:
+            logger.warning(f"Could not write the setup report into the container: {exc}")
     return str(target)
+
+
+def _write_report_into_container(
+    orchestrator: DockerOrchestrator, document: str, *, name: str
+) -> None:
+    """Replace the container's stub with the document the reader opens.
+
+    One run leaves one report, so the copy inside the container is the copy
+    outside it. Written with the same here-doc the report tool writes its own
+    deliverable with, over the file the report phase left — or under this
+    run's name when the phase left none.
+
+    The caller guards this: a container that has gone away or turned
+    read-only costs the run nothing, because the host already holds the
+    document.
+    """
+
+    listing = _execute_control(
+        orchestrator,
+        "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f 2>/dev/null | head -1",
+    )
+    stub = str(listing.get("output") or "").strip().splitlines()
+    target = (
+        stub[-1]
+        if stub and stub[-1].startswith("/workspace/setup-report-")
+        else f"/workspace/{name}"
+    )
+    delimiter = f"EOF_{abs(hash(document)) % 10000}"
+    answered = orchestrator.execute_command(
+        f"cat > {target} << '{delimiter}'\n{document}\n{delimiter}"
+    )
+    # Both shapes this codebase's execute paths answer with: an exit code, or
+    # a success flag with no code. An absent field is not a failure signal.
+    answer = answered if isinstance(answered, Mapping) else {}
+    if answer.get("exit_code", 0) == 0 and answer.get("success", True):
+        logger.info(f"✅ Setup report written into the container at {target}")
+    else:
+        logger.warning(f"Could not write the setup report into the container at {target}")
 
 
 def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> str | None:
@@ -988,6 +1036,7 @@ def project(
             target,
             card,
             session_dir=session_dir,
+            orchestrator=orchestrator,
             verdict=snapshot,
             report_metrics=report_metrics,
             project_url=repo_url,

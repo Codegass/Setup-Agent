@@ -363,3 +363,120 @@ def test_the_document_is_written_in_plain_english():
 
     found = [word for word in forbidden if word in prose.lower()]
     assert not found, f"house vocabulary in the reader's report: {found}"
+
+
+class _RecordingContainer:
+    """A container that answers the report lookup and keeps what it is sent."""
+
+    def __init__(self, stub: str | None = None):
+        self.stub = stub
+        self.commands: list[str] = []
+
+    def execute_command(self, command, **kwargs):
+        del kwargs
+        self.commands.append(command)
+        if command.startswith("find /workspace"):
+            return {"exit_code": 0, "output": self.stub or ""}
+        return {"exit_code": 0, "output": ""}
+
+
+def test_the_document_replaces_the_stub_inside_the_container():
+    """One run, one report: the container's copy is the host's copy."""
+
+    import sag.main as main_module
+
+    container = _RecordingContainer(stub="/workspace/setup-report-20260917-183804.md")
+    main_module._write_report_into_container(
+        container, "# commons-cli — setup report\n", name="setup-report-20260917-183900.md"
+    )
+
+    written = [line for line in container.commands if line.startswith("cat > ")]
+    assert len(written) == 1, container.commands
+    assert written[0].startswith("cat > /workspace/setup-report-20260917-183804.md << ")
+    assert "# commons-cli — setup report" in written[0]
+
+
+def test_a_container_that_kept_no_report_is_given_this_runs_name():
+    """A run whose report phase wrote nothing still ends up holding the report."""
+
+    import sag.main as main_module
+
+    container = _RecordingContainer()
+    main_module._write_report_into_container(
+        container, "# doc\n", name="setup-report-20260917-183900.md"
+    )
+
+    written = [line for line in container.commands if line.startswith("cat > ")]
+    assert written[0].startswith("cat > /workspace/setup-report-20260917-183900.md << ")
+
+
+def test_the_run_end_hands_the_container_the_document_it_wrote(monkeypatch, tmp_path):
+    """The bytes the host wrote are the bytes the container is sent."""
+
+    from test_cli_project_exit_codes import RecordingSetupAgent, invoke_project
+
+    import sag.main as main_module
+
+    sent: list[tuple[str, str]] = []
+    real = main_module._write_report_into_container
+
+    def _spy(orchestrator, document, *, name):
+        sent.append((document, name))
+        return real(orchestrator, document, name=name)
+
+    monkeypatch.setattr(main_module, "_write_report_into_container", _spy)
+    result = invoke_project(monkeypatch, tmp_path, RecordingSetupAgent)
+    assert result.exit_code == 0, result.output
+
+    written = sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
+    assert len(sent) == 1, sent
+    assert sent[0][0] == written[0].read_text(encoding="utf-8")
+    assert sent[0][1] == written[0].name
+
+
+def test_the_write_back_never_fails_the_run(monkeypatch, tmp_path):
+    """A container that has gone away costs the run nothing; the host has it."""
+
+    from test_cli_project_exit_codes import RecordingSetupAgent, invoke_project
+
+    import sag.main as main_module
+
+    def _refuse(orchestrator, document, *, name):
+        raise RuntimeError("the container is gone")
+
+    monkeypatch.setattr(main_module, "_write_report_into_container", _refuse)
+
+    result = invoke_project(monkeypatch, tmp_path, RecordingSetupAgent)
+
+    assert result.exit_code == 0, result.output
+    written = sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
+    assert len(written) == 1, written
+    assert "## Result" in written[0].read_text(encoding="utf-8")
+
+
+def test_the_web_tab_reads_the_documents_own_timestamp():
+    """The report tab dates the document, and the session list times the run.
+
+    Both read the time out of the document's own text. The reader's report
+    carries it on the `**Run**` line rather than in the `**Generated:**` line
+    the in-loop tool wrote, and both spellings are read so an archived run
+    still dates correctly.
+    """
+
+    from sag.web.session_registry import _report_document, _report_generated_at
+
+    document = render_setup_report(FIXTURE)
+
+    assert _report_generated_at(document) == "2026-09-17 18:38:14"
+    assert _report_generated_at("**Generated:** 2026-09-17 18:38:04\n") == "2026-09-17 18:38:04"
+
+    rendered = _report_document(
+        {"report_path": "/workspace/setup-report-20260917-183804.md", "report_raw": document}
+    )
+    assert rendered is not None
+    assert rendered.generated == "2026-09-17 18:38:14"
+    # The Result table still reaches the tab as a table, not as prose.
+    tables = [block for block in rendered.blocks if block.get("type") == "table"]
+    assert any(
+        any(row and row[0] == "Setup" for row in table["rows"]) for table in tables
+    ), tables
