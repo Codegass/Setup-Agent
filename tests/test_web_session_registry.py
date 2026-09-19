@@ -1183,7 +1183,14 @@ def test_card_states_the_run_counts_its_own_ledger_recorded(tmp_path, snapshot_f
     assert card.session_dir is not None and card.session_dir.endswith(
         "session_20260717_120000_000000_aaaaaaaaaaaa_1"
     )
-    assert card.row("setup").headline == "2 turns · 2 tool calls · 27.7s"
+    # One phase, and the ledger records no transition out of it, so it is one
+    # phase the run did not leave. The phases come from the run's own bands
+    # now: this fixture's verdict carries no phase records at all, and the
+    # fraction used to be absent because of that rather than because nothing
+    # had been recorded.
+    assert card.stats.phases_completed == 0
+    assert card.stats.phases_total == 1
+    assert card.row("setup").headline == "0/1 phases · 2 turns · 2 tool calls · 27.7s"
 
 
 def test_a_session_without_a_ledger_still_gets_a_card_that_says_so(tmp_path, snapshot_factory):
