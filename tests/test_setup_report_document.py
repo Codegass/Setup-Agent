@@ -305,3 +305,61 @@ def test_the_document_keeps_the_accounting_and_the_static_count():
         "- Static test declarations found by analysis: 472 "
         "(diagnostic; not the denominator above)" in section
     )
+
+
+def test_the_document_is_a_reading_of_whatever_record_it_is_handed(tmp_path):
+    """The staleness was the reading instant, never the renderer.
+
+    Hand this renderer the ledger as it stood when the report tool ran — 110
+    of the run's 122 events — and it states exactly what that tool stated. The
+    fix is that it is handed the finished record instead, which is why it
+    takes a session directory and can never be handed a running engine.
+    """
+
+    import inspect
+
+    session = _session(tmp_path)
+    ledger = session / "control_events.jsonl"
+    at_the_report_turn = ledger.read_text(encoding="utf-8").splitlines()[:110]
+    ledger.write_text("\n".join(at_the_report_turn) + "\n", encoding="utf-8")
+
+    assert "· 18 turns · 18 tool calls · 5m 59s |" in render_setup_report(session)
+
+    parameters = inspect.signature(render_setup_report).parameters
+    assert next(iter(parameters)) == "session_dir"
+    # Every other input names an artifact the run wrote. Nothing here can be
+    # handed a live engine, a report tool, or a container.
+    assert set(parameters) == {
+        "session_dir",
+        "card",
+        "verdict",
+        "report_metrics",
+        "project_meta",
+        "run_pin",
+        "env_overlay",
+    }
+
+
+def test_the_document_is_written_in_plain_english():
+    """Nine words name house concepts a reader of a report does not share."""
+
+    import re
+
+    forbidden = (
+        "sealed",
+        "canonical",
+        "claimed",
+        "quarantined",
+        "subject",
+        "snapshot",
+        "metrics-v2",
+        "verdict-bearing",
+        "promoting",
+    )
+    document = render_setup_report(FIXTURE)
+    # A raw reason code quoted in brackets is the handle a reader searches
+    # for, and is exempt; the prose around it is not.
+    prose = re.sub(r"\([A-Za-z0-9_]+\)", "", document)
+
+    found = [word for word in forbidden if word in prose.lower()]
+    assert not found, f"house vocabulary in the reader's report: {found}"
