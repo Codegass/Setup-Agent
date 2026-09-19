@@ -522,3 +522,34 @@ def test_the_document_counts_the_phases_the_run_ran():
 
     assert "| **Setup** | success | 5/5 phases · 19 turns · 19 tool calls · 6m 08s |" in document
     assert "4/4 phases" not in document
+
+
+def test_a_session_directory_that_is_gone_costs_the_run_nothing(monkeypatch, tmp_path):
+    """Naming a document is not worth a run's exit code.
+
+    Everything about the report at run end is best-effort, and the step that
+    decides what to call the file reads the ledger to date it. A directory
+    that is not there raised out of that read, past the guard around the
+    write, into the command's own handler: a successful run printed
+    `❌ Setup failed` and exited 1 because a document could not be named.
+    """
+
+    import shutil
+
+    from test_cli_project_exit_codes import invoke_project
+
+    import sag.main as main_module
+    from sag.config import get_session_logger
+
+    def _take_the_directory_away(orchestrator, project_name):
+        del orchestrator, project_name
+        shutil.rmtree(get_session_logger().session_log_dir)
+        return None
+
+    monkeypatch.setattr(main_module, "_save_setup_artifacts", _take_the_directory_away)
+
+    result = invoke_project(monkeypatch, tmp_path, _recording_agent(), "--record")
+
+    assert result.exit_code == 0, result.output
+    assert "Setup failed" not in result.output
+    assert " Setup         success" in result.output

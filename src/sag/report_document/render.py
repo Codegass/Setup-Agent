@@ -129,7 +129,14 @@ def run_ended_at(session_dir: Path | str) -> datetime | None:
     this package exists.
     """
 
-    ledger = control_events_path(session_dir)
+    try:
+        ledger = control_events_path(session_dir)
+    except Exception as exc:
+        # A directory that is not there raises rather than answering, and this
+        # is a reader: every caller of it is doing something best-effort, and
+        # one of them was naming a file at the end of a successful run.
+        logger.debug(f"the run's end could not be read from {session_dir}: {exc}")
+        return None
     if ledger is None:
         return None
     stamp: str | None = None
