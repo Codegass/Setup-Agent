@@ -8,6 +8,6 @@ counts twelve ledger events short of the end and stated 18 turns for a run of
 directory and never an engine.
 """
 
-from sag.report_document.render import render_setup_report, report_name
+from sag.report_document.render import render_setup_report, report_name, setup_report_name
 
-__all__ = ["render_setup_report", "report_name"]
+__all__ = ["render_setup_report", "report_name", "setup_report_name"]

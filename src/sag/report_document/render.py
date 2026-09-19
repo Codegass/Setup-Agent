@@ -51,6 +51,11 @@ _COMMIT_CHARS = 7
 #: comparing them should not have to apply an offset in their head.
 _WRITTEN_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+#: How the document is named, and the format the name's timestamp takes. The
+#: same name the report phase's own deliverable carries, so one run leaves one
+#: report rather than two files a reader has to choose between.
+_REPORT_NAME_FORMAT = "setup-report-%Y%m%d-%H%M%S.md"
+
 
 def read_run_document(base: Path, name: str) -> dict[str, Any] | None:
     """Read one of a run's JSON artifacts, or nothing when it is not readable."""
@@ -126,6 +131,19 @@ def run_ended_at(session_dir: Path | str) -> datetime | None:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment.astimezone()
+
+
+def setup_report_name(session_dir: Path | str) -> str:
+    """What to call this run's report, when the run has not already named one.
+
+    A run that mirrored its artifacts out already has a file to replace, and
+    replacing it is what keeps one run to one report. This names the rest, off
+    the run's own end so that re-rendering an archived run reproduces the name
+    it was written under rather than inventing today's.
+    """
+
+    ended = run_ended_at(session_dir) or datetime.now()
+    return ended.strftime(_REPORT_NAME_FORMAT)
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -222,7 +240,14 @@ def render_setup_report(
         # card would be a page about a run nobody can read the outcome of.
         return ""
 
-    meta = _mapping(project_meta) or read_run_document(base, _PROJECT_META_NAME) or {}
+    # What the caller states wins over what the directory holds, field by
+    # field: a run that has not mirrored its artifacts out yet has no
+    # `project_meta.json` on the host, and a run that has one still knows its
+    # own repository URL better than a file copied out of a container.
+    meta = {
+        **(read_run_document(base, _PROJECT_META_NAME) or {}),
+        **{key: value for key, value in _mapping(project_meta).items() if value is not None},
+    }
     pin = _mapping(run_pin) or read_run_document(base, _RUN_PIN_NAME) or {}
 
     lines = _header(
@@ -235,4 +260,10 @@ def render_setup_report(
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-__all__ = ["read_run_document", "render_setup_report", "report_name", "run_ended_at"]
+__all__ = [
+    "read_run_document",
+    "render_setup_report",
+    "report_name",
+    "run_ended_at",
+    "setup_report_name",
+]

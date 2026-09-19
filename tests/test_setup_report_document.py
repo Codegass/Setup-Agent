@@ -84,3 +84,66 @@ def test_the_document_is_dated_by_the_runs_last_event():
 
     assert "written 2026-09-17 18:38:14" in document
     assert "18:38:04" not in document
+
+
+def _session_log_dir(tmp_path: Path) -> Path:
+    """The one session directory a CLI run under `tmp_path` wrote."""
+
+    sessions = sorted((tmp_path / "logs").glob("session_*"))
+    assert len(sessions) == 1, f"expected one session directory, found {sessions}"
+    return sessions[0]
+
+
+def test_the_run_end_writes_the_document_beside_the_record(monkeypatch, tmp_path):
+    """Written whether or not the run was asked to keep artifacts.
+
+    Without `--record` nothing is copied out of the container, so a document
+    that waited for the copy would never be written for the majority of runs.
+    """
+
+    from test_cli_project_exit_codes import RecordingSetupAgent, invoke_project
+
+    result = invoke_project(monkeypatch, tmp_path, RecordingSetupAgent)
+    assert result.exit_code == 0, result.output
+
+    written = sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
+    assert len(written) == 1, written
+    document = written[0].read_text(encoding="utf-8")
+    assert "## Result" in document
+    assert "**Run** `cli-success`" in document
+
+
+def test_the_archived_copy_does_not_overwrite_the_document(monkeypatch, tmp_path):
+    """`--record` copies the container's stub out; the reader's report is last.
+
+    The two write the same filename into the same directory, so whichever runs
+    second is the document a reader opens. Ordering measured at the call site:
+    the copy runs first, and this is what keeps it there.
+    """
+
+    from test_cli_project_exit_codes import RecordingSetupAgent, invoke_project
+
+    import sag.main as main_module
+    from sag.config import get_session_logger
+
+    stub = "# 🎯 Project Setup Report v0.3.0\n\n**Generated:** 2026-09-17 18:38:04\n"
+
+    def _copy_the_stub_out(orchestrator, project_name):
+        del orchestrator, project_name
+        target = get_session_logger().session_log_dir / "setup-report-20260917-183804.md"
+        target.write_text(stub, encoding="utf-8")
+        return str(target)
+
+    monkeypatch.setattr(main_module, "_save_setup_artifacts", _copy_the_stub_out)
+
+    result = invoke_project(monkeypatch, tmp_path, RecordingSetupAgent, "--record")
+    assert result.exit_code == 0, result.output
+
+    written = sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
+    assert [path.name for path in written] == ["setup-report-20260917-183804.md"]
+    document = written[0].read_text(encoding="utf-8")
+    assert "## Result" in document
+    assert "Project Setup Report" not in document
+    # The row names the file the reader is holding, not the container's copy.
+    assert "| **Report** | delivered | setup-report-20260917-183804.md |" in document
+    assert "/workspace/setup-report" not in document

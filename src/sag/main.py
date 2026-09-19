@@ -40,7 +40,9 @@ from sag.console.result_block import render_result_block
 from sag.console.turn_stream import TurnStreamRenderer
 from sag.coverage.runner import apply_coverage
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.report_document import render_setup_report, report_name, setup_report_name
 from sag.result_card import build_result_card
+from sag.result_card.models import RunResultCard
 from sag.result_card.run_evidence import (
     find_recorded_session,
     read_run_counts,
@@ -75,7 +77,7 @@ _SEPARATORS = frozenset({"/", os.sep})
 # garbage collection and does not affect functionality. Python already handles it gracefully.
 
 
-def _render_setup_cli_result(
+def _setup_result_card(
     snapshot: RunVerdictSnapshot,
     termination: RunTermination,
     project_name: str,
@@ -87,16 +89,19 @@ def _render_setup_cli_result(
     container: str | None = None,
     session_dir: str | None = None,
     report_path: str | None = None,
-) -> tuple[str, int]:
-    """Render the run's result block and translate only its verdict to an exit code.
+) -> RunResultCard:
+    """The card for a run that has just finished.
 
     `run_counts` arrives whole from `read_run_counts` and is splatted whole. No
     surface names the counts one at a time, so none can fill four of the five
     and drop the fifth — which is how the terminal came to bill tokens the web
     API said nothing about for the same run.
+
+    Named apart from the block because two surfaces state this run at its end —
+    the block and the written report — and they state one card, not two.
     """
 
-    card = build_result_card(
+    return build_result_card(
         snapshot,
         module_metrics=module_metrics,
         report_metrics=report_metrics,
@@ -108,6 +113,42 @@ def _render_setup_cli_result(
         session_dir=session_dir,
         report_path=report_path,
     )
+
+
+def _render_setup_cli_result(
+    snapshot: RunVerdictSnapshot,
+    termination: RunTermination,
+    project_name: str,
+    *,
+    card: RunResultCard | None = None,
+    module_metrics: Mapping[str, Any] | None = None,
+    report_metrics: Mapping[str, Any] | None = None,
+    run_pin: Mapping[str, Any] | None = None,
+    run_counts: Mapping[str, Any] | None = None,
+    container: str | None = None,
+    session_dir: str | None = None,
+    report_path: str | None = None,
+) -> tuple[str, int]:
+    """Render the run's result block and translate only its verdict to an exit code.
+
+    `card` is for the caller that has already built one — the end of a live
+    run, which renders the same card into the written report — so the two
+    surfaces cannot be handed different readings of one run.
+    """
+
+    if card is None:
+        card = _setup_result_card(
+            snapshot,
+            termination,
+            project_name,
+            module_metrics=module_metrics,
+            report_metrics=report_metrics,
+            run_pin=run_pin,
+            run_counts=run_counts,
+            container=container,
+            session_dir=session_dir,
+            report_path=report_path,
+        )
     return render_result_block(card, width=console.width), (
         0 if snapshot.verdict == "success" else 1
     )
@@ -134,15 +175,12 @@ def _report_name_for_block(report_path: str | None, session_dir: str | None) -> 
 
     The Evidence line directly above names the session directory, so a report
     copied into it is named by its file rather than by a path several times
-    wider than the column, which would break the row it is printed in.
+    wider than the column, which would break the row it is printed in. The
+    written report names it the same way, from the same function, so the two
+    surfaces cannot come to spell one file differently.
     """
 
-    if not report_path or not session_dir:
-        return report_path
-    try:
-        return str(Path(report_path).relative_to(session_dir))
-    except ValueError:
-        return report_path
+    return report_name(report_path, session_dir)
 
 
 def _read_run_pin_for_cli(session_logger: Any) -> Mapping[str, Any] | None:
@@ -357,6 +395,54 @@ def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str
     except Exception as e:
         logger.warning(f"Failed to read project metadata: {e}")
         return None
+
+
+def _reader_report_path(session_dir: str | None, mirrored: str | None) -> Path | None:
+    """Where this run's report goes on the host, or nothing when it has no home.
+
+    A run that mirrored its artifacts out has already put a file there, and the
+    reader's report replaces it: one run leaves one report. A run that did not
+    is given the name the run's own end would have produced.
+    """
+
+    if mirrored:
+        return Path(mirrored)
+    if not session_dir:
+        return None
+    return Path(session_dir) / setup_report_name(session_dir)
+
+
+def _write_reader_report(
+    target: Path | None,
+    card: RunResultCard,
+    *,
+    session_dir: str | None,
+    project_url: str | None = None,
+) -> str | None:
+    """Write the reader's report beside the run's own record.
+
+    Best-effort, on the same contract as the artifact copy below: a run is not
+    failed by a document, and the block is printed either way. Returns the path
+    written, or nothing — the caller names the file only when it is there.
+    """
+
+    if target is None or not session_dir:
+        return None
+    try:
+        document = render_setup_report(
+            session_dir,
+            card=card,
+            project_meta={"project_url": project_url},
+        )
+        if not document:
+            return None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(document, encoding="utf-8")
+    except Exception as exc:
+        logger.warning(f"Could not write the setup report to {target}: {exc}")
+        return None
+    logger.info(f"✅ Setup report written to {target}")
+    return str(target)
 
 
 def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> str | None:
@@ -850,11 +936,18 @@ def project(
         session_dir = str(session_logger.session_log_dir) if session_logger else None
 
         # The block names the report a reader can open, so the copy has to have
-        # happened before the block is built.
+        # happened before the block is built. It also has to have happened
+        # before the report below is written: both put the same filename in the
+        # same directory, and the one that runs second is the one a reader
+        # opens. The reader's report is written second, on purpose.
         report_path = _save_setup_artifacts(orchestrator, project_name) if record else None
 
         run_counts = read_run_counts(session_dir)
-        cli_result, exit_code = _render_setup_cli_result(
+        # One card, two surfaces: the block the terminal prints and the report
+        # the reader opens are the same reading of this run, taken here, after
+        # its last event.
+        target = _reader_report_path(session_dir, report_path)
+        card = _setup_result_card(
             snapshot,
             termination,
             project_name,
@@ -864,7 +957,14 @@ def project(
             run_counts=run_counts,
             container=docker_name,
             session_dir=session_dir,
-            report_path=_report_name_for_block(report_path, session_dir),
+            report_path=_report_name_for_block(str(target) if target else None, session_dir),
+        )
+        _write_reader_report(target, card, session_dir=session_dir, project_url=repo_url)
+        cli_result, exit_code = _render_setup_cli_result(
+            snapshot,
+            termination,
+            project_name,
+            card=card,
         )
 
         console.print(cli_result)
