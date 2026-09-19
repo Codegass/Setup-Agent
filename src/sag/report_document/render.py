@@ -66,6 +66,12 @@ _HOW_PROVISIONED: dict[str, str] = {
     "agent_registered": "registered by the run",
 }
 
+#: How much of the toolchain the second table shows before it starts counting,
+#: and how much of one reason a row carries. The same bounds the in-loop
+#: renderer has always used, so a pathological reason cannot flood the page.
+_MAX_REFUSED_ROWS = 5
+_MAX_REASON_CHARS = 160
+
 #: What each kind of citation is called, singular and plural. The kinds are
 #: `classify_evidence_ref`'s answers; a kind it does not know is counted under
 #: `other` and named as a citation, because dropping it would make the total
@@ -264,6 +270,17 @@ def _header(
     return lines
 
 
+def _clipped(value: Any) -> str | None:
+    """One reason, cut to a row's worth of it and marked where it was cut."""
+
+    if value is None:
+        return None
+    reason = str(value).replace("\n", " ").strip()
+    if len(reason) <= _MAX_REASON_CHARS:
+        return reason
+    return reason[: _MAX_REASON_CHARS - 1].rstrip() + "…"
+
+
 def _cell(value: Any) -> str:
     """One table cell, escaped the way the card escapes its own.
 
@@ -280,35 +297,56 @@ def _what_was_set_up(env_overlay: Mapping[str, Any]) -> list[str]:
     """The toolchain the run provisioned. Section C.3 of the spec.
 
     Read from the overlay the run wrote when it activated each tool, which is
-    the record of what the commands afterwards actually ran against. Nothing
-    is printed for a run that activated nothing.
+    the record of what the commands afterwards actually ran against, and from
+    the same file's record of the executables it found and refused. A run that
+    could not provision a JDK has nothing active and everything to explain, so
+    the second table stands on its own when the first has no rows.
     """
 
     tools = env_overlay.get("tools")
-    rows: list[str] = []
+    active_rows: list[str] = []
+    refused_rows: list[str] = []
     for name, entry in sorted((tools or {}).items()):
         if not isinstance(entry, Mapping):
             continue
         active = entry.get("active")
-        if not active:
-            continue
-        candidate = (entry.get("candidates") or {}).get(active) or {}
-        source = str(candidate.get("source") or "")
-        how = _HOW_PROVISIONED.get(source, source.replace("_", " "))
-        rows.append(
-            f"| {_cell(name)} | {_cell(candidate.get('version'))} "
-            f"| `{_cell(active)}` | {_cell(how)} |"
-        )
-    if not rows:
+        if active:
+            candidate = (entry.get("candidates") or {}).get(active) or {}
+            source = str(candidate.get("source") or "")
+            how = _HOW_PROVISIONED.get(source, source.replace("_", " "))
+            active_rows.append(
+                f"| {_cell(name)} | {_cell(candidate.get('version'))} "
+                f"| `{_cell(active)}` | {_cell(how)} |"
+            )
+        for refused in entry.get("blocked") or ():
+            if not isinstance(refused, Mapping):
+                continue
+            refused_rows.append(
+                f"| {_cell(name)} | {_cell(refused.get('version'))} "
+                f"| `{_cell(refused.get('executable'))}` | {_cell(refused.get('requirement'))} "
+                f"| {_cell(_clipped(refused.get('reason')))} |"
+            )
+    if not active_rows and not refused_rows:
         return []
-    return [
-        "## What was set up",
-        "",
-        "| Tool | Version | Path | How |",
-        "|---|---|---|---|",
-        *rows,
-        "",
-    ]
+
+    lines = ["## What was set up", ""]
+    if active_rows:
+        lines.extend(["| Tool | Version | Path | How |", "|---|---|---|---|", *active_rows, ""])
+    if refused_rows:
+        shown = refused_rows[:_MAX_REFUSED_ROWS]
+        lines.extend(
+            [
+                "### Tools the run did not use",
+                "",
+                "| Tool | Version | Path | Required | Why |",
+                "|---|---|---|---|---|",
+                *shown,
+            ]
+        )
+        if len(refused_rows) > len(shown):
+            lines.append(f"- and {len(refused_rows) - len(shown):,} more")
+        lines.append("")
+    return lines
 
 
 def _turn_rows(turns: Sequence[Turn]) -> list[str]:

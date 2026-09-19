@@ -657,3 +657,57 @@ def test_the_host_and_the_container_call_the_report_one_name(monkeypatch, tmp_pa
     written = sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
     assert [path.name for path in written] == ["setup-report-20260917-183804.md"]
     assert sent == ["setup-report-20260917-183804.md"]
+
+
+def test_the_document_names_the_tools_the_run_would_not_use(tmp_path):
+    """The run that could not provision a JDK is the run this section is for.
+
+    The section used to print only tools with an active executable, so a run
+    that found a JDK and refused it — the case where what was set up is the
+    whole story — printed no `## What was set up` at all.
+    """
+
+    import json
+
+    session = _session(tmp_path)
+    (session / ".setup_agent" / "env_overlay.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tools": {
+                    "java": {
+                        "active": None,
+                        "blocked": [
+                            {
+                                "executable": "/usr/bin/java",
+                                "version": "11.0.22",
+                                "requirement": ">=17",
+                                "reason": "the build asked for a newer Java than this one",
+                                "source": "build_error",
+                            }
+                        ],
+                        "candidates": {},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    document = render_setup_report(session)
+
+    assert "## What was set up" in document
+    assert "### Tools the run did not use" in document
+    assert (
+        "| java | 11.0.22 | `/usr/bin/java` | >=17 "
+        "| the build asked for a newer Java than this one |"
+    ) in document
+
+
+def test_a_run_that_refused_nothing_prints_no_second_table():
+    """Every table in the document is a table with rows in it."""
+
+    document = render_setup_report(FIXTURE)
+
+    assert "## What was set up" in document
+    assert "did not use" not in document
