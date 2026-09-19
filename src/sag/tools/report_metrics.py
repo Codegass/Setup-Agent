@@ -1668,6 +1668,52 @@ def _format_counts(value: Any) -> str:
     return rendered
 
 
+#: The evidence-accounting lines, said the way a reader would say them. The
+#: numbers are untouched — only the name in front of each one changes, from
+#: the pipeline's internal term for a layer to what that layer actually counts.
+#: Kept beside the formatter whose lines they rename, because two surfaces now
+#: print these lines and neither should carry its own copy of the words.
+_ACCOUNTING_LABELS: dict[str, str] = {
+    "Receipt executions": "Results bound to this run's receipts",
+    "Claimed latest cases": "Tests identified by module and name",
+    "Claimed latest subjects": "Test classes identified by module and name",
+    "Quarantined observations (not verdict-bearing)": "Set aside: not from this run's receipts",
+    "Unattributed observations (not verdict-bearing)": (
+        "Set aside: no module or test name recorded"
+    ),
+    "Stale observations (not verdict-bearing)": "Set aside: from an earlier run",
+    "Evidence transport": "Evidence records",
+}
+
+#: The one reason string the layer formatter states in pipeline terms. The
+#: fact is the same either way: nothing was published for the report to read.
+_ACCOUNTING_VALUES: dict[str, str] = {
+    "unavailable (metrics-v2 artifact unavailable)": (
+        "unavailable (no evidence record was published)"
+    ),
+}
+
+
+def _accounting_line(line: str) -> str:
+    """Relabel one evidence-accounting line, leaving its measurement alone."""
+
+    label, separator, value = line.partition(": ")
+    if not separator:
+        return line
+    return f"{_ACCOUNTING_LABELS.get(label, label)}: {_ACCOUNTING_VALUES.get(value, value)}"
+
+
+def format_evidence_accounting_lines(metrics: Mapping[str, Any] | None) -> list[str]:
+    """How every test observation was accounted for, said in plain English.
+
+    This is bookkeeping, not the result: it says which observations the run
+    counted and which it set aside, and why. One wording, because the written
+    report and the in-loop document both print it.
+    """
+
+    return [_accounting_line(line) for line in format_evidence_layer_lines(metrics)]
+
+
 def format_evidence_layer_lines(metrics: Mapping[str, Any] | None) -> list[str]:
     """Render all verdict-bearing and non-verdict-bearing test layers."""
 
@@ -1719,6 +1765,7 @@ __all__ = [
     "MetricsContractError",
     "assemble_report_metrics",
     "build_evidence_layer_projection",
+    "format_evidence_accounting_lines",
     "format_evidence_layer_lines",
     "read_live_report_metrics",
     "read_report_metrics",

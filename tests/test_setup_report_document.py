@@ -268,3 +268,40 @@ def test_the_document_says_how_to_open_the_evidence():
     assert f"uv run sag inspect commons-cli --session {FIXTURE} --turn 12" in document
     assert f"uv run sag result {FIXTURE}" in document
     assert "uv run sag ui" in document
+
+
+def test_the_document_keeps_the_accounting_and_the_static_count():
+    """The audit trail behind the Tests row, plus the one number it was missing."""
+
+    document = render_setup_report(FIXTURE)
+    lines = document.splitlines()
+    section = lines[lines.index("## Evidence accounting") :]
+
+    assert (
+        "- Test classes identified by module and name: 534/595 passed, 0 failed, "
+        "0 errors, 61 skipped" in section
+    )
+    assert (
+        "- Tests identified by module and name: 933/994 passed, 0 failed, "
+        "0 errors, 61 skipped" in section
+    )
+    assert (
+        "- Results bound to this run's receipts: 933/994 passed, 0 failed, "
+        "0 errors, 61 skipped" in section
+    )
+    assert (
+        "- Set aside: not from this run's receipts: 0/0 passed, 0 failed, 0 errors, 0 skipped"
+        in section
+    )
+    assert (
+        "- Set aside: no module or test name recorded: 0/0 passed, 0 failed, 0 errors, 0 skipped"
+        in section
+    )
+    assert "- Set aside: from an earlier run: 0/0 passed, 0 failed, 0 errors, 0 skipped" in section
+    assert "- Evidence records: complete" in section
+    # Moved here from the diagnostics table the document drops: it is the one
+    # fact that table carried which the Tests row does not.
+    assert (
+        "- Static test declarations found by analysis: 472 "
+        "(diagnostic; not the denominator above)" in section
+    )

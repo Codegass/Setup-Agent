@@ -53,38 +53,6 @@ from sag.verdict_rates import (
 
 from .base import BaseTool, ToolResult
 
-#: The evidence-accounting lines, said the way a reader would say them. The
-#: numbers are untouched — only the name in front of each one changes, from
-#: the pipeline's internal term for a layer to what that layer actually counts.
-_ACCOUNTING_LABELS: Dict[str, str] = {
-    "Receipt executions": "Results bound to this run's receipts",
-    "Claimed latest cases": "Tests identified by module and name",
-    "Claimed latest subjects": "Test classes identified by module and name",
-    "Quarantined observations (not verdict-bearing)": "Set aside: not from this run's receipts",
-    "Unattributed observations (not verdict-bearing)": (
-        "Set aside: no module or test name recorded"
-    ),
-    "Stale observations (not verdict-bearing)": "Set aside: from an earlier run",
-    "Evidence transport": "Evidence records",
-}
-
-#: The one reason string the layer formatter states in pipeline terms. The
-#: fact is the same either way: nothing was published for the report to read.
-_ACCOUNTING_VALUES: Dict[str, str] = {
-    "unavailable (metrics-v2 artifact unavailable)": (
-        "unavailable (no evidence record was published)"
-    ),
-}
-
-
-def _accounting_line(line: str) -> str:
-    """Relabel one evidence-accounting line, leaving its measurement alone."""
-
-    label, separator, value = line.partition(": ")
-    if not separator:
-        return line
-    return f"{_ACCOUNTING_LABELS.get(label, label)}: {_ACCOUNTING_VALUES.get(value, value)}"
-
 
 def rate_marker(rate: Optional[float]) -> str:
     """The one icon rule for a measured rate in the operator report.
@@ -1750,9 +1718,7 @@ class ReportTool(BaseTool):
         raw = tests.raw
         outcomes_accounted = tests.passed + tests.failed + tests.errors + tests.skipped
         non_skipped = tests.passed + tests.failed + tests.errors
-        non_skipped_pass_pct = (
-            (tests.passed / non_skipped) * 100.0 if non_skipped > 0 else None
-        )
+        non_skipped_pass_pct = (tests.passed / non_skipped) * 100.0 if non_skipped > 0 else None
         expansion_factor = None
         if tests.executed > 0 and raw.executed > tests.executed:
             expansion_factor = raw.executed / tests.executed
@@ -3214,7 +3180,9 @@ class ReportTool(BaseTool):
                 f"({format_percentage(test_pass_rate)} passed) — project-owned"
             )
             return "partial"
-        logger.info(f"SUCCESS: build passed and tests ran ({format_percentage(test_pass_rate)} passed)")
+        logger.info(
+            f"SUCCESS: build passed and tests ran ({format_percentage(test_pass_rate)} passed)"
+        )
         return "success"
 
     def _generate_console_report(
@@ -5284,14 +5252,14 @@ with open(lock_path,"a+b") as lock:
         the reader who wants to audit the counts the Result table states.
         """
 
-        from sag.tools.report_metrics import format_evidence_layer_lines
+        from sag.tools.report_metrics import format_evidence_accounting_lines
 
         return [
             "## Evidence accounting",
             "",
             *[
-                f"- {_accounting_line(line)}"
-                for line in format_evidence_layer_lines(
+                f"- {line}"
+                for line in format_evidence_accounting_lines(
                     snapshot.get("metrics_v2") or snapshot.get("evidence_layer_projection")
                 )
             ],

@@ -436,6 +436,7 @@ def _write_reader_report(
     *,
     session_dir: str | None,
     verdict: Any = None,
+    report_metrics: Mapping[str, Any] | None = None,
     project_url: str | None = None,
     env_overlay: Mapping[str, Any] | None = None,
 ) -> str | None:
@@ -453,6 +454,7 @@ def _write_reader_report(
             session_dir,
             card=card,
             verdict=verdict,
+            report_metrics=report_metrics,
             project_meta={"project_url": project_url},
             env_overlay=env_overlay,
         )
@@ -969,12 +971,13 @@ def project(
         # the reader opens are the same reading of this run, taken here, after
         # its last event.
         target = _reader_report_path(session_dir, report_path)
+        report_metrics = _read_metrics_v2_for_cli(orchestrator)
         card = _setup_result_card(
             snapshot,
             termination,
             project_name,
             module_metrics=_read_module_metrics_for_cli(orchestrator),
-            report_metrics=_read_metrics_v2_for_cli(orchestrator),
+            report_metrics=report_metrics,
             run_pin=_read_run_pin_for_cli(session_logger),
             run_counts=run_counts,
             container=docker_name,
@@ -986,6 +989,7 @@ def project(
             card,
             session_dir=session_dir,
             verdict=snapshot,
+            report_metrics=report_metrics,
             project_url=repo_url,
             env_overlay=_read_env_overlay_for_cli(orchestrator),
         )

@@ -30,6 +30,7 @@ from sag.result_card.markdown import render_result_card_markdown
 from sag.result_card.models import RunResultCard
 from sag.result_card.rows import duration_text
 from sag.result_card.run_evidence import read_run_counts, recorded_report
+from sag.tools.report_metrics import format_evidence_accounting_lines
 from sag.trajectory.builder import build_trajectory, control_events_path, resolve_session_dir
 from sag.trajectory.schema import SessionInfo, Trajectory, Turn
 
@@ -538,11 +539,36 @@ def _evidence(card: RunResultCard, document: Trajectory, verdict: Mapping[str, A
     return ["## Evidence", "", *lines] if lines else []
 
 
+def _evidence_accounting(
+    report_metrics: Mapping[str, Any], verdict: Mapping[str, Any]
+) -> list[str]:
+    """How every test observation was accounted for. Section C.7 of the spec.
+
+    The seven lines are the ones the in-loop report already printed, from the
+    same formatter. The eighth is the static declaration count, moved here out
+    of the diagnostics table this document drops: it was the one fact that
+    table carried which the Tests row does not, and it belongs beside the
+    denominators it is explicitly not one of.
+    """
+
+    if not report_metrics:
+        return []
+    lines = [f"- {line}" for line in format_evidence_accounting_lines(report_metrics)]
+    discovered = (verdict.get("test_stats") or {}).get("discovered")
+    if isinstance(discovered, int):
+        lines.append(
+            f"- Static test declarations found by analysis: {discovered:,} "
+            "(diagnostic; not the denominator above)"
+        )
+    return ["## Evidence accounting", "", *lines, ""]
+
+
 def render_setup_report(
     session_dir: Path | str,
     *,
     card: RunResultCard | None = None,
     verdict: Any = None,
+    report_metrics: Mapping[str, Any] | None = None,
     project_meta: Mapping[str, Any] | None = None,
     run_pin: Mapping[str, Any] | None = None,
     env_overlay: Mapping[str, Any] | None = None,
@@ -587,11 +613,12 @@ def render_setup_report(
     turns = _trajectory_of(base)
     lines.extend(_the_run(turns))
     lines.extend(_tokens(resolved_card, turns))
+    sealed = _mapping(verdict) or read_run_document(base, _VERDICT_NAME) or {}
+    lines.extend(_evidence(resolved_card, turns, sealed))
     lines.extend(
-        _evidence(
-            resolved_card,
-            turns,
-            _mapping(verdict) or read_run_document(base, _VERDICT_NAME) or {},
+        _evidence_accounting(
+            _mapping(report_metrics) or read_run_document(base, _REPORT_METRICS_NAME) or {},
+            sealed,
         )
     )
     return "\n".join(lines).rstrip("\n") + "\n"
