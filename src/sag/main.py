@@ -23,6 +23,7 @@ from sag.agent.context_journal import JOURNAL_DIR
 from sag.agent.history_state import HistoryActionState, decode_history_action_state
 from sag.agent.phase_machine import PHASE_NAMES
 from sag.agent.verdict_finalizer import (
+    ReportDeliveryStatus,
     RunTermination,
     RunVerdictSnapshot,
     read_live_verdict_snapshot,
@@ -430,12 +431,25 @@ def _reader_report_path(session_dir: str | None, mirrored: str | None) -> Path |
     return Path(session_dir) / setup_report_name(session_dir)
 
 
+def _delivering(termination: RunTermination) -> RunTermination:
+    """The run's own ending, with the report the host is writing as delivered.
+
+    `recorded_report` says `delivered` for a directory that holds a report;
+    this says it for the document being written into one, which is the same
+    statement a moment earlier. Only the report word is replaced: how the run
+    itself ended is the run's to say, and the Setup row reads it.
+    """
+
+    return termination.model_copy(update={"report_delivery_status": ReportDeliveryStatus.DELIVERED})
+
+
 def _write_reader_report(
-    target: Path | None,
-    card: RunResultCard,
-    *,
     session_dir: str | None,
+    build_card: Callable[[RunTermination, str | None], RunResultCard],
+    *,
+    mirrored: str | None = None,
     orchestrator: DockerOrchestrator | None = None,
+    termination: RunTermination,
     verdict: Any = None,
     report_metrics: Mapping[str, Any] | None = None,
     project_url: str | None = None,
@@ -446,11 +460,21 @@ def _write_reader_report(
     Best-effort, on the same contract as the artifact copy below: a run is not
     failed by a document, and the block is printed either way. Returns the path
     written, or nothing — the caller names the file only when it is there.
+
+    Naming the file is inside the guard with everything else: it reads the
+    ledger to date the name, and a run that has finished is not failed by a
+    directory that has gone.
     """
 
-    if target is None or not session_dir:
+    if not session_dir:
         return None
     try:
+        target = _reader_report_path(session_dir, mirrored)
+        if target is None:
+            return None
+        # The document names itself: its Report row is this file, delivered,
+        # and it only reaches a reader if the write below succeeds.
+        card = build_card(_delivering(termination), str(target))
         document = render_setup_report(
             session_dir,
             card=card,
@@ -464,7 +488,7 @@ def _write_reader_report(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(document, encoding="utf-8")
     except Exception as exc:
-        logger.warning(f"Could not write the setup report to {target}: {exc}")
+        logger.warning(f"Could not write the setup report for {session_dir}: {exc}")
         return None
     logger.info(f"✅ Setup report written to {target}")
     # And into the container, over the stub the report phase left there, so a
@@ -1015,38 +1039,52 @@ def project(
         report_path = _save_setup_artifacts(orchestrator, project_name) if record else None
 
         run_counts = read_run_counts(session_dir)
-        # One card, two surfaces: the block the terminal prints and the report
-        # the reader opens are the same reading of this run, taken here, after
-        # its last event.
-        target = _reader_report_path(session_dir, report_path)
         report_metrics = _read_metrics_v2_for_cli(orchestrator)
-        card = _setup_result_card(
-            snapshot,
-            termination,
-            project_name,
-            module_metrics=_read_module_metrics_for_cli(orchestrator),
-            report_metrics=report_metrics,
-            run_pin=_read_run_pin_for_cli(session_logger),
-            run_counts=run_counts,
-            container=docker_name,
-            session_dir=session_dir,
-            report_path=_report_name_for_block(str(target) if target else None, session_dir),
-        )
-        _write_reader_report(
-            target,
-            card,
-            session_dir=session_dir,
+
+        # One card builder, two surfaces: the block the terminal prints and the
+        # report the reader opens are the same reading of this run, taken here,
+        # after its last event. They differ in one cell and only when the
+        # document could not be written — the row then says what the run
+        # recorded rather than naming a file that is not there.
+        def _card(ending: RunTermination, report_file: str | None) -> RunResultCard:
+            return _setup_result_card(
+                snapshot,
+                ending,
+                project_name,
+                module_metrics=_read_module_metrics_for_cli(orchestrator),
+                report_metrics=report_metrics,
+                run_pin=_read_run_pin_for_cli(session_logger),
+                run_counts=run_counts,
+                container=docker_name,
+                session_dir=session_dir,
+                report_path=_report_name_for_block(report_file, session_dir),
+            )
+
+        written = _write_reader_report(
+            session_dir,
+            _card,
+            mirrored=report_path,
             orchestrator=orchestrator,
+            termination=termination,
             verdict=snapshot,
             report_metrics=report_metrics,
             project_url=repo_url,
             env_overlay=_read_env_overlay_for_cli(orchestrator),
         )
+        # What the block says about the report is read back off the disk the
+        # same way `sag result` reads it, so the row names a file that is
+        # there. Without a document it states what the run itself recorded.
+        delivered, found = (
+            recorded_report(Path(session_dir)) if written and session_dir else (None, None)
+        )
         cli_result, exit_code = _render_setup_cli_result(
             snapshot,
             termination,
             project_name,
-            card=card,
+            card=_card(
+                _delivering(termination) if delivered is not None else termination,
+                found if delivered is not None else report_path,
+            ),
         )
 
         console.print(cli_result)

@@ -258,7 +258,12 @@ def test_project_command_success_ignores_report_delivery_failure(monkeypatch, tm
     # only the closing trailer is what a successful run does without.
     assert " Setup         success" in result.output
     assert "Setup verdict" not in result.output
-    assert "the setup report was not written" in result.output
+    # The report phase's own deliverable failed, and the host wrote the
+    # reader's report at the end of the run regardless. The row is read back
+    # off the disk, so it states the document that is there rather than the
+    # one the loop failed to write.
+    assert "the setup report was not written" not in result.output
+    assert " Report        delivered      setup-report-" in result.output
     assert "WARNING" not in result.output
 
 

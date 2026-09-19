@@ -553,3 +553,45 @@ def test_a_session_directory_that_is_gone_costs_the_run_nothing(monkeypatch, tmp
     assert result.exit_code == 0, result.output
     assert "Setup failed" not in result.output
     assert " Setup         success" in result.output
+
+
+def test_the_block_names_the_document_only_when_it_was_written(monkeypatch, tmp_path):
+    """A row that names a file the reader cannot open is worse than no name.
+
+    The card used to be built from the path the run *intended* to write, and
+    the write's answer was thrown away — so a failed write still printed
+    `Report | delivered | setup-report-….md` for a file that is not there.
+    """
+
+    from test_cli_project_exit_codes import invoke_project
+
+    import sag.main as main_module
+
+    def _refuse(*args, **kwargs):
+        raise RuntimeError("nothing could be rendered")
+
+    monkeypatch.setattr(main_module, "render_setup_report", _refuse)
+
+    result = invoke_project(monkeypatch, tmp_path, _recording_agent())
+
+    assert result.exit_code == 0, result.output
+    assert not sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
+    assert "setup-report-" not in result.output
+    # What the run itself recorded: the report tool wrote one in the container.
+    assert "written inside the container" in result.output
+
+
+def test_both_surfaces_say_delivered_and_name_the_same_file(monkeypatch, tmp_path):
+    """The block and the document state one file, found the one way."""
+
+    from test_cli_project_exit_codes import invoke_project
+
+    result = invoke_project(monkeypatch, tmp_path, _recording_agent())
+    assert result.exit_code == 0, result.output
+
+    written = sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
+    assert len(written) == 1, written
+    document = written[0].read_text(encoding="utf-8")
+
+    assert f"| **Report** | delivered | {written[0].name} |" in document
+    assert f"Report        delivered      {written[0].name}" in result.output
