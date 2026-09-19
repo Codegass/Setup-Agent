@@ -711,3 +711,48 @@ def test_a_run_that_refused_nothing_prints_no_second_table():
 
     assert "## What was set up" in document
     assert "did not use" not in document
+
+
+def test_only_the_workspace_itself_is_counted_as_a_directory():
+    """A path with no extension is not the same thing as a directory."""
+
+    from sag.report_document.render import classify_evidence_ref
+
+    roots = ("/workspace", "/workspace/commons-cli")
+
+    assert classify_evidence_ref("/workspace/commons-cli", roots) == "directory"
+    assert classify_evidence_ref("/workspace", roots) == "directory"
+    # Files the build reads and writes that happen to carry no extension.
+    assert classify_evidence_ref("/workspace/commons-cli/Makefile", roots) == "other"
+    assert classify_evidence_ref("/workspace/commons-cli/mvnw", roots) == "other"
+    assert classify_evidence_ref("/workspace/commons-cli/target/classes", roots) == "other"
+
+
+def test_a_citation_that_names_two_files_is_counted_as_neither():
+    """Folding a spelling into the wrong file would undercount the run's work."""
+
+    from sag.report_document.render import artifacts_by_kind
+
+    counted = artifacts_by_kind(
+        [
+            "/workspace/p/one/target/app.jar",
+            "/workspace/p/two/target/app.jar",
+            "target/app.jar",
+        ],
+        roots=("/workspace/p",),
+    )
+
+    # Two jars, and one citation that could be either of them.
+    assert counted == {"jar": 2, "other": 1}
+
+
+def test_the_evidence_sentence_still_adds_up_for_the_archived_run():
+    """The counts are a census of the artifacts, so they sum to the total."""
+
+    document = render_setup_report(FIXTURE)
+
+    assert (
+        "The run cited 72 distinct artifacts: 47 surefire report files, "
+        "13 stored tool outputs, 6 compiled classes, 4 jars, "
+        "1 validator observation, 1 workspace directory."
+    ) in document

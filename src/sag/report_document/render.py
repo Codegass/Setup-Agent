@@ -464,18 +464,25 @@ def _tokens(card: RunResultCard, document: Trajectory) -> list[str]:
     ]
 
 
-def classify_evidence_ref(ref: str) -> str:
+def classify_evidence_ref(ref: str, roots: Sequence[str] = ()) -> str:
     """Which kind of thing one citation names, by the shape of the citation.
 
     Six kinds cover everything the archived run cited; anything else is
     counted under `other`, never dropped — a reader told the run cited 72
     artifacts and shown 71 has been told a falsehood about the seventy-second.
+
+    `roots` are the directories the run worked in, and they are the only
+    citations called directories: an extensionless path is a `Makefile` or an
+    `mvnw` as often as it is a folder, and nothing in the citation itself says
+    which.
     """
 
     if ref.startswith("output_"):
         return "output"
     if ref.startswith("validator:"):
         return "validator"
+    if ref.rstrip("/") in {root.rstrip("/") for root in roots}:
+        return "directory"
     tail = ref.rsplit("/", 1)[-1]
     if tail.endswith(".xml") and "surefire" in ref:
         return "surefire"
@@ -483,31 +490,37 @@ def classify_evidence_ref(ref: str) -> str:
         return "class"
     if tail.endswith(".jar"):
         return "jar"
-    if "." not in tail:
-        return "directory"
     return "other"
 
 
-def _distinct_artifacts(refs: Sequence[str]) -> list[str]:
-    """One entry per artifact, however many ways the run spelled it.
+def artifacts_by_kind(refs: Sequence[str], *, roots: Sequence[str] = ()) -> dict[str, int]:
+    """How many distinct artifacts the run cited, by kind.
 
     The same file is cited both absolutely and relative to the project — nine
     such pairs on the archived run — and counting the spellings would tell a
     reader the run touched nine files it never touched. A relative citation
     folds into an absolute one that ends with it, and only when exactly one
-    does: two candidates mean the fold would be a guess.
+    does: with two candidates the fold would be a guess, so the citation is
+    counted on its own, as something the report cannot name — never folded
+    into one of them, which would undercount the other.
     """
 
     absolute = [ref for ref in refs if ref.startswith("/")]
-    folded: dict[str, str] = {}
+    counted: dict[str, int] = {}
+    seen: set[str] = set()
     for ref in refs:
-        key = ref
+        key, kind = ref, classify_evidence_ref(ref, roots)
         if not ref.startswith("/"):
             matches = [other for other in absolute if other.endswith(f"/{ref}")]
             if len(matches) == 1:
                 key = matches[0]
-        folded.setdefault(key, ref)
-    return list(folded)
+            elif matches:
+                kind = "other"
+        if key in seen:
+            continue
+        seen.add(key)
+        counted[kind] = counted.get(kind, 0) + 1
+    return counted
 
 
 def _counted(kind: str, count: int) -> str:
@@ -543,14 +556,14 @@ def _evidence(card: RunResultCard, document: Trajectory, verdict: Mapping[str, A
         )
         if str(ref).strip()
     ]
-    artifacts = _distinct_artifacts(list(dict.fromkeys(refs)))
+    # Where the run worked, which is what makes a citation a directory rather
+    # than an extensionless file.
+    roots = ["/workspace", *([f"/workspace/{card.project}"] if card.project else [])]
+    counts = artifacts_by_kind(list(dict.fromkeys(refs)), roots=roots)
+    total = sum(counts.values())
 
     lines: list[str] = []
-    if artifacts:
-        counts: dict[str, int] = {}
-        for artifact in artifacts:
-            kind = classify_evidence_ref(artifact)
-            counts[kind] = counts.get(kind, 0) + 1
+    if total:
         # Largest class first, and ties by the name a reader sees, so one
         # run's evidence reads in the same order every time it is rendered.
         ordered = sorted(
@@ -560,8 +573,8 @@ def _evidence(card: RunResultCard, document: Trajectory, verdict: Mapping[str, A
         said = ", ".join(_counted(kind, count) for kind, count in ordered)
         lines.extend(
             [
-                f"The run cited {len(artifacts):,} distinct "
-                f"artifact{'' if len(artifacts) == 1 else 's'}: {said}.",
+                f"The run cited {total:,} distinct "
+                f"artifact{'' if total == 1 else 's'}: {said}.",
                 "",
             ]
         )
@@ -669,6 +682,8 @@ def render_setup_report(
 
 
 __all__ = [
+    "artifacts_by_kind",
+    "classify_evidence_ref",
     "read_run_document",
     "render_setup_report",
     "report_name",
