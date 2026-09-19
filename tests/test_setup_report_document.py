@@ -94,6 +94,30 @@ def _session_log_dir(tmp_path: Path) -> Path:
     return sessions[0]
 
 
+def _recording_agent():
+    """A run that leaves a ledger behind, the way a real one does.
+
+    The CLI fake seals a verdict but writes no control events, and the
+    document's account of the run is read from those. This subclass drops the
+    archived run's ledger into the host session directory as the session
+    logger would have, so the fence below reads a document with a run in it.
+    """
+
+    from test_cli_project_exit_codes import RecordingSetupAgent
+
+    from sag.config import get_session_logger
+
+    class _LedgerWritingAgent(RecordingSetupAgent):
+        def setup_project(self, **kwargs):
+            termination = super().setup_project(**kwargs)
+            session = get_session_logger().session_log_dir
+            session.mkdir(parents=True, exist_ok=True)
+            shutil.copy(FIXTURE / "control_events.jsonl", session / "control_events.jsonl")
+            return termination
+
+    return _LedgerWritingAgent
+
+
 def test_the_run_end_writes_the_document_beside_the_record(monkeypatch, tmp_path):
     """Written whether or not the run was asked to keep artifacts.
 
@@ -101,9 +125,9 @@ def test_the_run_end_writes_the_document_beside_the_record(monkeypatch, tmp_path
     that waited for the copy would never be written for the majority of runs.
     """
 
-    from test_cli_project_exit_codes import RecordingSetupAgent, invoke_project
+    from test_cli_project_exit_codes import invoke_project
 
-    result = invoke_project(monkeypatch, tmp_path, RecordingSetupAgent)
+    result = invoke_project(monkeypatch, tmp_path, _recording_agent())
     assert result.exit_code == 0, result.output
 
     written = sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
@@ -111,6 +135,10 @@ def test_the_run_end_writes_the_document_beside_the_record(monkeypatch, tmp_path
     document = written[0].read_text(encoding="utf-8")
     assert "## Result" in document
     assert "**Run** `cli-success`" in document
+    # The account of the run is in the file the run left behind, which is what
+    # a document written before the run ended could never carry.
+    assert "## The run" in document
+    assert "19 turns across 5 phases" in document
 
 
 def test_the_archived_copy_does_not_overwrite_the_document(monkeypatch, tmp_path):
@@ -121,7 +149,7 @@ def test_the_archived_copy_does_not_overwrite_the_document(monkeypatch, tmp_path
     the copy runs first, and this is what keeps it there.
     """
 
-    from test_cli_project_exit_codes import RecordingSetupAgent, invoke_project
+    from test_cli_project_exit_codes import invoke_project
 
     import sag.main as main_module
     from sag.config import get_session_logger
@@ -136,13 +164,14 @@ def test_the_archived_copy_does_not_overwrite_the_document(monkeypatch, tmp_path
 
     monkeypatch.setattr(main_module, "_save_setup_artifacts", _copy_the_stub_out)
 
-    result = invoke_project(monkeypatch, tmp_path, RecordingSetupAgent, "--record")
+    result = invoke_project(monkeypatch, tmp_path, _recording_agent(), "--record")
     assert result.exit_code == 0, result.output
 
     written = sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
     assert [path.name for path in written] == ["setup-report-20260917-183804.md"]
     document = written[0].read_text(encoding="utf-8")
     assert "## Result" in document
+    assert "## The run" in document
     assert "Project Setup Report" not in document
     # The row names the file the reader is holding, not the container's copy.
     assert "| **Report** | delivered | setup-report-20260917-183804.md |" in document
