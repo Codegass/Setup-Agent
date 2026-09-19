@@ -39,10 +39,14 @@ theirs, because the bytes never change.
 
 import csv
 import io
+import json
 from pathlib import Path
 
 import pytest
+from result_card_fakes import snapshot_dict
 
+from sag.result_card.build import build_result_card
+from sag.result_card.run_evidence import read_run_counts
 from sag.trajectory.builder import build_trajectory, follow_trajectory
 from sag.trajectory.reducer import DeltaAccumulator
 from sag.trajectory.schema import KEY_RESULTS_MAX_CHARS, Trajectory
@@ -52,6 +56,10 @@ KAFKA = FIXTURES / "kafka-d2r3"
 CAMEL_QUARKUS = FIXTURES / "camel-quarkus-d2r3"
 IGNITE = FIXTURES / "ignite-d2r3"
 SLING = FIXTURES / "sling-commons-osgi-v4"
+
+#: A finished run's verdict, as the card builder wants it. Nothing in it is
+#: about tokens; it is the frame the counts are read into.
+_CARD_SNAPSHOT = snapshot_dict()
 
 #: The warning codes that name a call the ledger never fully accounted for.
 SILENT_CALL_CODES = ("missing_loop_decision", "missing_tool_result")
@@ -624,6 +632,134 @@ def test_slings_forced_consults_are_billed_the_advisor_they_forced():
         (1984, 148),
         (2652, 125),
     ]
+
+
+#: SYNTHETIC, and it has to be: `grep -l CALL_NOT_EXECUTED logs/*/control_events.jsonl`
+#: finds this shape in none of the 794 archived sessions. The bytes are built
+#: from the payload classes the engine seals — `RefusalRecordPayload` for the
+#: cancelled call, `TurnRecordPayload` for both turns — so nothing here is a
+#: shape the engine could not write.
+#:
+#: What it stages is one model response on iteration 5 that asked for two tools:
+#: the first closed the phase, so the second — an `advisor` call — was cancelled
+#: before it dispatched, and the transition that cancelled it then forced an
+#: entry consult on the same iteration. Two turns call `advisor`; exactly one of
+#: them ran the advisor.
+def _cancelled_then_consulted(tmp_path: Path) -> Path:
+    def event(sequence: int, kind: str, payload: dict) -> str:
+        return json.dumps(
+            {
+                "sequence": sequence,
+                "kind": kind,
+                "payload": payload,
+                "source": None,
+                "timestamp": f"2026-09-15T01:00:{sequence:02d}Z",
+                "event_id": f"control-{sequence:06d}",
+                "run_id": "run-1",
+            }
+        )
+
+    def record(sequence: int, turn_id: int, actor: str, envelope: str | None, **bill) -> str:
+        return event(
+            sequence,
+            "turn_record",
+            {
+                "turn_id": turn_id,
+                "phase": "build",
+                "iteration": 5,
+                "actor": actor,
+                "envelope_ref": envelope,
+                "t0": "2026-09-15T01:00:00Z",
+                "t1": "2026-09-15T01:00:01Z",
+                **bill,
+            },
+        )
+
+    lines = [
+        event(
+            1,
+            "refusal_record",
+            {
+                "tool": "advisor",
+                "tool_call_id": "call-1",
+                "refusal_code": "CALL_NOT_EXECUTED",
+                "exact_params_sha256": "a" * 64,
+            },
+        ),
+        record(2, 1, "model", None),
+        event(
+            3,
+            "action_envelope",
+            {
+                "tool": "advisor",
+                "envelope_id": "envelope-000003",
+                "exact_params": {},
+                "intent_source": "controller",
+            },
+        ),
+        event(
+            4,
+            "tool_result",
+            {
+                "envelope_id": "envelope-000003",
+                "tool": "advisor",
+                "params": {},
+                "result": {"operation_outcome": "success", "invocation_status": "completed"},
+            },
+        ),
+        # The engine billed the consult that actually ran, in process, before
+        # the CSV existed.
+        record(
+            5,
+            2,
+            "controller",
+            "envelope-000003",
+            advisor_tokens_in=12632,
+            advisor_tokens_out=149,
+        ),
+    ]
+    session = tmp_path / "cancelled-consult"
+    session.mkdir()
+    (session / "control_events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (session / "token_usage.csv").write_text(
+        "iteration,timestamp,type,tool_name,model,total_tokens,prompt_tokens,"
+        "completion_tokens,reasoning_tokens,actual_output_tokens\n"
+        "5,2026-09-15T01:00:00.500000,advisor,Unknown,gpt-5.4-mini,12781,12632,149,0,149\n",
+        encoding="utf-8",
+    )
+    return session
+
+
+def test_a_cancelled_consult_never_takes_the_bill_of_the_one_that_ran(tmp_path):
+    """A call that never dispatched spent nothing, and cannot spend it twice.
+
+    The cancelled turn comes first in the ledger, so a join that asks only
+    "did this turn name the advisor?" hands it the row — and the consult that
+    actually ran keeps the bill the engine already put on it. One consult then
+    reports as two, and `read_run_counts` adds both into the card: 25,264
+    tokens for a run that was charged 12,781.
+    """
+    session = _cancelled_then_consulted(tmp_path)
+    snap = build_trajectory(session)
+
+    cancelled, consulted = snap.turns
+    assert cancelled.call.tool == "advisor" and cancelled.observation.outcome == "cancelled"
+    assert consulted.call.tool == "advisor" and consulted.observation.outcome == "ok"
+    assert cancelled.advisor_tokens is None
+    assert (consulted.advisor_tokens.input, consulted.advisor_tokens.output) == (12632, 149)
+
+    # And the card adds up to the row, not to twice it.
+    counts = read_run_counts(session)
+    card = build_result_card(_CARD_SNAPSHOT, **counts)
+    assert (card.stats.advisor_tokens_in, card.stats.advisor_tokens_out) == (12632, 149)
+
+
+def test_a_cancelled_consult_is_the_same_turn_to_a_live_watcher(tmp_path):
+    """The follower claims on sight, so it must not claim for a call that ran nothing."""
+    session = _cancelled_then_consulted(tmp_path)
+    accumulated = _accumulated(session, tmp_path / "live", withheld=("token_usage.csv",))
+
+    assert accumulated.turns == build_trajectory(session).turns
 
 
 def test_an_advisor_bill_that_lands_after_the_run_still_reaches_its_turn(tmp_path):

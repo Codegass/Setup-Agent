@@ -27,8 +27,10 @@ control stream does not carry:
   over: a row on iteration N pays the turn that CALLED the advisor on iteration
   N, whoever asked for it, and lands on `advisor_tokens` — never inside
   `tokens`, because the two went to two different models and one sum would
-  report spend nobody was charged. `advisor_tokens_unattributed` and
-  `advisor_tokens_duplicate_row` are those rows' own statements. The engine
+  report spend nobody was charged. A turn that named the advisor and never
+  dispatched — a call cancelled before it ran — is not that turn, because
+  nothing was consulted and nothing was spent. `advisor_tokens_unattributed`
+  and `advisor_tokens_duplicate_row` are those rows' own statements. The engine
   exports this file when the ReAct loop EXITS, so live it
   lands AFTER every turn it pays for: the follower therefore re-states a turn
   whose bill arrived late instead of leaving it unbilled forever, which is the
@@ -847,12 +849,23 @@ class _TokenBiller:
         What IS asked is whether the turn called the advisor, because that is
         the only thing in the ledger that says a consult happened here.
 
+        A call that never dispatched is not such a thing. A model `advisor` call
+        cancelled by an earlier call's phase transition reaches no provider and
+        spends nothing — and the transition then forces an entry consult on the
+        same iteration, so claiming here would take the row off the consult that
+        ran while the engine's own record still bills it: one consult reported
+        as two, and both added into the card. The refusal record states the
+        outcome in the same event that opens the turn, so the follower reads it
+        as early as the replay does.
+
         Claimed on sight, like the model's bill and for the same reason: the
         ledger lands at loop exit, so a claim that waited for its row would
         settle on a different turn in a follow than in a replay.
         """
         iteration = turn.iteration
         if iteration is None or turn.call is None or turn.call.tool != "advisor":
+            return False
+        if turn.observation is not None and turn.observation.outcome in ("cancelled", "refused"):
             return False
         return self._advised.setdefault(iteration, turn.turn_id) == turn.turn_id
 
