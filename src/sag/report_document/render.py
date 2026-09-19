@@ -51,6 +51,14 @@ _COMMIT_CHARS = 7
 #: comparing them should not have to apply an offset in their head.
 _WRITTEN_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+#: How a tool came to be the one the run used, said the way a reader would say
+#: it. A source not named here is printed as the overlay recorded it: an
+#: unfamiliar word from the record is honest, and an invented sentence is not.
+_HOW_PROVISIONED: dict[str, str] = {
+    "system_install": "installed by the run",
+    "agent_registered": "registered by the run",
+}
+
 #: How the document is named, and the format the name's timestamp takes. The
 #: same name the report phase's own deliverable carries, so one run leaves one
 #: report rather than two files a reader has to choose between.
@@ -216,12 +224,60 @@ def _header(
     return lines
 
 
+def _cell(value: Any) -> str:
+    """One table cell, escaped the way the card escapes its own.
+
+    A pipe inside a version string or a path would split the column it sits
+    in, and a newline would end the row early.
+    """
+
+    if value is None:
+        return ""
+    return str(value).replace("|", r"\|").replace("\n", " ")
+
+
+def _what_was_set_up(env_overlay: Mapping[str, Any]) -> list[str]:
+    """The toolchain the run provisioned. Section C.3 of the spec.
+
+    Read from the overlay the run wrote when it activated each tool, which is
+    the record of what the commands afterwards actually ran against. Nothing
+    is printed for a run that activated nothing.
+    """
+
+    tools = env_overlay.get("tools")
+    rows: list[str] = []
+    for name, entry in sorted((tools or {}).items()):
+        if not isinstance(entry, Mapping):
+            continue
+        active = entry.get("active")
+        if not active:
+            continue
+        candidate = (entry.get("candidates") or {}).get(active) or {}
+        source = str(candidate.get("source") or "")
+        how = _HOW_PROVISIONED.get(source, source.replace("_", " "))
+        rows.append(
+            f"| {_cell(name)} | {_cell(candidate.get('version'))} "
+            f"| `{_cell(active)}` | {_cell(how)} |"
+        )
+    if not rows:
+        return []
+    return [
+        "## What was set up",
+        "",
+        "| Tool | Version | Path | How |",
+        "|---|---|---|---|",
+        *rows,
+        "",
+    ]
+
+
 def render_setup_report(
     session_dir: Path | str,
     *,
     card: RunResultCard | None = None,
     project_meta: Mapping[str, Any] | None = None,
     run_pin: Mapping[str, Any] | None = None,
+    env_overlay: Mapping[str, Any] | None = None,
 ) -> str:
     """The document for one finished run, as markdown.
 
@@ -257,6 +313,9 @@ def render_setup_report(
         ended_at=run_ended_at(base),
     )
     lines.extend(render_result_card_markdown(resolved_card))
+    lines.extend(
+        _what_was_set_up(_mapping(env_overlay) or read_run_document(base, _ENV_OVERLAY_NAME) or {})
+    )
     return "\n".join(lines).rstrip("\n") + "\n"
 
 

@@ -147,3 +147,25 @@ def test_the_archived_copy_does_not_overwrite_the_document(monkeypatch, tmp_path
     # The row names the file the reader is holding, not the container's copy.
     assert "| **Report** | delivered | setup-report-20260917-183804.md |" in document
     assert "/workspace/setup-report" not in document
+
+
+def test_the_document_says_what_was_provisioned():
+    """Turns 3 and 4 installed a JDK and a Maven; the old report named neither."""
+
+    document = render_setup_report(FIXTURE)
+
+    assert "## What was set up" in document
+    assert "| java | 1.8.0_502 | `/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java` |" in document
+    assert "| maven | 3.9.9 | `/opt/apache-maven-3.9.9/bin/mvn` |" in document
+    assert "installed by the run" in document
+
+
+def test_a_run_that_provisioned_nothing_says_nothing(tmp_path):
+    """A heading with nothing under it is a question a reader cannot answer."""
+
+    session = _session(tmp_path)
+    (session / ".setup_agent" / "env_overlay.json").write_text(
+        '{"tools": {}, "version": 1}', encoding="utf-8"
+    )
+
+    assert "## What was set up" not in render_setup_report(session)

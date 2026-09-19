@@ -170,6 +170,24 @@ def _read_module_metrics_for_cli(orchestrator: DockerOrchestrator) -> Mapping[st
     return parsed if isinstance(parsed, dict) else None
 
 
+def _read_env_overlay_for_cli(orchestrator: DockerOrchestrator) -> Mapping[str, Any] | None:
+    """Read what the run activated, or nothing when it recorded no overlay.
+
+    The written report names the toolchain the run provisioned. Only a
+    `--record` run mirrors that file to the host, and the report is written for
+    every run, so it is read from the container where it was written.
+    """
+
+    try:
+        from sag.runtime.env_overlay import EnvOverlayStore
+
+        overlay = EnvOverlayStore(orchestrator).inspect()
+    except Exception as exc:
+        logger.debug(f"the runtime overlay could not be read for the report: {exc}")
+        return None
+    return overlay if isinstance(overlay, Mapping) else None
+
+
 def _report_name_for_block(report_path: str | None, session_dir: str | None) -> str | None:
     """Name the report the way the block has room to print it.
 
@@ -418,6 +436,7 @@ def _write_reader_report(
     *,
     session_dir: str | None,
     project_url: str | None = None,
+    env_overlay: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Write the reader's report beside the run's own record.
 
@@ -433,6 +452,7 @@ def _write_reader_report(
             session_dir,
             card=card,
             project_meta={"project_url": project_url},
+            env_overlay=env_overlay,
         )
         if not document:
             return None
@@ -959,7 +979,13 @@ def project(
             session_dir=session_dir,
             report_path=_report_name_for_block(str(target) if target else None, session_dir),
         )
-        _write_reader_report(target, card, session_dir=session_dir, project_url=repo_url)
+        _write_reader_report(
+            target,
+            card,
+            session_dir=session_dir,
+            project_url=repo_url,
+            env_overlay=_read_env_overlay_for_cli(orchestrator),
+        )
         cli_result, exit_code = _render_setup_cli_result(
             snapshot,
             termination,
