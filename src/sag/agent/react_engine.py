@@ -6741,7 +6741,7 @@ class ReActEngine:
         except Exception as exc:  # observability never ends a run
             stated = ", ".join(f"{name}={value}" for name, value in bills.items())
             logger.warning(
-                f"turn record {payload.turn_id} sealed without its bill ({stated}): {exc}"
+                f"turn record {payload.turn_id} was recorded without its bill ({stated}): {exc}"
             )
             return payload
 
