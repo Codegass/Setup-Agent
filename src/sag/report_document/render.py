@@ -516,8 +516,7 @@ def _evidence(card: RunResultCard, document: Trajectory, verdict: Mapping[str, A
         lines.extend(
             [
                 f"The run cited {len(artifacts):,} distinct "
-                f"artifact{'' if len(artifacts) == 1 else 's'}: {said}. "
-                "The full list is in the run's record.",
+                f"artifact{'' if len(artifacts) == 1 else 's'}: {said}.",
                 "",
             ]
         )
