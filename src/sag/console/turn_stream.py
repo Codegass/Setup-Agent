@@ -652,7 +652,7 @@ class TurnStreamRenderer:
         """Is this the turn the record just read was taken for?
 
         The record names the envelope it answered and the span it ran for, and
-        the reducer puts both on the turn it sealed. Either identifies it. The
+        the reducer puts both on the turn it closed. Either identifies it. The
         record's own turn id does not: those are the engine's sequence, which
         this view counts differently on purpose.
 
