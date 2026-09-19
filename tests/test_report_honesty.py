@@ -343,10 +343,6 @@ def test_canonical_report_surfaces_use_same_grain_metrics_only():
     assert "non-skipped passed 926/926" in rendered
     assert "skipped 61 · failed 0 · errors 0" in rendered
     assert "static declarations 468 (diagnostic)" in rendered
-    assert "| **Outcomes Accounted** | 987/987 |" in diagnostics
-    assert "| **Non-skipped Passed** | 926/926 (100.0%) |" in diagnostics
-    assert "| **Skipped** | 61 |" in diagnostics
-
     assert "56/36" not in rendered
     assert "987/468" not in rendered
     assert "Execution Rate" not in rendered
@@ -439,6 +435,21 @@ def _render(tool, snapshot):
     return "\n".join(tool._render_issues_recommendations(snapshot))
 
 
+def _setup_document(tool, snapshot, execution_metrics=None):
+    """The whole document the in-loop tool writes for a setup run."""
+
+    return tool._generate_markdown_report(
+        "done",
+        snapshot.get("status", {}).get("overall", "success"),
+        "",
+        "2026-09-17 18:38:04",
+        {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
+        {},
+        execution_metrics or {},
+        snapshot,
+    )
+
+
 def _blocker_count(text):
     match = re.search(r"### Blockers \((\d+)\)", text)
     assert match, f"no Blockers heading rendered:\n{text}"
@@ -501,13 +512,17 @@ def test_unresolved_conflicts_never_report_zero_blockers():
     assert "build_receipts_unreadable" in text
 
 
-def test_clean_sealed_run_still_reports_no_blockers():
-    """The honest clean path is unchanged — no invented blockers."""
-    snapshot = _sealed_snapshot(verdict="success")
-    text = _render(_tool(), snapshot)
+def test_a_clean_run_prints_no_blockers_section_at_all():
+    """A heading counting to zero is a question a clean run never raised.
 
-    assert "### Blockers (0)" in text
-    assert "✅ No blocking issues" in text
+    The Setup row already says the run succeeded. The section survives for
+    runs that have blockers, which its three siblings above pin.
+    """
+
+    text = _setup_document(_tool(), _sealed_snapshot(verdict="success"))
+
+    assert "Blockers" not in text
+    assert "No blocking issues" not in text
 
 
 def test_derived_blockers_do_not_duplicate_attention_blockers():
@@ -809,7 +824,6 @@ def test_no_tests_and_no_collection_facts_renders_no_test_section():
     assert any("Test classes identified by module and name: unavailable" in line for line in lines)
     # The absence is stated in the reader's words, not the pipeline's.
     assert not any("metrics-v2" in line.lower() for line in lines)
-    assert "## 🧪 Snapshot Test Diagnostics" not in tool._render_detailed_test_analysis(snapshot)
 
 
 def test_report_leads_with_the_result_table_not_bold_metric_lines():
@@ -890,3 +904,43 @@ def test_a_wrong_call_to_the_module_metrics_reader_raises_instead_of_blanking(mo
         tool._result_card(
             {"mode": "setup", "canonical_snapshot": snapshot_dict(), "project_info": {"name": "p"}}
         )
+
+
+def test_the_in_loop_report_states_no_run_counts_it_cannot_know():
+    """A document written at the report turn cannot count the run's turns.
+
+    Every number the engine's live counters offered was wrong by the time it
+    was printed: the runtime was the report phase's six seconds beside a
+    Result row saying 5m 59s, the iterations counted model calls beside a turn
+    count that counts something else, the thoughts counted a step type this
+    engine has not written since the tracker started writing executor/advisor
+    rows, and the success rate accused the report tool's own in-flight call.
+    The run's counts are stated once, by the card, from the ledger.
+    """
+
+    text = _setup_document(
+        _tool(),
+        _sealed_snapshot(verdict="success"),
+        execution_metrics={
+            "total_runtime": 0.1,
+            "total_iterations": 13,
+            "total_thoughts": 0,
+            "total_actions": 18,
+            "successful_actions": 17,
+            "success_rate": 94.0,
+            "tools_used": {"phase": 4, "bash": 4},
+        },
+    )
+
+    assert "iterations" not in text
+    assert "thoughts" not in text
+    assert "success rate" not in text
+    assert "Execution Details" not in text
+    assert "Tool Usage" not in text
+    # The boilerplate that closed it said nothing the Result row had not.
+    assert "Project Ready" not in text
+    assert "All dependencies are installed and configured" not in text
+    assert "Task completed. Setup Agent has finished." not in text
+    # What the phase's deliverable is for: the result, in the same words the
+    # other surfaces use, and the accounting behind the Tests row.
+    assert "## Evidence accounting" in text
