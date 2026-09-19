@@ -33,13 +33,22 @@ somewhere to show itself.
 
 import io
 import json
+import re
 from pathlib import Path
 
 import pytest
 from rich.console import Console
 from rich.text import Text
 
-from sag.console.turn_stream import TOOL_WIDTH, TurnStreamRenderer, _escape, _Line
+from sag.console.turn_stream import (
+    TOOL_WIDTH,
+    TurnStreamRenderer,
+    _escape,
+    _Line,
+    turn_duration_text,
+)
+from sag.report_document import render_setup_report
+from sag.trajectory import build_trajectory
 from sag.trajectory.reducer import TrajectoryReducer
 from sag.trajectory.schema import SUMMARY_MAX_CHARS, CallInfo, GateInfo, ObservationInfo, Turn
 
@@ -1755,6 +1764,9 @@ def test_a_five_way_collision_is_five_different_lines_when_the_terminal_has_the_
 #: session named. These are what a reader reads; a summariser branch going dead
 #: changes one of them and this fails with the before and after side by side.
 #: The `sling-commons-osgi-v4` rows are the four shapes no other fixture has.
+#: Their timings are the engine's own: `sling-commons-osgi-v4` records every
+#: turn it took, so each of these four states the span the record states and
+#: not the gap between the envelope and the answer.
 VERBATIM = [
     (
         "kafka-d2r3",
@@ -1824,21 +1836,21 @@ VERBATIM = [
     # call, so that branch is pinned by unit tests only"; this one does.
     (
         "sling-commons-osgi-v4",
-        "  #6   file_io   read /workspace/sling-org-apache-sling-com…  ok                                1.8s",
+        "  #6   file_io   read /workspace/sling-org-apache-sling-com…  ok                                1.9s",
     ),
     # A refusal, on real bytes. R21 said the same of refusal records.
     (
         "sling-commons-osgi-v4",
-        "  #20  search    search                      cancelled · cancelled                              0.0s",
+        "  #20  search    search                      cancelled · cancelled                              0.1s",
     ),
     # A job dispatched and still running when its turn was answered.
     (
         "sling-commons-osgi-v4",
-        "  #19  search    job:output_a93bbaebcf50     pending · running                                  1.7s",
+        "  #19  search    job:output_a93bbaebcf50     pending · running                                  1.8s",
     ),
     (
         "sling-commons-osgi-v4",
-        "  #14  bash      mvn --show-version -U -B -e clean install…  ok                                1m04s",
+        "  #14  bash      mvn --show-version -U -B -e clean install…  ok                                1m05s",
     ),
 ]
 
@@ -1903,6 +1915,174 @@ def test_a_clip_at_eighty_columns_never_ends_on_a_dangling_separator():
         for line in _render(session, width=80).lines:
             assert not line.endswith("·…"), line
             assert " ·…" not in line, line
+
+
+# --- one turn, one duration, wherever it is read --------------------------
+
+#: The two archived sessions whose ledgers carry the engine's own per-turn
+#: record. The other three predate it, and what they fence is the opposite
+#: property: an outcome the ledger never records is still placed, by the next
+#: thing that needs the terminal.
+RECORDED = {
+    "sling-commons-osgi-v4": FIXTURE_DIR / "sling-commons-osgi-v4",
+    "commons-cli": Path(__file__).parent / "fixtures" / "report_document" / "commons-cli",
+}
+
+#: How long a turn took, as this stream writes it: flush to the right edge, and
+#: either seconds to one decimal or whole minutes and seconds.
+_TOOK = re.compile(r"(\d+\.\d+s|\d+m\d{2}s)$")
+
+
+def _replay(directory: Path, width: int = 100) -> _Sink:
+    """Feed one archived ledger through the renderer, line by line."""
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=width, tty=False)
+    for line in (directory / "control_events.jsonl").read_text().splitlines():
+        stream.feed(line)
+    stream.close()
+    return sink
+
+
+def _took_on_screen(sink: _Sink) -> dict[int, str]:
+    """What the stream says each turn took, read off the rendered lines."""
+
+    found = {}
+    for line in sink.lines:
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+        match = _TOOK.search(stripped)
+        if match is not None:
+            found[int(stripped.split()[0][1:])] = match.group(1)
+    return found
+
+
+def _took_in_document(document: str) -> dict[int, str]:
+    """The `Took` column of the written report's turn tables.
+
+    Read by following the table's own header rather than by counting cells: a
+    call carrying a `|` is escaped into the row, and splitting on the pipe
+    alone drops exactly the three turns whose commands hold an alternation.
+    """
+
+    found = {}
+    in_table = False
+    for line in document.splitlines():
+        if line.startswith("| # | Tool |"):
+            in_table = True
+            continue
+        if not line.startswith("|"):
+            in_table = False
+            continue
+        cells = [cell.strip() for cell in line.split("|")]
+        if in_table and cells[1].isdigit():
+            found[int(cells[1])] = cells[-2]
+    return found
+
+
+@pytest.mark.parametrize("session", sorted(RECORDED))
+def test_a_recorded_turn_took_on_screen_what_the_engine_stated_it_took(session):
+    """The terminal and the trajectory state one span per turn.
+
+    The engine writes its own start and end for every turn it takes, and the
+    derivation adopts them. Reading the answer's arrival off the wire instead
+    measured the gap between two events rather than the turn — 0.1s for a
+    forced consult that ran for four seconds.
+    """
+
+    directory = RECORDED[session]
+    on_screen = _took_on_screen(_replay(directory))
+    stated = {
+        turn.turn_id: turn_duration_text(turn)
+        for turn in build_trajectory(directory).turns
+        if turn_duration_text(turn) is not None
+    }
+    assert on_screen == stated
+
+
+def test_the_forced_consult_of_the_archived_run_reads_the_span_the_engine_stated():
+    """Turn 11 by name, and the two-minute build under it.
+
+    A forced consult is written down after it has run, so the envelope and the
+    answer are 53 ms apart and the turn is not. The run states 4.1s for it and
+    2m06s for the build that follows; the stream used to say 0.1s and 2m02s.
+    """
+
+    lines = _replay(RECORDED["commons-cli"]).lines
+    assert (
+        "  #11  advisor   consult                     advice delivered"
+        "                                   4.1s" in lines
+    )
+    assert (
+        "  #12  build     verify mvn -B clean verify  exit 0 · 994 tests · 0 F · 0 E · 61 S · 6 "
+        "artif…  2m06s" in lines
+    )
+
+
+def test_the_terminal_and_the_written_report_agree_on_every_turn_of_the_real_run():
+    """One run, two surfaces, one number per turn."""
+
+    directory = RECORDED["commons-cli"]
+    document = _took_in_document(render_setup_report(directory))
+    assert document
+    assert _took_on_screen(_replay(directory)) == document
+
+
+def test_an_outcome_is_written_once_when_the_record_lands_after_the_answer():
+    """A live run: the record arrives in a later delta than the result.
+
+    This is the follow path — the renderer is handed each raw line and each
+    delta as they land — and it is where the rule has to hold, because it is
+    the order a real run produces.
+    """
+
+    reducer = TrajectoryReducer()
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    record = _event(
+        3,
+        "turn_record",
+        {
+            "actor": "model",
+            "envelope_ref": "e1",
+            "phase": "build",
+            "iteration": 1,
+            "t0": "2026-09-15T01:00:00.100000Z",
+            "t1": "2026-09-15T01:00:03.600000Z",
+        },
+    )
+    for line in (
+        _envelope(1, "bash", {"command": "mvn test"}, "e1"),
+        _result(2, "bash", "e1", {"operation_outcome": "success"}),
+        record,
+    ):
+        stream.note_event(line)
+        stream.render_delta(reducer.feed(line))
+    stream.close()
+
+    assert len(_turn_lines(sink)) == 1
+    assert _took_on_screen(sink) == {1: "3.5s"}
+    assert "1.0s" not in sink.text
+
+
+def test_an_outcome_no_record_ever_seals_is_placed_before_another_writer_prints():
+    """The three record-less fixtures live here too.
+
+    With no record to wait for, the held outcome goes out the moment anything
+    else needs the terminal — and `give_way()` is a log sink saying so.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "build", {"command": "mvn test"}, "e1"))
+    stream.feed(_result(2, "build", "e1", _build_ok()))
+    assert "exit 0" not in sink.text, "the ledger has not finished with the turn yet"
+    stream.give_way()
+    assert "exit 0 · 994 tests" in sink.text
+    assert sink.text.endswith("\n")
+    stream.close()
+    assert len(_turn_lines(sink)) == 1
 
 
 # --- the sink a real terminal actually is --------------------------------

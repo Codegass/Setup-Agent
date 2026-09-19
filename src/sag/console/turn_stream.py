@@ -13,6 +13,18 @@ progress note, a hole in the ledger, a phase band — the outcome takes a fresh
 line carrying its own turn id, so an outcome is never lost to an interleaving
 and never read as the outcome of the line above it.
 
+**When the outcome appears.** Not when the tool answered: when the engine wrote
+the turn down. The engine states its own start and end for every turn it takes,
+and the trajectory, the written report and the browser all state that span — so
+a stream timing the gap between two events instead would put a different number
+beside the same turn. On the archived commons-cli run the record lands 60 ms to
+3.4 s after the answer (3.4 s of it on a two-minute build), and that wait is the
+whole price of the four surfaces agreeing on one number per turn. A ledger that
+records nothing — the three sessions that predate the engine's per-turn
+record — keeps its outcome only until the next thing needs the terminal: a
+later turn's first line, a band, a job note, a log sink calling `give_way()`,
+or the close. Nothing is ever held past `close()`.
+
 Three things a live renderer has to get right that a batch one does not:
 
 - **A turn in flight is not a hole.** The reducer states `missing_tool_result`
@@ -158,7 +170,10 @@ def turn_duration_text(turn: Turn) -> str | None:
     """How long the turn took, or nothing when the ledger has not said yet.
 
     Public because the written report prints the same column beside the same
-    turns, and a turn that took `2m02s` on one surface took it on both.
+    turns, and a turn that took `2m02s` on one surface took it on both. That
+    holds because both read `t0` and `t1` off the same turn, and because the
+    terminal waits for the engine's own record of the turn before it writes the
+    number down — the record is where those two timestamps come from.
     """
 
     seconds = elapsed(turn.t0, turn.t1) if turn.t0 and turn.t1 else None
@@ -326,6 +341,18 @@ class TurnStreamRenderer:
         #: or under the band already open if anything else needs the terminal
         #: first.
         self._pending: Turn | None = None
+        #: A turn whose outcome is decided and not yet written. It waits for the
+        #: engine's own record of the turn, because that record carries the span
+        #: every other surface states.
+        self._outcome: Turn | None = None
+        #: Whether that outcome line carries the gate's word. Decided when the
+        #: outcome was, not when it is written: a gate that lands in between
+        #: takes a continuation line of its own, exactly as it does today.
+        self._outcome_gate = False
+        #: Set by a `turn_record` line, read by the delta that follows it. That
+        #: delta is where the reducer restates the turn with the record's own
+        #: start and end, so settling on it uses the right span.
+        self._recorded = False
         #: Statements currently true about the ledger, and the ones already
         #: shown. A statement is shown at most once and only while it stands.
         self._held: dict[Warning, None] = {}
@@ -432,7 +459,7 @@ class TurnStreamRenderer:
             line.add(" · " if line.text else "").add(f"{_GATE} {gate_word}")
         return line
 
-    def _settle(self, turn: Turn, used: int) -> _Line | None:
+    def _settle(self, turn: Turn, used: int, *, gate: bool | None = None) -> _Line | None:
         """What the turn's settling adds to a line already `used` columns long.
 
         The outcome starts where the call ENDED, not at a fixed column: a
@@ -440,6 +467,10 @@ class TurnStreamRenderer:
         in half is the worst thing this layout can do, because the cut string is
         the one a reader greps for. The timing goes flush to the right edge,
         where it stays a column to scan down and cannot be what gets clipped.
+
+        `gate` overrides whether the gate's word is part of the line. An
+        outcome that waited was decided before it was written, and asking
+        `_gated` again at writing time would answer for the wrong moment.
         """
 
         # Only an ANSWER finishes a turn's line. A gate that arrived first
@@ -447,7 +478,9 @@ class TurnStreamRenderer:
         # afterwards, would find the turn already spoken for and be dropped.
         if not self._answered(turn):
             return None
-        line = self._outcome_line(turn, gate=turn.turn_id not in self._gated)
+        if gate is None:
+            gate = turn.turn_id not in self._gated
+        line = self._outcome_line(turn, gate=gate)
         room = self._width - used
         duration = turn_duration_text(turn)
         if duration is None:
@@ -474,6 +507,13 @@ class TurnStreamRenderer:
             # where a retraction can still have reached it first.
             self._settled.add(turn.turn_id)
 
+        # An outcome still waiting always takes the newest statement of its own
+        # turn. The record's start and end arrive on a restatement, and a line
+        # written from the statement before it states a span nothing else does.
+        waiting = self._outcome is not None and self._outcome.turn_id == turn.turn_id
+        if waiting:
+            self._outcome = turn
+
         # Another turn's news means the held one has waited long enough: place it
         # first, or it is overwritten and its dispatch line never printed at all.
         if self._pending is not None and self._pending.turn_id != turn.turn_id:
@@ -499,54 +539,112 @@ class TurnStreamRenderer:
             return
 
         if turn.turn_id not in self._said:
-            settled = self._settle(turn, self._outcome_at(self._open_cost))
-            if settled is not None:
-                self._said.add(turn.turn_id)
-                if turn.gate is not None:
-                    self._gated.add(turn.turn_id)
-                self._complete(turn, settled)
-        elif turn.gate is not None and turn.turn_id not in self._gated:
-            self._gated.add(turn.turn_id)
-            if self._gate_adds(turn):
-                self._emit(
-                    _Line(self._continuation(turn.turn_id)).add(f"{_GATE} {turn.gate.word}")
-                )
+            if self._answered(turn):
+                self._hold_outcome(turn)
+        else:
+            if waiting and self._recorded:
+                self._place()
+            if turn.gate is not None and turn.turn_id not in self._gated:
+                self._gated.add(turn.turn_id)
+                if self._gate_adds(turn):
+                    # The outcome, if it is still waiting, goes out first and
+                    # without this word: it was decided before the grading
+                    # arrived, and the `↳ #N` line below it is where a grading
+                    # that arrives late has always been read.
+                    self._emit(
+                        _Line(self._continuation(turn.turn_id)).add(f"{_GATE} {turn.gate.word}")
+                    )
         self._band(turn)
 
     def _dispatch(self, turn: Turn) -> None:
-        """Open the turn's band if it opens one, then write its first line."""
+        """Open the turn's band if it opens one, then write its first line.
+
+        A turn that arrives already answered AND already recorded has nothing
+        left to wait for and goes out whole. One that arrives answered before
+        its record — the two refusals of `sling-commons-osgi-v4` do — still
+        gets its first line now and its outcome when the record lands, so the
+        span on screen is the span the engine stated.
+        """
 
         self._band(turn)
         head = self._head(turn)
-        settled = self._settle(turn, self._outcome_at(len(head.text)))
-        if settled is None:
-            self._open_line(head)
-            self._open_turn = turn.turn_id
+        if self._answered(turn) and self._recorded:
+            settled = self._settle(turn, self._outcome_at(len(head.text)))
+            self._said.add(turn.turn_id)
+            if turn.gate is not None:
+                # A held line defers the write past events that have already
+                # happened, so a turn dispatched late can arrive with its
+                # grading already in hand and on this very line. Not recording
+                # it here says it a second time on the next restatement. Event
+                # order is not render order, and this clause is about render
+                # order.
+                self._gated.add(turn.turn_id)
+            self._emit(
+                head.add(" " * (self._outcome_at(len(head.text)) - len(head.text))).extend(
+                    settled or _Line()
+                )
+            )
             return
-        self._said.add(turn.turn_id)
-        if turn.gate is not None:
-            # A held line defers the write past events that have already
-            # happened, so a turn dispatched late can arrive with its grading
-            # already in hand and on this very line. Not recording it here says
-            # it a second time on the next restatement. Event order is not
-            # render order, and this clause is about render order.
-            self._gated.add(turn.turn_id)
-        self._emit(
-            head.add(" " * (self._outcome_at(len(head.text)) - len(head.text))).extend(settled)
-        )
+        self._open_line(head)
+        self._open_turn = turn.turn_id
+        if self._answered(turn):
+            self._hold_outcome(turn)
 
-    def _flush(self) -> None:
-        """Place a held first line now, under whatever band the run is in.
+    def _hold_outcome(self, turn: Turn) -> None:
+        """Decide what the turn's outcome says; write it when the record lands.
 
-        Anything else reaching the terminal would otherwise be printed above a
-        turn that was dispatched before it. The band it goes under is the one
-        already open, which is the fallback for a phase that never resolves.
+        Deciding and writing are two moments now, and everything the outcome
+        depends on other than the span is fixed here, at the first moment the
+        ledger answered the turn: the turn is spoken for, and the gate's word
+        is part of the line only if the grading was already in hand.
         """
 
-        # `_pending` is cleared BEFORE the dispatch, so the `_emit` inside it
-        # re-enters here and finds nothing to do. That is the whole re-entry
-        # guard; a flag as well would be a second one that can never fire.
+        if self._outcome is not None and self._outcome.turn_id != turn.turn_id:
+            # Two outcomes cannot wait at once: the one already waiting belongs
+            # to the line that is open, and this one does not.
+            self._place()
+        self._outcome = turn
+        # The grading is part of this line only if it was already in hand. A
+        # restatement can hand the waiting outcome a gate that landed after it
+        # was decided, and that gate's place is the `↳ #N` line below.
+        self._outcome_gate = turn.gate is not None and turn.turn_id not in self._gated
+        self._said.add(turn.turn_id)
+        if turn.gate is not None:
+            self._gated.add(turn.turn_id)
+        if self._recorded:
+            self._place()
+
+    def _place(self) -> None:
+        """Write the outcome that was waiting, wherever its line now is.
+
+        `_outcome` is cleared BEFORE the write, so an `_emit` inside it
+        re-enters `_flush` and finds nothing left to place.
+        """
+
+        turn, self._outcome = self._outcome, None
+        if turn is None:
+            return
+        gate = self._outcome_gate
+        settled = self._settle(turn, self._outcome_at(self._open_cost), gate=gate)
+        if settled is not None:
+            self._complete(turn, settled, gate=gate)
+
+    def _flush(self) -> None:
+        """Place what is waiting: an outcome first, then a held first line.
+
+        Anything else reaching the terminal would otherwise be printed above a
+        turn that was dispatched before it. The outcome goes first because it
+        belongs to the line that is still open; the band a held first line goes
+        under is the one already open, which is the fallback for a phase that
+        never resolves.
+        """
+
+        # Both are cleared BEFORE anything is written, so the `_emit` inside
+        # either one re-enters here and finds nothing to do. That is the whole
+        # re-entry guard; a flag as well would be a second one that can never
+        # fire.
         pending, self._pending = self._pending, None
+        self._place()
         if pending is not None:
             self._dispatch(pending)
 
@@ -561,7 +659,7 @@ class TurnStreamRenderer:
 
         return f"      ↳ #{turn_id} "
 
-    def _complete(self, turn: Turn, settled: _Line) -> None:
+    def _complete(self, turn: Turn, settled: _Line, *, gate: bool | None = None) -> None:
         """Finish the turn's line in place, or give the outcome its own line."""
 
         if self._open_turn == turn.turn_id and self._line_open:
@@ -570,7 +668,7 @@ class TurnStreamRenderer:
             self._close_line()
             return
         marker = self._continuation(turn.turn_id)
-        self._emit(_Line(marker).extend(self._settle(turn, len(marker)) or _Line()))
+        self._emit(_Line(marker).extend(self._settle(turn, len(marker), gate=gate) or _Line()))
 
     def _band(self, turn: Turn) -> None:
         """Open a phase band when the run enters one, and remember its grading.
@@ -796,6 +894,15 @@ class TurnStreamRenderer:
             self._note_job(body)
         elif kind == "job_live_at_close":
             self._note_live_job(body)
+        elif kind == "turn_record":
+            # Nothing to print. What it says is that the engine has finished
+            # with a turn, and the delta this line produces restates that turn
+            # with the engine's own start and end — which is the moment a
+            # waiting outcome can be written with the span every other surface
+            # states. The record's own turn ids are ITS sequence and are not
+            # this view's, so the line is read for the fact that a record
+            # landed and the delta beside it names the turn.
+            self._recorded = True
 
     def render_delta(self, delta: TrajectoryDelta) -> None:
         """Write what one delta changed: its turns, then its statements.
@@ -820,6 +927,8 @@ class TurnStreamRenderer:
 
         for turn in delta.turns:
             self.render_turn(turn)
+        # The record's reach is one delta: the one its own line produced.
+        self._recorded = False
         self._hold(delta.warnings, delta.retracted_warnings)
         self._release()
 

@@ -832,9 +832,10 @@ def test_a_console_line_written_while_a_turn_is_open_lands_on_its_own_line(
 
     `_attach_turn_stream` registers `renderer.give_way` with the logger, so a
     warning logged while a dispatch line is open finishes that line first and
-    the answer comes back under `↳ #N`. `_close_turn_stream` takes the hook back
-    before the renderer is closed, so a warning logged during shutdown has no
-    renderer to ask and reaches stderr all the same.
+    the answer comes back under `↳ #N` — when the engine's record of the turn
+    lands, which is what the stream writes the outcome on. `_close_turn_stream`
+    takes the hook back before the renderer is closed, so a warning logged
+    during shutdown has no renderer to ask and reaches stderr all the same.
     """
 
     buffer = _terminal(monkeypatch)
@@ -883,6 +884,24 @@ def test_a_console_line_written_while_a_turn_is_open_lands_on_its_own_line(
                 "params": {},
                 "scope": "environment",
                 "result": {"operation_outcome": "success"},
+            },
+        )
+    )
+    # The answer alone does not write the outcome: the stream waits for the
+    # engine to write the turn down, because that record carries the span the
+    # trajectory and the report state.
+    assert "↳ #2" not in buffer.getvalue()
+    renderer.feed(
+        _ledger_line(
+            4,
+            "turn_record",
+            {
+                "actor": "model",
+                "envelope_ref": "e1",
+                "phase": "provision",
+                "iteration": 1,
+                "t0": "2026-09-15T01:00:01Z",
+                "t1": "2026-09-15T01:00:03Z",
             },
         )
     )
