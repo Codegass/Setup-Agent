@@ -1,0 +1,42 @@
+{
+  "tools": {
+    "java": {
+      "active": "/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java",
+      "blocked": [],
+      "candidates": {
+        "/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java": {
+          "capabilities": [
+            "javac"
+          ],
+          "distribution": "openjdk",
+          "env": {
+            "JAVA_HOME": "/usr/lib/jvm/java-8-openjdk-amd64"
+          },
+          "path_prepend": [
+            "/usr/lib/jvm/java-8-openjdk-amd64/jre/bin",
+            "/usr/lib/jvm/java-8-openjdk-amd64/bin"
+          ],
+          "source": "system_install",
+          "version": "1.8.0_502"
+        }
+      }
+    },
+    "maven": {
+      "active": "/opt/apache-maven-3.9.9/bin/mvn",
+      "blocked": [],
+      "candidates": {
+        "/opt/apache-maven-3.9.9/bin/mvn": {
+          "env": {
+            "MAVEN_HOME": "/opt/apache-maven-3.9.9"
+          },
+          "path_prepend": [
+            "/opt/apache-maven-3.9.9/bin"
+          ],
+          "source": "system_install",
+          "version": "3.9.9"
+        }
+      }
+    }
+  },
+  "version": 1
+}

@@ -1,0 +1,109 @@
+{
+  "control": {
+    "cleanup_escalations": 0,
+    "midrun_human_approvals": 0,
+    "terminal_refusal_recurrences": 0,
+    "unsettled_jobs": 0
+  },
+  "coverage": {
+    "domains_attempted": 1,
+    "domains_discovered": 1,
+    "domains_terminal": 1,
+    "domains_with_claimed_tests": 1
+  },
+  "evidence": {
+    "conflict_count": 0,
+    "integrity": "complete",
+    "receipts_expected": 1,
+    "receipts_persisted": 1,
+    "terminal_receipts_unpersisted": 0
+  },
+  "identity_version": "module-qualified-v1",
+  "outcome": {
+    "build_state": "success",
+    "terminal_reason": "test_terminated",
+    "test_state": "success",
+    "verdict": "success"
+  },
+  "run": {
+    "control_bundle_hash": "9e4bf4ba17e978956a91d0e53cde3e4ec1d82ea28054e36b910bc639824b855c",
+    "image_digest": "sha256:b2b7ea366714195a1e1c5b2b578ece85c0b3920381a8654d038d9684f009613c",
+    "missing_pins": [
+      "run_order_index"
+    ],
+    "model_pin": "thinking=gpt-5.4-mini;action=gpt-5.4-mini",
+    "pin_status": "incomplete",
+    "prompt_hash": "c5804bbbe504cea802b1795f8e8ed7f9b8634cbd4bb76bfc892eba458938a1f5",
+    "run_id": "20260917_182955_763421_56a9bbfe481c_71905-7-0f1681c52e35",
+    "run_order_index": null,
+    "sag_sha": "6042fc9be87c7fdf2bb8fbf2e4438ba3784af432",
+    "target_sha": "e17111798da51037659b3594d9c0b3b525040081"
+  },
+  "schema_version": 2,
+  "tests": {
+    "claimed": {
+      "latest_cases": {
+        "availability": "available",
+        "basis": "latest parameter-aware cases",
+        "errors": 0,
+        "executed": 994,
+        "failed": 0,
+        "passed": 933,
+        "skipped": 61
+      },
+      "latest_subjects": {
+        "availability": "available",
+        "basis": "latest module-qualified subjects",
+        "errors": 0,
+        "executed": 595,
+        "failed": 0,
+        "passed": 534,
+        "skipped": 61
+      },
+      "receipt_executions": {
+        "availability": "available",
+        "basis": "report XML totals over every claimed report",
+        "errors": 0,
+        "executed": 994,
+        "failed": 0,
+        "passed": 933,
+        "skipped": 61
+      }
+    },
+    "flaky_cases": 0,
+    "quarantined_observations": {
+      "availability": "available",
+      "basis": "receipt-scoped report scan",
+      "errors": 0,
+      "executed": 0,
+      "failed": 0,
+      "passed": 0,
+      "reason_counts": {},
+      "report_file_count": 0,
+      "skipped": 0
+    },
+    "retried_cases": 0,
+    "stale_observations": {
+      "availability": "available",
+      "basis": "receipt hash validation",
+      "errors": 0,
+      "executed": 0,
+      "failed": 0,
+      "passed": 0,
+      "reason_counts": {},
+      "report_file_count": 0,
+      "skipped": 0
+    },
+    "unattributed_observations": {
+      "availability": "available",
+      "basis": "all current-target receipt rows were identity-sealed",
+      "errors": 0,
+      "executed": 0,
+      "failed": 0,
+      "passed": 0,
+      "reason_counts": {},
+      "report_file_count": 0,
+      "skipped": 0
+    }
+  }
+}
