@@ -163,6 +163,45 @@ def invoke_project(monkeypatch, tmp_path, agent_type, *extra_args):
     )
 
 
+def test_the_run_end_reads_the_container_once_for_each_thing_it_needs(monkeypatch, tmp_path):
+    """Two surfaces, one reading. The card builder is called twice — the
+    document names itself as delivered, the block names the file it found —
+    and it used to re-read the module metrics and the run pin on each call,
+    so a finished run made two container round-trips and two pin reads for
+    one set of numbers. The container's report path was asked twice as well,
+    once to name the host's copy and once to write the container's, which is
+    the same `find` over the same directory for the same file.
+
+    Numbers a run states once are read once.
+    """
+
+    reads = {"modules": 0, "pin": 0, "report_path": 0}
+    real_modules = main_module._read_module_metrics_for_cli
+    real_pin = main_module._read_run_pin_for_cli
+    real_path = main_module.container_report_path
+
+    def _modules(orchestrator):
+        reads["modules"] += 1
+        return real_modules(orchestrator)
+
+    def _pin(session_logger):
+        reads["pin"] += 1
+        return real_pin(session_logger)
+
+    def _path(orchestrator):
+        reads["report_path"] += 1
+        return real_path(orchestrator)
+
+    monkeypatch.setattr(main_module, "_read_module_metrics_for_cli", _modules)
+    monkeypatch.setattr(main_module, "_read_run_pin_for_cli", _pin)
+    monkeypatch.setattr(main_module, "container_report_path", _path)
+
+    result = invoke_project(monkeypatch, tmp_path, RecordingSetupAgent)
+
+    assert result.exit_code == 0, result.output
+    assert reads == {"modules": 1, "pin": 1, "report_path": 1}
+
+
 def test_project_command_returns_nonzero_for_partial_snapshot(monkeypatch, tmp_path):
     result = invoke_project(monkeypatch, tmp_path, PartialSetupAgent)
 

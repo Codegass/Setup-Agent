@@ -419,7 +419,7 @@ def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str
 def _reader_report_path(
     session_dir: str | None,
     mirrored: str | None,
-    orchestrator: DockerOrchestrator | None = None,
+    stated: str | None = None,
 ) -> Path | None:
     """Where this run's report goes on the host, or nothing when it has no home.
 
@@ -430,14 +430,17 @@ def _reader_report_path(
     the same file twice — they were dated from two different clocks before,
     the host's from the run's last event and the container's from the report
     turn. Only a run whose report phase left nothing is named from the record.
+
+    `stated` is where the container says its own report is, already resolved
+    by the caller. Asking for it here as well listed the same directory for
+    the same file twice in one run.
     """
 
     if not session_dir:
         return None
     name = Path(mirrored).name if mirrored else None
-    if name is None and orchestrator is not None:
-        stated = container_report_path(orchestrator)
-        name = Path(stated).name if stated else None
+    if name is None and stated:
+        name = Path(stated).name
     return Path(session_dir) / (name or setup_report_name(session_dir))
 
 
@@ -479,7 +482,12 @@ def _write_reader_report(
     if not session_dir:
         return None
     try:
-        target = _reader_report_path(session_dir, mirrored, orchestrator)
+        # The container is asked once where its report is. Both the host's
+        # copy and the container's need that answer — one for its name, one
+        # for the file it replaces — and it is the same listing of the same
+        # directory either way.
+        stated = container_report_path(orchestrator) if orchestrator is not None else None
+        target = _reader_report_path(session_dir, mirrored, stated)
         if target is None:
             return None
         # The document names itself: its Report row is this file, delivered,
@@ -507,14 +515,32 @@ def _write_reader_report(
     # it is not a reason to fail a run that has finished.
     if orchestrator is not None:
         try:
-            _write_report_into_container(orchestrator, document, name=target.name)
+            _write_report_into_container(
+                orchestrator,
+                document,
+                name=target.name,
+                target=_container_report_target(stated, target.name),
+            )
         except Exception as exc:
             logger.warning(f"Could not write the setup report into the container: {exc}")
     return str(target)
 
 
+def _container_report_target(stated: str | None, name: str) -> str:
+    """The file the container's copy of the report goes to.
+
+    The report the container already holds, when the report phase left one,
+    and this run's name when it did not. One expression, because the run end
+    resolves it before it names the host's copy and hands the answer on: the
+    same listing of the same directory twice in one run is a round trip for
+    nothing.
+    """
+
+    return stated or f"/workspace/{name}"
+
+
 def _write_report_into_container(
-    orchestrator: DockerOrchestrator, document: str, *, name: str
+    orchestrator: DockerOrchestrator, document: str, *, name: str, target: str | None = None
 ) -> None:
     """Replace the container's stub with the document the reader opens.
 
@@ -524,23 +550,27 @@ def _write_report_into_container(
     way every surface resolves it — or under this run's name when the phase
     left none.
 
+    `target` is that file when the caller has already asked for it, which the
+    run end has: it needs the same answer to name the host's copy. Left out,
+    this asks for itself, so the function still stands on its own.
+
     The caller guards this: a container that has gone away or turned
     read-only costs the run nothing, because the host already holds the
     document.
     """
 
-    target = container_report_path(orchestrator) or f"/workspace/{name}"
+    where = target or _container_report_target(container_report_path(orchestrator), name)
     delimiter = f"EOF_{abs(hash(document)) % 10000}"
     answered = orchestrator.execute_command(
-        f"cat > {target} << '{delimiter}'\n{document}\n{delimiter}"
+        f"cat > {where} << '{delimiter}'\n{document}\n{delimiter}"
     )
     # Both shapes this codebase's execute paths answer with: an exit code, or
     # a success flag with no code. An absent field is not a failure signal.
     answer = answered if isinstance(answered, Mapping) else {}
     if answer.get("exit_code", 0) == 0 and answer.get("success", True):
-        logger.info(f"✅ Setup report written into the container at {target}")
+        logger.info(f"✅ Setup report written into the container at {where}")
     else:
-        logger.warning(f"Could not write the setup report into the container at {target}")
+        logger.warning(f"Could not write the setup report into the container at {where}")
 
 
 def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> str | None:
@@ -1042,6 +1072,12 @@ def project(
 
         run_counts = read_run_counts(session_dir)
         report_metrics = _read_metrics_v2_for_cli(orchestrator)
+        # Read here, beside the counts, and not inside the builder below. The
+        # builder is called twice for one run and these are two readings of
+        # things that cannot change between the calls — one of them a round
+        # trip into the container.
+        module_metrics = _read_module_metrics_for_cli(orchestrator)
+        run_pin = _read_run_pin_for_cli(session_logger)
 
         # One card builder, two surfaces: the block the terminal prints and the
         # report the reader opens are the same reading of this run, taken here,
@@ -1053,9 +1089,9 @@ def project(
                 snapshot,
                 ending,
                 project_name,
-                module_metrics=_read_module_metrics_for_cli(orchestrator),
+                module_metrics=module_metrics,
                 report_metrics=report_metrics,
-                run_pin=_read_run_pin_for_cli(session_logger),
+                run_pin=run_pin,
                 run_counts=run_counts,
                 container=docker_name,
                 session_dir=session_dir,

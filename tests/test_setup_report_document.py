@@ -450,9 +450,9 @@ def test_the_run_end_hands_the_container_the_document_it_wrote(monkeypatch, tmp_
     sent: list[tuple[str, str]] = []
     real = main_module._write_report_into_container
 
-    def _spy(orchestrator, document, *, name):
+    def _spy(orchestrator, document, *, name, **rest):
         sent.append((document, name))
-        return real(orchestrator, document, name=name)
+        return real(orchestrator, document, name=name, **rest)
 
     monkeypatch.setattr(main_module, "_write_report_into_container", _spy)
     result = invoke_project(monkeypatch, tmp_path, RecordingSetupAgent)
@@ -471,7 +471,7 @@ def test_the_write_back_never_fails_the_run(monkeypatch, tmp_path):
 
     import sag.main as main_module
 
-    def _refuse(orchestrator, document, *, name):
+    def _refuse(orchestrator, document, *, name, **rest):
         raise RuntimeError("the container is gone")
 
     monkeypatch.setattr(main_module, "_write_report_into_container", _refuse)
@@ -641,9 +641,9 @@ def test_the_host_and_the_container_call_the_report_one_name(monkeypatch, tmp_pa
     sent: list[str] = []
     real = main_module._write_report_into_container
 
-    def _spy(orchestrator, document, *, name):
+    def _spy(orchestrator, document, *, name, **rest):
         sent.append(name)
-        return real(orchestrator, document, name=name)
+        return real(orchestrator, document, name=name, **rest)
 
     monkeypatch.setattr(main_module, "_write_report_into_container", _spy)
     monkeypatch.setattr(
