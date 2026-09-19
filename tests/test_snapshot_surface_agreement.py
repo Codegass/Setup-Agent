@@ -1871,29 +1871,56 @@ def test_a_phase_that_closed_blocked_is_not_a_phase_that_finished():
     assert (kafka.stats.phases_completed, kafka.stats.phases_total) != (5, 5)
 
 
-def test_the_phases_the_seal_completed_are_phases_the_bands_finished():
-    """Two readings of one run, and the stricter one may not lose a phase.
+def test_on_this_run_the_phases_the_seal_completed_are_bands_the_fraction_counts():
+    """Two readings of one run, and where they part company.
 
     The seal records a phase `completed`; the bands say whether the run left
-    it on a grading that passed. Every phase the seal completed is a band the
-    fraction counts, so replacing the seal's numerator with the bands' cannot
-    quietly demote a phase that finished.
+    it on a grading that passed. Those are different questions and the archive
+    shows exactly where they answer differently: over the 98 archived runs
+    that carry both a ledger and a seal — 454 bands — fifteen bands close
+    `evidence_close` on a `failed` grading while the seal calls that same
+    phase completed. The fraction follows the band there, deliberately. It is
+    the same call the turn stream makes when it prints `✗ <phase> blocked`,
+    and a card that counted a phase the table above it crosses out would be
+    two surfaces disagreeing about one run.
+
+    So what is asserted here is about THIS run, not a law about the two
+    readings: commons-cli's four completed phases are four of the five bands
+    its fraction counts. The assertion is the subset, because the count
+    comparison that stood here before — `phases_completed >= len(completed)` —
+    is also passed by a run that completed four phases and finished four
+    different ones. The fifteen-band shape is pinned below on the fixture that
+    carries it.
     """
     import json
     from pathlib import Path
 
     from sag.result_card.run_evidence import read_run_counts
+    from sag.trajectory.phases import band_finished
 
-    session = Path(__file__).parent / "fixtures" / "report_document" / "commons-cli"
+    root = Path(__file__).parent / "fixtures"
+    session = root / "report_document" / "commons-cli"
     seal = json.loads((session / ".setup_agent" / "verdict.json").read_text(encoding="utf-8"))
     completed = [
         record["phase"] for record in seal["phase_records"] if record["termination"] == "completed"
     ]
     counts = read_run_counts(session)
+    counted = [band["name"] for band in counts["trajectory_phases"] if band_finished(band)]
 
     assert completed == ["provision", "analyze", "build", "test"]
+    assert set(completed) <= set(counted)
     card = build_result_card(snapshot_dict(), **counts)
-    assert card.stats.phases_completed >= len(completed)
+    assert card.stats.phases_completed == len(counted)
+
+    # The shape the two readings disagree on, on the archived run that has it:
+    # a band closed by `evidence_close` on a `failed` grading is a band this
+    # fraction does not count, whatever a seal says about the phase.
+    kafka = read_run_counts(root / "trajectory" / "kafka-d2r3")
+    uncounted = [band for band in kafka["trajectory_phases"] if not band_finished(band)]
+    assert [(band["name"], band["termination"]) for band in uncounted] == [
+        ("test", "evidence_close")
+    ]
+    assert [gate["word"] for gate in uncounted[0]["gates"]][-1] == "failed"
 
 
 def test_no_surface_names_the_run_counts_one_at_a_time():
