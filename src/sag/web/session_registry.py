@@ -36,7 +36,7 @@ from sag.agent.verdict_finalizer import (
 from sag.result_card.build import _verdict_source, build_result_card
 from sag.result_card.run_evidence import ReportDeliveryOnly, read_run_counts
 from sag.result_card.models import RunResultCard
-from sag.runtime.container_io import resolve_control_execute
+from sag.runtime.container_io import container_report_path, resolve_control_execute
 from sag.trajectory.builder import CONTROL_EVENTS_NAME, build_trajectory
 from sag.web.context_trace import ContextTraceBuilder
 from sag.web.models import (
@@ -1304,45 +1304,14 @@ def _context_filenames(orchestrator: Any) -> list[str]:
 
 
 def _latest_setup_report_path(orchestrator: Any) -> str | None:
-    command = (
-        "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f "
-        "2>/dev/null | sort | tail -1"
-    )
-    try:
-        result = _execute_control(orchestrator, command, timeout=5)
-    except TypeError:
-        result = _execute_control(orchestrator, command)
-    except Exception:
-        return None
+    """The report the container holds, resolved the one way every surface does.
 
-    if not isinstance(result, dict) or result.get("exit_code") != 0:
-        return None
+    The run-end write-back replaces this same file, so the two must name it
+    identically: when they did not, the tab could go on showing a stub the
+    host had already replaced somewhere else.
+    """
 
-    output = result.get("output")
-    if not isinstance(output, str):
-        return None
-
-    report_path = output.strip().splitlines()[-1] if output.strip() else ""
-    if report_path.startswith("/workspace/setup-report-") and report_path.endswith(".md"):
-        return report_path
-
-    fallback_command = (
-        "test -f /workspace/setup-report.md && " "printf '%s\\n' /workspace/setup-report.md"
-    )
-    try:
-        fallback = _execute_control(orchestrator, fallback_command, timeout=5)
-    except TypeError:
-        fallback = _execute_control(orchestrator, fallback_command)
-    except Exception:
-        return None
-
-    if not isinstance(fallback, dict) or fallback.get("exit_code") != 0:
-        return None
-    fallback_output = fallback.get("output")
-    if not isinstance(fallback_output, str):
-        return None
-    fallback_path = fallback_output.strip().splitlines()[-1] if fallback_output.strip() else ""
-    return fallback_path if fallback_path == "/workspace/setup-report.md" else None
+    return container_report_path(orchestrator)
 
 
 def _raw_task_dicts(trunk_data: dict[str, Any]) -> list[dict[str, Any]]:

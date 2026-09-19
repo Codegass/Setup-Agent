@@ -55,6 +55,60 @@ def resolve_control_execute(source: Any) -> Callable[..., Any] | None:
     return cast(Callable[..., Any], source) if callable(source) else None
 
 
+#: Where the report phase leaves its deliverable, and what it is called. The
+#: timestamped name is what the report tool writes; the bare one is what older
+#: runs left, and a reader that knows only the new name sees nothing in them.
+_REPORT_LISTING = (
+    "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f 2>/dev/null | sort | tail -1"
+)
+_REPORT_PREFIX = "/workspace/setup-report-"
+_LEGACY_REPORT_PATH = "/workspace/setup-report.md"
+_LEGACY_REPORT_LISTING = f"test -f {_LEGACY_REPORT_PATH} && printf '%s\\n' {_LEGACY_REPORT_PATH}"
+
+
+def container_report_path(orchestrator: Any) -> str | None:
+    """The setup report the container holds, or nothing.
+
+    The newest by name, which for `setup-report-<timestamp>.md` is the newest
+    by time. A run whose model called the report tool twice leaves two — the
+    tool removes neither — so "the report" has to mean one of them, and every
+    surface has to mean the same one. The web read the newest and the run-end
+    write-back took whichever line `find` printed first, which is how a host
+    document could land on the older file while the Report tab went on showing
+    the stub.
+    """
+
+    listed = _listed_path(orchestrator, _REPORT_LISTING)
+    if listed.startswith(_REPORT_PREFIX) and listed.endswith(".md"):
+        return listed
+    legacy = _listed_path(orchestrator, _LEGACY_REPORT_LISTING)
+    return legacy if legacy == _LEGACY_REPORT_PATH else None
+
+
+def _listed_path(orchestrator: Any, command: str) -> str:
+    """The last line one listing command printed, or an empty string."""
+
+    execute = resolve_control_execute(orchestrator)
+    if execute is None:
+        return ""
+    try:
+        # The timeout is what a dashboard asking a live container needs; a
+        # double that does not take one is answered without it rather than
+        # left unasked.
+        try:
+            result = execute(command, timeout=5)
+        except TypeError:
+            result = execute(command)
+    except Exception:
+        return ""
+    if not isinstance(result, Mapping) or not _command_succeeded(result):
+        return ""
+    output = result.get("output")
+    if not isinstance(output, str) or not output.strip():
+        return ""
+    return output.strip().splitlines()[-1].strip()
+
+
 def _command_succeeded(result: Mapping[str, Any]) -> bool:
     return result.get("success") is not False and result.get("exit_code", 0) == 0
 

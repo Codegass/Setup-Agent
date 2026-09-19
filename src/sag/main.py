@@ -49,7 +49,7 @@ from sag.result_card.run_evidence import (
     read_run_counts,
     recorded_report,
 )
-from sag.runtime.container_io import read_container_text
+from sag.runtime.container_io import container_report_path, read_container_text
 from sag.tools.module_metrics import MODULE_METRICS_PATH
 from sag.trajectory.builder import (
     build_trajectory,
@@ -416,19 +416,29 @@ def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str
         return None
 
 
-def _reader_report_path(session_dir: str | None, mirrored: str | None) -> Path | None:
+def _reader_report_path(
+    session_dir: str | None,
+    mirrored: str | None,
+    orchestrator: DockerOrchestrator | None = None,
+) -> Path | None:
     """Where this run's report goes on the host, or nothing when it has no home.
 
-    A run that mirrored its artifacts out has already put a file there, and the
-    reader's report replaces it: one run leaves one report. A run that did not
-    is given the name the run's own end would have produced.
+    One run leaves one report, under one name. A run that mirrored its
+    artifacts out has already put a file there and the reader's report
+    replaces it. A run that did not takes the name off the container's own
+    report, so the copy beside the ledger and the copy in the container are
+    the same file twice — they were dated from two different clocks before,
+    the host's from the run's last event and the container's from the report
+    turn. Only a run whose report phase left nothing is named from the record.
     """
 
-    if mirrored:
-        return Path(mirrored)
     if not session_dir:
         return None
-    return Path(session_dir) / setup_report_name(session_dir)
+    name = Path(mirrored).name if mirrored else None
+    if name is None and orchestrator is not None:
+        stated = container_report_path(orchestrator)
+        name = Path(stated).name if stated else None
+    return Path(session_dir) / (name or setup_report_name(session_dir))
 
 
 def _delivering(termination: RunTermination) -> RunTermination:
@@ -469,7 +479,7 @@ def _write_reader_report(
     if not session_dir:
         return None
     try:
-        target = _reader_report_path(session_dir, mirrored)
+        target = _reader_report_path(session_dir, mirrored, orchestrator)
         if target is None:
             return None
         # The document names itself: its Report row is this file, delivered,
@@ -510,24 +520,16 @@ def _write_report_into_container(
 
     One run leaves one report, so the copy inside the container is the copy
     outside it. Written with the same here-doc the report tool writes its own
-    deliverable with, over the file the report phase left — or under this
-    run's name when the phase left none.
+    deliverable with, over the file the report phase left — resolved the one
+    way every surface resolves it — or under this run's name when the phase
+    left none.
 
     The caller guards this: a container that has gone away or turned
     read-only costs the run nothing, because the host already holds the
     document.
     """
 
-    listing = _execute_control(
-        orchestrator,
-        "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f 2>/dev/null | head -1",
-    )
-    stub = str(listing.get("output") or "").strip().splitlines()
-    target = (
-        stub[-1]
-        if stub and stub[-1].startswith("/workspace/setup-report-")
-        else f"/workspace/{name}"
-    )
+    target = container_report_path(orchestrator) or f"/workspace/{name}"
     delimiter = f"EOF_{abs(hash(document)) % 10000}"
     answered = orchestrator.execute_command(
         f"cat > {target} << '{delimiter}'\n{document}\n{delimiter}"

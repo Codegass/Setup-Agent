@@ -595,3 +595,65 @@ def test_both_surfaces_say_delivered_and_name_the_same_file(monkeypatch, tmp_pat
 
     assert f"| **Report** | delivered | {written[0].name} |" in document
     assert f"Report        delivered      {written[0].name}" in result.output
+
+
+def test_the_writer_and_the_web_mean_the_same_container_report():
+    """A run whose model called the report tool twice leaves two of them.
+
+    The report tool never removes an older `setup-report-<ts>.md`. The web
+    resolved the newest and the write-back the first line `find` happened to
+    print, so the host document could land on the older file while the Report
+    tab went on showing the stub.
+    """
+
+    import sag.main as main_module
+    from sag.web.session_registry import _latest_setup_report_path
+
+    two = "/workspace/setup-report-20260917-183804.md\n/workspace/setup-report-20260917-184500.md"
+
+    container = _RecordingContainer(stub=two)
+    main_module._write_report_into_container(container, "# doc\n", name="setup-report-x.md")
+    written = [line for line in container.commands if line.startswith("cat > ")]
+
+    assert written[0].startswith("cat > /workspace/setup-report-20260917-184500.md << ")
+    assert _latest_setup_report_path(_RecordingContainer(stub=two)) == (
+        "/workspace/setup-report-20260917-184500.md"
+    )
+    # Both ask the container to choose, in the same words, so the container's
+    # answer cannot depend on which surface asked.
+    asked = [line for line in container.commands if line.startswith("find /workspace")]
+    assert asked and "sort | tail -1" in asked[0]
+
+
+def test_the_host_and_the_container_call_the_report_one_name(monkeypatch, tmp_path):
+    """Without `--record` nothing is copied out, and the two names diverged.
+
+    The host file was dated from the run's last event and the container's stub
+    from the clock at the report turn, so one run left `setup-report-A.md`
+    beside the ledger and `setup-report-B.md` in the container.
+    """
+
+    from test_cli_project_exit_codes import invoke_project
+
+    import sag.main as main_module
+
+    sent: list[str] = []
+    real = main_module._write_report_into_container
+
+    def _spy(orchestrator, document, *, name):
+        sent.append(name)
+        return real(orchestrator, document, name=name)
+
+    monkeypatch.setattr(main_module, "_write_report_into_container", _spy)
+    monkeypatch.setattr(
+        main_module,
+        "container_report_path",
+        lambda orchestrator: "/workspace/setup-report-20260917-183804.md",
+    )
+
+    result = invoke_project(monkeypatch, tmp_path, _recording_agent())
+    assert result.exit_code == 0, result.output
+
+    written = sorted(_session_log_dir(tmp_path).glob("setup-report-*.md"))
+    assert [path.name for path in written] == ["setup-report-20260917-183804.md"]
+    assert sent == ["setup-report-20260917-183804.md"]
