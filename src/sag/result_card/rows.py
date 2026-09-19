@@ -32,8 +32,12 @@ def _join(*parts: str | None) -> str:
     return " · ".join(part for part in parts if part)
 
 
-def _duration_text(seconds: float | None) -> str | None:
-    """`6m 30s`, `41.0s`, `1h 04m`. Sub-minute keeps a decimal; hours drop seconds."""
+def duration_text(seconds: float | None) -> str | None:
+    """`6m 30s`, `41.0s`, `1h 04m`. Sub-minute keeps a decimal; hours drop seconds.
+
+    Public because the written report opens its account of the run with the
+    same duration the Setup row states, and one run cannot last two lengths.
+    """
 
     if seconds is None or seconds < 0:
         return None
@@ -73,7 +77,7 @@ def setup_row(snapshot: Any, *, stats: ResultStats, termination: Any | None) -> 
         phases,
         f"{stats.turns:,} turns" if stats.turns is not None else None,
         f"{stats.tool_calls:,} tool calls" if stats.tool_calls is not None else None,
-        _duration_text(stats.wall_clock_seconds),
+        duration_text(stats.wall_clock_seconds),
     )
     detail = None
     ending = getattr(getattr(termination, "termination", None), "value", None)
@@ -506,6 +510,7 @@ __all__ = [
     "NOT_SCORED",
     "NOT_SUPPLIED",
     "build_row",
+    "duration_text",
     "ci_row",
     "coverage_row",
     "report_row",

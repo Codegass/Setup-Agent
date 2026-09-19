@@ -19,16 +19,19 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from loguru import logger
 
 from sag import __version__
+from sag.console.turn_stream import turn_duration_text
 from sag.result_card import build_result_card
 from sag.result_card.markdown import render_result_card_markdown
 from sag.result_card.models import RunResultCard
+from sag.result_card.rows import duration_text
 from sag.result_card.run_evidence import read_run_counts, recorded_report
-from sag.trajectory.builder import control_events_path, resolve_session_dir
+from sag.trajectory.builder import build_trajectory, control_events_path, resolve_session_dir
+from sag.trajectory.schema import SessionInfo, Trajectory, Turn
 
 #: A run's own artifacts, by the names it writes them under, and the two roots
 #: it writes them at — the same pair `sag result` reads, so a document and the
@@ -50,6 +53,9 @@ _COMMIT_CHARS = 7
 #: timestamps a run's other artifacts carry are that clock too, and a reader
 #: comparing them should not have to apply an offset in their head.
 _WRITTEN_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+#: What marks a turn the harness took rather than one the model asked for.
+_HARNESS_MARK = "(the harness asked)"
 
 #: How a tool came to be the one the run used, said the way a reader would say
 #: it. A source not named here is printed as the overlay recorded it: an
@@ -169,6 +175,18 @@ def _mapping(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _trajectory_of(base: Path) -> Trajectory:
+    """The run's turns, or an empty document when the ledger cannot be read."""
+
+    try:
+        return build_trajectory(base)
+    except Exception as exc:
+        # A reader is never worth a traceback: a run whose ledger is
+        # unreadable prints no account of its turns and says everything else.
+        logger.debug(f"the run's turns are unavailable for the report: {exc}")
+        return Trajectory(session=SessionInfo(run_id=""))
+
+
 def _card_for(directory: Path, base: Path) -> RunResultCard | None:
     """Build the run's card from its own directory, the way `sag result` does."""
 
@@ -271,6 +289,75 @@ def _what_was_set_up(env_overlay: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _turn_rows(turns: Sequence[Turn]) -> list[str]:
+    """One row per turn: what was asked, what came back, how long it took."""
+
+    rows = []
+    for turn in turns:
+        asked = turn.call.summary if turn.call else None
+        # A turn the harness took is not a turn the model asked for, and a
+        # reader comparing the run to the model's reasoning needs to see which
+        # is which rather than be told the model asked for it.
+        if asked and turn.actor == "controller":
+            asked = f"{asked} {_HARNESS_MARK}"
+        answered = None
+        if turn.observation is not None:
+            answered = turn.observation.summary or turn.observation.outcome
+        rows.append(
+            f"| {turn.turn_id} | {_cell(turn.call.tool if turn.call else None)} "
+            f"| {_cell(asked)} | {_cell(answered)} "
+            f"| {_cell(turn_duration_text(turn))} |"
+        )
+    return rows
+
+
+def _the_run(document: Trajectory) -> list[str]:
+    """The run as its turns, banded by phase. Section C.4 of the spec.
+
+    Every cell is a field the derivation already holds — the same summaries
+    `sag trajectory` prints, for the same turns, in the same order. Nothing is
+    computed here, so the table and the stream cannot come to disagree about
+    what a turn did.
+    """
+
+    turns = list(document.turns)
+    if not turns:
+        return []
+
+    counted = [
+        f"{len(turns):,} turn{'' if len(turns) == 1 else 's'}",
+        (
+            f"across {len(document.phases):,} phase{'' if len(document.phases) == 1 else 's'}"
+            if document.phases
+            else None
+        ),
+    ]
+    said = " ".join(part for part in counted if part)
+    elapsed = duration_text(document.session.wall_clock_seconds)
+    lines = ["## The run", "", f"{said}, {elapsed}." if elapsed else f"{said}.", ""]
+
+    # Banded the way the turn stream bands a replay: a new band each time the
+    # phase changes, so a phase entered twice reads as two visits rather than
+    # as one long one.
+    band: list[Turn] = []
+    for turn in [*turns, None]:
+        if band and (turn is None or turn.phase != band[0].phase):
+            lines.extend(
+                [
+                    f"**{_cell(band[0].phase)}**",
+                    "",
+                    "| # | Tool | Asked | Result | Took |",
+                    "|---|---|---|---|---|",
+                    *_turn_rows(band),
+                    "",
+                ]
+            )
+            band = []
+        if turn is not None:
+            band.append(turn)
+    return lines
+
+
 def render_setup_report(
     session_dir: Path | str,
     *,
@@ -316,6 +403,7 @@ def render_setup_report(
     lines.extend(
         _what_was_set_up(_mapping(env_overlay) or read_run_document(base, _ENV_OVERLAY_NAME) or {})
     )
+    lines.extend(_the_run(_trajectory_of(base)))
     return "\n".join(lines).rstrip("\n") + "\n"
 
 

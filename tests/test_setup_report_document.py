@@ -169,3 +169,45 @@ def test_a_run_that_provisioned_nothing_says_nothing(tmp_path):
     )
 
     assert "## What was set up" not in render_setup_report(session)
+
+
+def test_the_document_carries_one_row_per_turn():
+    """The 19-line trajectory is the best summary of the run that exists."""
+
+    document = render_setup_report(FIXTURE)
+    lines = document.splitlines()
+    start = lines.index("## The run")
+    section = lines[start:]
+
+    assert "19 turns across 5 phases, 6m 08s." in section
+    for band in ("**provision**", "**analyze**", "**build**", "**test**", "**report**"):
+        assert band in section, band
+    numbered = [
+        line for line in section if line.startswith("| ") and line[2:].split(" ")[0].isdigit()
+    ]
+    assert len(numbered) == 19
+
+    # Each turn's own span, opened by its call and closed by its turn record —
+    # `sag trajectory`'s replay prints a shorter one because it renders a turn
+    # at its tool result, before the record that closes the turn has landed.
+    assert (
+        "| 1 | project | clone apache/commons-cli | e171117 → /workspace/commons-cli | 4.8s |"
+        in section
+    )
+    assert (
+        "| 12 | build | verify mvn -B clean verify "
+        "| exit 0 · 994 tests · 0 F · 0 E · 61 S · 6 artifacts | 2m06s |"
+    ) in section
+    # A turn with nothing to say about what came back still came back.
+    assert "| 4 | project | provision maven 3.9.9 | ok | 6.9s |" in section
+
+
+def test_the_turns_the_harness_took_are_marked_as_its_own():
+    """Turns 11 and 14 consulted the advisor because the harness made them."""
+
+    document = render_setup_report(FIXTURE)
+
+    assert "| 11 | advisor | consult (the harness asked) |" in document
+    assert "| 14 | advisor | consult (the harness asked) |" in document
+    # Turn 2 was the same call, asked for by the model.
+    assert "| 2 | advisor | consult |" in document

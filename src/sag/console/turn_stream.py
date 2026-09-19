@@ -158,8 +158,12 @@ _REPAIR_STYLE = "yellow"
 _CLOSE_STYLE = "green"
 
 
-def _duration(turn: Turn) -> str | None:
-    """How long the turn took, or nothing when the ledger has not said yet."""
+def turn_duration_text(turn: Turn) -> str | None:
+    """How long the turn took, or nothing when the ledger has not said yet.
+
+    Public because the written report prints the same column beside the same
+    turns, and a turn that took `2m02s` on one surface took it on both.
+    """
 
     seconds = elapsed(turn.t0, turn.t1) if turn.t0 and turn.t1 else None
     if seconds is None:
@@ -449,7 +453,7 @@ class TurnStreamRenderer:
             return None
         line = self._outcome_line(turn, gate=turn.turn_id not in self._gated)
         room = self._width - used
-        duration = _duration(turn)
+        duration = turn_duration_text(turn)
         if duration is None:
             # Nothing to hold back and every caller clips what it writes, so a
             # second clip here would have nothing to do.
@@ -853,4 +857,4 @@ class TurnStreamRenderer:
         self._closed = True
 
 
-__all__ = ["TurnStreamRenderer", "TOOL_WIDTH"]
+__all__ = ["TurnStreamRenderer", "TOOL_WIDTH", "turn_duration_text"]
