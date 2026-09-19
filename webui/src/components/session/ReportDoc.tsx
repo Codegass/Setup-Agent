@@ -77,6 +77,14 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
     return <p className="text-[13.5px] leading-relaxed text-muted-foreground">{text}</p>
   }
 
+  if (type === "code") {
+    return (
+      <pre className="overflow-x-auto rounded-md border border-border bg-muted px-3 py-2.5 font-mono text-[12px] leading-relaxed text-foreground">
+        {text}
+      </pre>
+    )
+  }
+
   if (type === "status") {
     const explicitTone = typeof block.tone === "string" ? block.tone.toLowerCase() : ""
     const normalized = text.toLowerCase()

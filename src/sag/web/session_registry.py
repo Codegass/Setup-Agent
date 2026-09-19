@@ -1917,6 +1917,29 @@ def _report_blocks(report_raw: str) -> list[dict[str, Any]]:
                     "ok": "success" in result.lower() or "passed" in result.lower(),
                 }
             )
+        elif line.startswith("    ") or text.startswith("```"):
+            # A block a reader copies: the commands that open a run's record,
+            # or anything the document fenced. Kept whole and monospaced,
+            # because four commands as four paragraphs is four lines a reader
+            # cannot tell the ends of.
+            fenced = text.startswith("```")
+            code_lines: list[str] = []
+            if fenced:
+                index += 1
+            while index < len(lines):
+                current = lines[index]
+                if fenced:
+                    if current.strip().startswith("```"):
+                        index += 1
+                        break
+                elif current.strip() and not current.startswith("    "):
+                    break
+                code_lines.append(current[4:] if current.startswith("    ") else current)
+                index += 1
+            body = "\n".join(code_lines).strip("\n")
+            if body:
+                blocks.append({"type": "code", "text": body})
+            continue
         elif text.startswith("|") or text.startswith("\u2502"):
             table_lines: list[str] = []
             while index < len(lines) and (
@@ -1928,7 +1951,7 @@ def _report_blocks(report_raw: str) -> list[dict[str, Any]]:
             if rows:
                 blocks.append({"type": "table", "rows": rows})
             continue
-        elif not text.startswith("```"):
+        else:
             blocks.append({"type": "p", "text": _clean_inline_markdown(text)})
 
         if len(blocks) >= max_blocks:

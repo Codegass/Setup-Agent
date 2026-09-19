@@ -23,6 +23,25 @@ describe("ReportDoc", () => {
     expect(screen.queryByText(/preserved for context/i)).not.toBeInTheDocument()
   })
 
+  it("shows a code block as one block a reader can copy", () => {
+    render(<ReportDoc doc={{
+      title: "Setup report",
+      generated: "now",
+      blocks: [{
+        type: "code",
+        text: "uv run sag trajectory logs/session_x\nuv run sag ui",
+      }],
+    }} />)
+
+    const block = screen.getByText(/uv run sag trajectory logs\/session_x/)
+    expect(block.tagName).toBe("PRE")
+    // The commands themselves, not the block they arrived in: the fallback
+    // branch prints the whole JSON object, braces and block type included.
+    expect(block.textContent).toBe(
+      "uv run sag trajectory logs/session_x\nuv run sag ui",
+    )
+  })
+
   it("renders partial and unknown status blocks as attention rather than failure", () => {
     render(<ReportDoc doc={{
       title: "Setup report",

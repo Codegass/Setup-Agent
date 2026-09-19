@@ -857,3 +857,29 @@ def test_a_phase_visited_twice_gets_a_table_each_time():
     first, second = text.split("**build**")[1:]
     assert "| 1 | build |" in first and "| 2 | build |" not in first
     assert "| 2 | build |" in second and "| 3 | build |" in second
+
+
+def test_the_web_tab_shows_the_commands_as_commands():
+    """Four commands to copy, not four paragraphs of prose.
+
+    The tab's parser had no branch for an indented block, so each command in
+    "To open it" arrived as its own paragraph, wrapped and proportional — a
+    reader could not tell where one command ended.
+    """
+
+    from sag.web.session_registry import _report_blocks
+
+    blocks = _report_blocks(render_setup_report(FIXTURE))
+    code = [block for block in blocks if block.get("type") == "code"]
+
+    assert len(code) == 1, [block.get("type") for block in blocks]
+    commands = code[0]["text"].splitlines()
+    assert commands[0] == f"uv run sag trajectory {FIXTURE}"
+    assert commands[-1] == "uv run sag ui"
+    # The band labels stay prose; only the block a reader would copy is code.
+    assert any(block.get("text") == "provision" for block in blocks)
+    assert not any(
+        isinstance(block.get("text"), str) and block["text"].startswith("uv run")
+        for block in blocks
+        if block.get("type") == "p"
+    )
