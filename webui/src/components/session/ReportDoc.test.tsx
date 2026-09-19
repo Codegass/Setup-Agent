@@ -6,16 +6,21 @@ import { ReportDoc } from "./ReportDoc"
 afterEach(() => cleanup())
 
 describe("ReportDoc", () => {
-  it("explains the report's relationship to the recorded result", () => {
+  it("shows the report without warning that it disagrees with the band", () => {
+    // The banner was there because the report was written during the run and
+    // the band after it, so the two counted different runs. One derivation,
+    // read once at the run's end, leaves nothing to warn about.
     render(<ReportDoc doc={{
       title: "Setup report",
       generated: "now",
-      blocks: [{ type: "p", text: "Legacy diagnostic totals" }],
+      blocks: [{ type: "p", text: "19 turns across 5 phases" }],
     }} />)
 
+    expect(screen.getByText("19 turns across 5 phases")).toBeInTheDocument()
     expect(
-      screen.getByText(/where its numbers differ.*the band is what the run is judged on/i),
-    ).toBeInTheDocument()
+      screen.queryByText(/where its numbers differ.*the band is what the run is judged on/i),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText(/preserved for context/i)).not.toBeInTheDocument()
   })
 
   it("renders partial and unknown status blocks as attention rather than failure", () => {

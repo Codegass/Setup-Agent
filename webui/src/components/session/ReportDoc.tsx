@@ -31,9 +31,6 @@ export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
       />
       <div className="px-6 py-5">
         <div className="mx-auto max-w-[68ch] space-y-3">
-          <div className="rounded-md border border-status-attention-border bg-status-attention-soft px-3 py-2.5 text-[12.5px] leading-relaxed text-status-attention">
-            This generated report is preserved for context. Where its numbers differ from the result band above, the band is what the run is judged on.
-          </div>
           {doc.blocks.map((block, index) => (
             <ReportBlock block={block} key={index} />
           ))}
