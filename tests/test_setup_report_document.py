@@ -477,6 +477,19 @@ def test_the_web_tab_reads_the_documents_own_timestamp():
     assert rendered.generated == "2026-09-17 18:38:14"
     # The Result table still reaches the tab as a table, not as prose.
     tables = [block for block in rendered.blocks if block.get("type") == "table"]
-    assert any(
-        any(row and row[0] == "Setup" for row in table["rows"]) for table in tables
-    ), tables
+    assert any(any(row and row[0] == "Setup" for row in table["rows"]) for table in tables), tables
+
+
+def test_the_document_counts_the_phases_the_run_ran():
+    """The run ran five phases; its verdict was finalized during the fourth.
+
+    The verdict is written when the evidence closes, before the report phase
+    exists, so its phase records hold four. The trajectory bands five, and
+    five is what the run did — on every surface at once, because all three
+    read the same group of counts.
+    """
+
+    document = render_setup_report(FIXTURE)
+
+    assert "| **Setup** | success | 5/5 phases · 19 turns · 19 tool calls · 6m 08s |" in document
+    assert "4/4 phases" not in document

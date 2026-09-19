@@ -1788,6 +1788,33 @@ def test_the_run_counts_a_card_states_come_from_one_reader():
     assert (consulted.stats.advisor_tokens_in, consulted.stats.advisor_tokens_out) == (4636, 273)
 
 
+def test_the_phase_count_is_the_runs_own_and_reaches_every_surface():
+    """The seal is finalized before the report phase, so its records miss it.
+
+    `verdict.json` for the archived commons-cli run holds four phase records —
+    provision, analyze, build, test — because the evidence closes during the
+    fourth. The run ran five. The count travels in the same group as the turns
+    and the tokens, which is what makes all three surfaces state it at once.
+    """
+    from pathlib import Path
+
+    from sag.result_card.run_evidence import read_run_counts
+
+    session = Path(__file__).parent / "fixtures" / "report_document" / "commons-cli"
+    counts = read_run_counts(session)
+
+    assert [band["name"] for band in counts["trajectory_phases"]] == [
+        "provision",
+        "analyze",
+        "build",
+        "test",
+        "report",
+    ]
+
+    card = build_result_card(snapshot_dict(), **counts)
+    assert (card.stats.phases_completed, card.stats.phases_total) == (5, 5)
+
+
 def test_no_surface_names_the_run_counts_one_at_a_time():
     """The keywords may only reach `build_result_card` through the shared group.
 

@@ -35,6 +35,7 @@ from sag.trajectory.builder import CONTROL_EVENTS_NAME, build_trajectory, resolv
 #: test can check the mapping against the function's own signature.
 RUN_COUNT_KEYS = (
     "trajectory_session",
+    "trajectory_phases",
     "turn_count",
     "tool_calls",
     "tool_failures",
@@ -80,6 +81,14 @@ def read_run_counts(session_dir: Path | str | None) -> dict[str, Any]:
         return counts
 
     counts["trajectory_session"] = document.session.model_dump(mode="json")
+    # The phases the run actually banded. The seal's own records are written
+    # when the evidence closes, which is before the report phase exists, so a
+    # card counting them states four phases for a run that ran five. This
+    # travels with the turns for the reason the whole group travels together:
+    # a surface that has to ask for it separately is one that can forget to.
+    counts["trajectory_phases"] = [
+        phase.model_dump(mode="json") for phase in document.phases
+    ] or None
     turns = tuple(document.turns)
     if not turns:
         return counts

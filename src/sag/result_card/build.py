@@ -93,17 +93,12 @@ def _stats(
     token_usage: Iterable[Mapping[str, Any]] | None,
     advisor_token_usage: Iterable[Mapping[str, Any]] | None,
     trajectory_session: Any,
+    trajectory_phases: Iterable[Mapping[str, Any]] | None,
     turn_count: int | None,
     tool_calls: int | None,
     tool_failures: int | None,
 ) -> ResultStats:
-    records = tuple(getattr(snapshot, "phase_records", ()) or ())
-    phases_total = len(records) or None
-    phases_completed = (
-        sum(1 for record in records if str(getattr(record, "termination", "")) == "completed")
-        if records
-        else None
-    )
+    phases_completed, phases_total = _phases(snapshot, trajectory_phases)
 
     # Absent until a row actually supplies a number: a run whose usage was never
     # recorded reports no tokens, not zero tokens.
@@ -130,6 +125,42 @@ def _stats(
         wall_clock_seconds=wall_clock if isinstance(wall_clock, (int, float)) else None,
         model=pin.get("action_model") or None,
         advisor_model=advisor.get("model") or None,
+    )
+
+
+#: How a phase band ends when the phase finished. The ledger's own words for
+#: a transition out of a phase; `repair` is the one that means the attempt did
+#: not finish, and a band with no transition at all is a phase the run never
+#: left.
+_PHASE_CLOSED = frozenset({"advance", "evidence_close", "report", "flow_close"})
+
+
+def _phases(
+    snapshot: Any, trajectory_phases: Iterable[Mapping[str, Any]] | None
+) -> tuple[int | None, int | None]:
+    """How many phases the run ran, and how many of them finished.
+
+    From the run's own bands when the ledger is readable, and from the seal's
+    phase records otherwise. The two count the same thing — one entry per
+    phase attempt — but the seal is finalized when the evidence closes, which
+    is before the report phase exists. Reading it alone told every surface
+    that the archived commons-cli run ran four phases; it ran five, and the
+    fifth is the one that wrote the report the reader is holding.
+    """
+
+    bands = tuple(trajectory_phases or ())
+    if bands:
+        closed = sum(
+            1 for band in bands if str((band or {}).get("termination") or "") in _PHASE_CLOSED
+        )
+        return closed, len(bands)
+
+    records = tuple(getattr(snapshot, "phase_records", ()) or ())
+    if not records:
+        return None, None
+    return (
+        sum(1 for record in records if str(getattr(record, "termination", "")) == "completed"),
+        len(records),
     )
 
 
@@ -211,11 +242,12 @@ def _attention(
             if failed:
                 said.append(f"{failed:,} failed")
             if errors:
-                said.append(f"{errors:,} ended in an error" if errors == 1
-                            else f"{errors:,} ended in errors")
-            items.append(
-                AttentionItem(kind="failing_tests", title=f"Tests: {' · '.join(said)}")
-            )
+                said.append(
+                    f"{errors:,} ended in an error"
+                    if errors == 1
+                    else f"{errors:,} ended in errors"
+                )
+            items.append(AttentionItem(kind="failing_tests", title=f"Tests: {' · '.join(said)}"))
 
     # The same codes the CI row lists, read from the record rather than
     # recovered from the row's rendered lines. `_consistent_subject` on
@@ -268,6 +300,7 @@ def build_result_card(
     token_usage: Iterable[Mapping[str, Any]] | None = None,
     advisor_token_usage: Iterable[Mapping[str, Any]] | None = None,
     trajectory_session: Any = None,
+    trajectory_phases: Iterable[Mapping[str, Any]] | None = None,
     turn_count: int | None = None,
     tool_calls: int | None = None,
     tool_failures: int | None = None,
@@ -288,6 +321,7 @@ def build_result_card(
         token_usage=token_usage,
         advisor_token_usage=advisor_token_usage,
         trajectory_session=trajectory_session,
+        trajectory_phases=trajectory_phases,
         turn_count=turn_count,
         tool_calls=tool_calls,
         tool_failures=tool_failures,

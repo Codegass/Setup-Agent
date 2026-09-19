@@ -445,6 +445,7 @@ def test_run_counts_state_absence_rather_than_zero_or_raising(tmp_path):
 
     absent = {
         "trajectory_session": None,
+        "trajectory_phases": None,
         "turn_count": None,
         "tool_calls": None,
         "tool_failures": None,
