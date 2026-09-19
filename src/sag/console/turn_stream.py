@@ -45,6 +45,7 @@ import time
 from collections import Counter
 from typing import Callable, Iterable
 
+from sag.trajectory.phases import blocked_close
 from sag.trajectory.reducer import UNKNOWN_PHASE, TrajectoryReducer, elapsed
 from sag.trajectory.schema import (
     SUMMARY_MAX_CHARS,
@@ -140,11 +141,6 @@ _TRANSITION_WORD = {
     "evidence_close": "finished",
     "report": "reported",
 }
-
-#: The gate words a phase can be graded with (`success`, `partial`, `failed`,
-#: `unknown` — measured over 120 ledgers). Only one of them means the phase did
-#: not finish, and a band that closed with a tick over it said the opposite.
-_BLOCKED_GATE_WORD = "failed"
 
 #: What Rich reads as a style tag, and a bracket with whatever backslashes run
 #: up to it. `_escape` needs to tell the two apart because Rich's parser does.
@@ -625,7 +621,10 @@ class TurnStreamRenderer:
             self._emit(_Line().add("✓ run ended", _CLOSE_STYLE))
             return
 
-        blocked = kind != "advance" and self._phase_gate == _BLOCKED_GATE_WORD
+        # One rule, two surfaces: the same call decides the fraction of phases
+        # the result card says finished, so a band this line ticks is a band
+        # that card counts.
+        blocked = blocked_close(kind, self._phase_gate)
         if blocked:
             # No reason here: the measured close codes (`test_terminal`,
             # `build_evidence_closed`, …) say which close fired, not why the

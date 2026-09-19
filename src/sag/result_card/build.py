@@ -26,6 +26,7 @@ from sag.result_card.rows import (
     task_row,
     tests_row,
 )
+from sag.trajectory.phases import band_finished
 
 _MAX_FAILING_NAMES = 5
 
@@ -128,32 +129,27 @@ def _stats(
     )
 
 
-#: How a phase band ends when the phase finished. The ledger's own words for
-#: a transition out of a phase; `repair` is the one that means the attempt did
-#: not finish, and a band with no transition at all is a phase the run never
-#: left.
-_PHASE_CLOSED = frozenset({"advance", "evidence_close", "report", "flow_close"})
-
-
 def _phases(
     snapshot: Any, trajectory_phases: Iterable[Mapping[str, Any]] | None
 ) -> tuple[int | None, int | None]:
     """How many phases the run ran, and how many of them finished.
 
     From the run's own bands when the ledger is readable, and from the seal's
-    phase records otherwise. The two count the same thing — one entry per
-    phase attempt — but the seal is finalized when the evidence closes, which
-    is before the report phase exists. Reading it alone told every surface
-    that the archived commons-cli run ran four phases; it ran five, and the
-    fifth is the one that wrote the report the reader is holding.
+    phase records otherwise. Both count one entry per phase attempt, but the
+    seal is finalized when the evidence closes, which is before the report
+    phase exists — reading it alone told every surface that the archived
+    commons-cli run ran four phases. It ran five, and the fifth is the one
+    that wrote the report the reader is holding.
+
+    Whether a band finished is `trajectory.phases.band_finished`, which is
+    also what decides whether the turn stream ticks that band or prints
+    `✗ <phase> blocked`. A phase graded failed still transitions out, so
+    counting the transition alone counted a blocked phase as a finished one.
     """
 
     bands = tuple(trajectory_phases or ())
     if bands:
-        closed = sum(
-            1 for band in bands if str((band or {}).get("termination") or "") in _PHASE_CLOSED
-        )
-        return closed, len(bands)
+        return sum(1 for band in bands if band_finished(band)), len(bands)
 
     records = tuple(getattr(snapshot, "phase_records", ()) or ())
     if not records:

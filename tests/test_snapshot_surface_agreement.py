@@ -1815,6 +1815,87 @@ def test_the_phase_count_is_the_runs_own_and_reaches_every_surface():
     assert (card.stats.phases_completed, card.stats.phases_total) == (5, 5)
 
 
+#: What each archived fixture's phase fraction is, and why. The numerator is
+#: the number of bands `sag trajectory` closes with a tick; the fence below
+#: reads that count off the renderer rather than trusting this table.
+_PHASE_FRACTIONS = {
+    "trajectory/camel-quarkus-d2r3": (4, 5),
+    "trajectory/ignite-d2r3": (3, 4),
+    "trajectory/kafka-d2r3": (4, 5),
+    "trajectory/sling-commons-osgi-v4": (3, 4),
+    "report_document/commons-cli": (5, 5),
+}
+
+
+def _ticked_bands(directory):
+    """How many bands the turn stream closes with a tick, replaying the ledger."""
+
+    from sag.console.turn_stream import TurnStreamRenderer
+
+    chunks: list[str] = []
+    stream = TurnStreamRenderer(chunks.append, width=100)
+    for line in (directory / "control_events.jsonl").read_text(encoding="utf-8").splitlines():
+        stream.feed(line)
+    stream.close()
+    return sum(1 for line in "".join(chunks).splitlines() if line.startswith("\u2713 "))
+
+
+def test_a_phase_that_closed_blocked_is_not_a_phase_that_finished():
+    """The numerator counts finished phases, not phases the run left.
+
+    A band's `termination` is the TRANSITION out of the phase, and a phase
+    graded `failed` still transitions out — `evidence_close` on every one of
+    the fourteen archived runs whose seal calls that phase blocked. Counting
+    the transition alone made `kafka-d2r3` read 5/5 for a run whose own table
+    prints `✗ test blocked`.
+
+    The fence is the table: one rule decides what the stream ticks and what
+    this fraction counts, so the two cannot drift.
+    """
+    from pathlib import Path
+
+    from sag.result_card.run_evidence import read_run_counts
+
+    root = Path(__file__).parent / "fixtures"
+    for name, expected in _PHASE_FRACTIONS.items():
+        directory = root / name
+        card = build_result_card(snapshot_dict(), **read_run_counts(directory))
+        stated = (card.stats.phases_completed, card.stats.phases_total)
+
+        assert stated == expected, f"{name}: {stated} != {expected}"
+        assert card.stats.phases_completed == _ticked_bands(directory), name
+
+    kafka = build_result_card(
+        snapshot_dict(), **read_run_counts(root / "trajectory" / "kafka-d2r3")
+    )
+    assert (kafka.stats.phases_completed, kafka.stats.phases_total) != (5, 5)
+
+
+def test_the_phases_the_seal_completed_are_phases_the_bands_finished():
+    """Two readings of one run, and the stricter one may not lose a phase.
+
+    The seal records a phase `completed`; the bands say whether the run left
+    it on a grading that passed. Every phase the seal completed is a band the
+    fraction counts, so replacing the seal's numerator with the bands' cannot
+    quietly demote a phase that finished.
+    """
+    import json
+    from pathlib import Path
+
+    from sag.result_card.run_evidence import read_run_counts
+
+    session = Path(__file__).parent / "fixtures" / "report_document" / "commons-cli"
+    seal = json.loads((session / ".setup_agent" / "verdict.json").read_text(encoding="utf-8"))
+    completed = [
+        record["phase"] for record in seal["phase_records"] if record["termination"] == "completed"
+    ]
+    counts = read_run_counts(session)
+
+    assert completed == ["provision", "analyze", "build", "test"]
+    card = build_result_card(snapshot_dict(), **counts)
+    assert card.stats.phases_completed >= len(completed)
+
+
 def test_no_surface_names_the_run_counts_one_at_a_time():
     """The keywords may only reach `build_result_card` through the shared group.
 
