@@ -1056,20 +1056,26 @@ class _Joiner:
         The scan runs only when a poll actually read a different ledger — an
         unchanged file cannot have changed anyone's bill — and skips the turns
         this same delta already carries, so no turn is ever stated twice at once.
+
+        Only a NUMBER rebills. A turn can already carry a bill the engine wrote
+        onto its `turn_record` while the run was live, and a CSV that says
+        nothing about that iteration is silence, not a correction — writing it
+        in would delete a fact this derivation's own source stated. Both bills
+        follow the one rule, because both are recorded the same way.
         """
         if not self._reledgered:
             return []
         self._reledgered = False
         restated: list[Turn] = []
         for turn_id, turn in list(self._claimants.items()):
-            update: dict[str, TokenUsage | None] = {}
+            update: dict[str, TokenUsage] = {}
             if self._biller.claims(turn):
                 usage = self._tokens.get(turn.iteration)
-                if usage != turn.tokens:
+                if usage is not None and usage != turn.tokens:
                     update["tokens"] = usage
             if self._biller.consults(turn):
                 advice = self._advisor_tokens.get(turn.iteration)
-                if advice != turn.advisor_tokens:
+                if advice is not None and advice != turn.advisor_tokens:
                     update["advisor_tokens"] = advice
             if not update or turn_id in sent:
                 continue

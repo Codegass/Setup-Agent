@@ -762,6 +762,68 @@ def test_a_cancelled_consult_is_the_same_turn_to_a_live_watcher(tmp_path):
     assert accumulated.turns == build_trajectory(session).turns
 
 
+def test_a_ledger_bill_is_never_replaced_by_silence_from_the_csv(tmp_path):
+    """What the engine recorded stands until the CSV says something else.
+
+    Both bills are joined twice over: the engine writes them onto the turn
+    record while the run is live, and the CSV join re-states them when the file
+    lands at loop exit. The retry used to write whatever the CSV held —
+    including nothing — so a turn the engine had billed was emptied the moment a
+    ledger arrived without a row on its iteration. That is a derivation deleting
+    a fact its own source stated. Only a different number rebills; an absence
+    rebills nobody.
+    """
+    session = tmp_path / "recorded-bill"
+    session.mkdir()
+    (session / "control_events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "sequence": 1,
+                        "kind": "turn_record",
+                        "payload": {
+                            "turn_id": 1,
+                            "phase": "build",
+                            "iteration": 5,
+                            "actor": "model",
+                            "envelope_ref": None,
+                            "tokens_in": 8648,
+                            "tokens_out": 199,
+                            "advisor_tokens_in": 60239,
+                            "advisor_tokens_out": 181,
+                            "t0": "2026-09-15T01:00:00Z",
+                            "t1": "2026-09-15T01:00:01Z",
+                        },
+                        "source": None,
+                        "timestamp": "2026-09-15T01:00:01Z",
+                        "event_id": "control-000001",
+                        "run_id": "run-1",
+                    }
+                )
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # A real ledger that simply never mentions iteration 5 — the run's other
+    # responses are in it, so the file is not empty and the poll does see it
+    # change.
+    (session / "token_usage.csv").write_text(
+        "iteration,timestamp,type,tool_name,model,total_tokens,prompt_tokens,"
+        "completion_tokens,reasoning_tokens,actual_output_tokens\n"
+        "6,2026-09-15T01:00:09.000000,executor,bash,gpt-5.4-mini,4205,4134,71,0,71\n",
+        encoding="utf-8",
+    )
+
+    accumulated = _accumulated(session, tmp_path / "live", withheld=("token_usage.csv",))
+
+    followed = accumulated.turns[0]
+    assert (followed.tokens.input, followed.tokens.output) == (8648, 199)
+    assert (followed.advisor_tokens.input, followed.advisor_tokens.output) == (60239, 181)
+    assert accumulated.turns == build_trajectory(session).turns
+
+
 def test_an_advisor_bill_that_lands_after_the_run_still_reaches_its_turn(tmp_path):
     """The ledger is exported at loop exit, so a follow meets the turn first.
 
