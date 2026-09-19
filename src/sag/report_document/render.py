@@ -381,6 +381,55 @@ def _turn_rows(turns: Sequence[Turn]) -> list[str]:
     return rows
 
 
+def _banded(document: Trajectory) -> list[tuple[str, list[Turn]]]:
+    """The run's turns, in the bands the reducer banded them into.
+
+    The bands are the record's, not a grouping of consecutive phase names: a
+    phase the run was sent back to opens a second band with the same name and
+    no other phase between, and by name alone the two visits read as one. What
+    separates them is the grading each band closed on, and the turn that
+    carried that grading is in the ledger — so a band takes the turns up to
+    and including its own last gate, and the next band starts after it.
+
+    A run whose ledger bands nothing still has its turns, under the phase each
+    one names.
+    """
+
+    turns = list(document.turns)
+    bands = list(document.phases)
+    if not bands:
+        grouped: list[tuple[str, list[Turn]]] = []
+        for turn in turns:
+            if grouped and grouped[-1][0] == turn.phase:
+                grouped[-1][1].append(turn)
+            else:
+                grouped.append((turn.phase, [turn]))
+        return grouped
+
+    decided_at = {
+        turn.gate.decision_id: index
+        for index, turn in enumerate(turns)
+        if turn.gate is not None and turn.gate.decision_id
+    }
+    # Where each band ends: the last turn it graded. A band the ledger graded
+    # without a turn ends nowhere, and the band after it takes those turns.
+    ends = [
+        max(
+            (decided_at[gate.decision_id] for gate in band.gates if gate.decision_id in decided_at),
+            default=None,
+        )
+        for band in bands
+    ]
+
+    held: list[list[Turn]] = [[] for _ in bands]
+    index = 0
+    for position, turn in enumerate(turns):
+        while index < len(bands) - 1 and (ends[index] is None or position > ends[index]):
+            index += 1
+        held[index].append(turn)
+    return [(band.name, held[index]) for index, band in enumerate(bands)]
+
+
 def _the_run(document: Trajectory) -> list[str]:
     """The run as its turns, banded by phase. Section C.4 of the spec.
 
@@ -406,25 +455,19 @@ def _the_run(document: Trajectory) -> list[str]:
     elapsed = duration_text(document.session.wall_clock_seconds)
     lines = ["## The run", "", f"{said}, {elapsed}." if elapsed else f"{said}.", ""]
 
-    # Banded the way the turn stream bands a replay: a new band each time the
-    # phase changes, so a phase entered twice reads as two visits rather than
-    # as one long one.
-    band: list[Turn] = []
-    for turn in [*turns, None]:
-        if band and (turn is None or turn.phase != band[0].phase):
-            lines.extend(
-                [
-                    f"**{_cell(band[0].phase)}**",
-                    "",
-                    "| # | Tool | Asked | Result | Took |",
-                    "|---|---|---|---|---|",
-                    *_turn_rows(band),
-                    "",
-                ]
-            )
-            band = []
-        if turn is not None:
-            band.append(turn)
+    for band, held in _banded(document):
+        if not held:
+            continue
+        lines.extend(
+            [
+                f"**{_cell(band)}**",
+                "",
+                "| # | Tool | Asked | Result | Took |",
+                "|---|---|---|---|---|",
+                *_turn_rows(held),
+                "",
+            ]
+        )
     return lines
 
 

@@ -785,3 +785,75 @@ def test_a_half_recorded_token_bill_is_still_printed():
 
     assert "| **Model** | — | 14 | 1,234 | — |" in document
     assert "| **Advisor** |" not in document
+
+
+def _repaired_run():
+    """A run that was sent back to the phase it was already in.
+
+    Two bands with one name and no other phase between them: the reducer
+    opens a second band on the repair, and nothing in a turn's own fields
+    says which of the two it belongs to. The gate each band was decided by
+    does say, because the turn that carried that gate is in the ledger.
+    """
+
+    from sag.trajectory.schema import (
+        CallInfo,
+        GateInfo,
+        PhaseInfo,
+        SessionInfo,
+        Trajectory,
+        Turn,
+    )
+
+    def _turn(turn_id, summary, gate=None):
+        return Turn(
+            turn_id=turn_id,
+            phase="build",
+            actor="model",
+            call=CallInfo(tool="build", summary=summary),
+            gate=GateInfo(word="failed" if gate == "g1" else "success", decision_id=gate)
+            if gate
+            else None,
+        )
+
+    return Trajectory(
+        session=SessionInfo(run_id="repaired", wall_clock_seconds=12.0),
+        phases=[
+            PhaseInfo(
+                name="build",
+                termination="repair",
+                gates=[GateInfo(word="failed", decision_id="g1")],
+            ),
+            PhaseInfo(
+                name="build",
+                termination="advance",
+                gates=[GateInfo(word="success", decision_id="g2")],
+            ),
+        ],
+        turns=[
+            _turn(1, "verify mvn -B verify", gate="g1"),
+            _turn(2, "verify mvn -B -pl core verify"),
+            _turn(3, "done success", gate="g2"),
+        ],
+    )
+
+
+def test_a_phase_visited_twice_gets_a_table_each_time():
+    """The account of the run is banded the way the run's own record bands it.
+
+    Grouping by consecutive phase names merged the two visits into one table
+    while the sentence above counted two phases — one more phase than there
+    were tables to show for it.
+    """
+
+    from sag.report_document.render import _the_run
+
+    lines = _the_run(_repaired_run())
+    text = "\n".join(lines)
+
+    assert "3 turns across 2 phases, 12.0s." in text
+    assert text.count("**build**") == 2
+    assert text.count("| # | Tool | Asked | Result | Took |") == 2
+    first, second = text.split("**build**")[1:]
+    assert "| 1 | build |" in first and "| 2 | build |" not in first
+    assert "| 2 | build |" in second and "| 3 | build |" in second
