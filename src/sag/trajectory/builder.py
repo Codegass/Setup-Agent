@@ -29,8 +29,11 @@ control stream does not carry:
   `tokens`, because the two went to two different models and one sum would
   report spend nobody was charged. A turn that named the advisor and never
   dispatched — a call cancelled before it ran — is not that turn, because
-  nothing was consulted and nothing was spent. `advisor_tokens_unattributed`
-  and `advisor_tokens_duplicate_row` are those rows' own statements. The engine
+  nothing was consulted and nothing was spent. One consult can take more than
+  one call: a context too long for the advisor's window is packed first, and
+  that call is ADDED to the consult's bill rather than treated as a second bill
+  for one answer. `advisor_tokens_unattributed` and
+  `advisor_tokens_duplicate_row` are those rows' own statements. The engine
   exports this file when the ReAct loop EXITS, so live it
   lands AFTER every turn it pays for: the follower therefore re-states a turn
   whose bill arrived late instead of leaving it unbilled forever, which is the
@@ -662,23 +665,42 @@ def _torn_tail(partial: bytes, offset: int) -> Warning | None:
 #: added later from silently going unread the way `advisor` itself did.
 _ADVISOR_TYPE_PREFIX = "advisor"
 
+#: The row a consult's own answer is written as. Every other advisor-prefixed
+#: kind is a call the consult had to make BEFORE it had an answer, and is part
+#: of what that consult cost.
+_ADVISOR_ANSWER_TYPE = "advisor"
+
 
 def _read_token_usage(
     path: Path,
 ) -> tuple[dict[int, TokenUsage], dict[int, TokenUsage], list[Warning]]:
-    """Bill each iteration from its own rows; the first row of a kind wins, out loud.
+    """Bill each iteration from its own rows, and say what any row did not pay.
 
     Two bills come back, never one: the model's, from the `executor` rows, and
     the advisor's, from the rows whose type names the advisor. They are kept
     apart the whole way down because they were paid to two different models, and
     a reader adding them would report spend nobody was charged as one number.
 
-    One response, one bill: a second row of the same kind for an iteration
-    already billed cannot be added (that would invent spend) and cannot replace
-    the first (that would make the bill depend on read order). So the first row
-    keeps it — and the ones that did not are STATED, on the same terms as the
-    rows that bill no turn at all. A total assembled by dropping rows in silence
-    is the same lie either way.
+    **The model's side: one response, one bill.** A second `executor` row for an
+    iteration already billed cannot be added (that would invent spend) and
+    cannot replace the first (that would make the bill depend on read order). So
+    the first row keeps it, and the ones that did not are STATED.
+
+    **The advisor's side: one consult, every call it took.** A consult is not
+    always one call. When the context is too long for the advisor's window the
+    engine packs it first, and the tracker files that call under `advisor_
+    compression` — a real call, charged before any advice existed, and part of
+    what asking cost. It is ADDED to the consult's bill. Only a repeat of the
+    answer itself — a second exact `advisor` row on one iteration — is the
+    ledger disagreeing with itself, and that one is dropped and stated, because
+    adding it would bill one answer twice.
+
+    The order matters and it is why this is not first-row-wins: the packing call
+    is written BEFORE the answer, so keeping the first row kept 600 tokens of
+    packing and threw the advisor's own answer away as a duplicate.
+
+    A total assembled by dropping rows in silence is the same lie either way, so
+    every row that pays nobody is named.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -688,24 +710,28 @@ def _read_token_usage(
     billed: dict[int, TokenUsage] = {}
     advised: dict[int, TokenUsage] = {}
     rows: Counter[int] = Counter()
-    advisor_rows: Counter[int] = Counter()
+    #: Repeats of the ANSWER only. A packing call is not a duplicate of anything.
+    answer_rows: Counter[int] = Counter()
     try:
         for row in csv.DictReader(io.StringIO(text)):
             kind = (row.get("type") or "").strip()
-            if kind == "executor":
-                into, counted = billed, rows
-            elif kind.startswith(_ADVISOR_TYPE_PREFIX):
-                into, counted = advised, advisor_rows
-            else:
+            advisor = kind.startswith(_ADVISOR_TYPE_PREFIX)
+            if kind != "executor" and not advisor:
                 continue
             iteration = int(str(row.get("iteration", "")).strip())
-            counted[iteration] += 1
-            if iteration in into:
-                continue
-            into[iteration] = TokenUsage(
+            usage = TokenUsage(
                 input=int(str(row.get("prompt_tokens", "")).strip()),
                 output=int(str(row.get("completion_tokens", "")).strip()),
             )
+            if not advisor:
+                rows[iteration] += 1
+                billed.setdefault(iteration, usage)
+            elif kind == _ADVISOR_ANSWER_TYPE:
+                answer_rows[iteration] += 1
+                if answer_rows[iteration] == 1:
+                    advised[iteration] = _added(advised.get(iteration), usage)
+            else:
+                advised[iteration] = _added(advised.get(iteration), usage)
     except (ValueError, csv.Error) as exc:
         return {}, {}, [_token_warning(f"{path.name} is not the expected token ledger: {exc}")]
     return (
@@ -713,11 +739,18 @@ def _read_token_usage(
         advised,
         [
             _duplicate_rows(iteration, count, kind)
-            for kind, counter in (("executor", rows), ("advisor", advisor_rows))
+            for kind, counter in (("executor", rows), ("advisor", answer_rows))
             for iteration, count in sorted(counter.items())
             if count > 1
         ],
     )
+
+
+def _added(held: TokenUsage | None, row: TokenUsage) -> TokenUsage:
+    """Two calls of one consult, as one bill."""
+    if held is None:
+        return row
+    return TokenUsage(input=held.input + row.input, output=held.output + row.output)
 
 
 def _token_warning(detail: str) -> Warning:

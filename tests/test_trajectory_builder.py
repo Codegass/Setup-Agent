@@ -109,22 +109,150 @@ def test_an_advisor_row_that_reaches_no_advisor_turn_is_stated_not_dropped(tmp_p
     ]
 
 
+#: SYNTHETIC in its numbering only: an `advisor` call in the shape every other
+#: call in this file has — envelope, result, decision — so the ledger states a
+#: turn that consulted someone on iteration 3. The archived fixtures' advisor
+#: calls emit no `loop_decision` at all, so none of them carries an iteration,
+#: and a fence about which row pays a consult needs one that does.
+ADVISOR_CALL_LINES = [
+    json.dumps(
+        {
+            "event_id": "control-000020",
+            "kind": "action_envelope",
+            "payload": {
+                "tool": "advisor",
+                "envelope_id": "envelope-000020",
+                "exact_params": {},
+                "intent_source": "model",
+            },
+            "sequence": 20,
+            "source": None,
+            "timestamp": "2026-08-14T11:29:20Z",
+        }
+    ),
+    json.dumps(
+        {
+            "event_id": "control-000021",
+            "kind": "tool_result",
+            "payload": {
+                "envelope_id": "envelope-000020",
+                "tool": "advisor",
+                "params": {},
+                "result": {"operation_outcome": "success", "invocation_status": "completed"},
+            },
+            "sequence": 21,
+            "source": None,
+            "timestamp": "2026-08-14T11:29:21Z",
+        }
+    ),
+    json.dumps(
+        {
+            "event_id": "control-000022",
+            "kind": "loop_decision",
+            "payload": {
+                "event": {
+                    "tool_name": "advisor",
+                    "iteration": 3,
+                    "phase": "build",
+                    "args": {},
+                    "attempt_id": "build-1",
+                    "error_code": "",
+                    "failure_signature": "",
+                    "invocation_status": "completed",
+                    "operation_outcome": "success",
+                    "recurrence_count": 1,
+                },
+                "expected_decision": "continue",
+                "expected_reason_code": "outcome_not_loop_candidate",
+            },
+            "sequence": 22,
+            "source": None,
+            "timestamp": "2026-08-14T11:29:22Z",
+        }
+    ),
+]
+
+#: The two rows one consult on iteration 3 writes, IN THE ORDER THE ENGINE
+#: WRITES THEM. `_advisor_messages` packs the context before `get_advisor_response`
+#: sends it, so `summarize_advisor_context` files its `advisor_compression` row
+#: ahead of the consult's own `advisor` row. A rule that keeps the first row
+#: therefore keeps the packing and throws the advice away.
+PACKED_CONSULT_ROWS = (
+    "3,2026-08-14T07:28:31.000000,advisor_compression,Unknown,gpt-5.4-mini,600,560,40,0,40\n"
+    "3,2026-08-14T07:28:32.000000,advisor,Unknown,gpt-5.4-mini,2713,2575,138,0,138\n"
+)
+
+
+def _consulting_session(tmp_path: Path, tokens: str) -> Path:
+    return _session(
+        tmp_path, events="\n".join(EVENT_LINES + ADVISOR_CALL_LINES) + "\n", tokens=tokens
+    )
+
+
+def test_packing_a_consult_is_part_of_what_the_consult_cost(tmp_path):
+    """Two calls, one consult: the bill is both of them added together.
+
+    `advisor_compression` is not a second bill for one answer — it is the call
+    that packed the context the answer was given on, and the run paid for both
+    before it had any advice. Keeping only the first row kept the packing (600
+    tokens of the EXECUTOR model) and threw away the advisor's own 2,713-token
+    answer while calling it a duplicate.
+    """
+    snap = build_trajectory(_consulting_session(tmp_path, REAL_TOKEN_CSV + PACKED_CONSULT_ROWS))
+
+    consult = snap.turns[2]
+    assert consult.call.tool == "advisor" and consult.iteration == 3
+    assert (consult.advisor_tokens.input, consult.advisor_tokens.output) == (3135, 178)
+    # Nothing was dropped, so nothing is stated.
+    assert [w.code for w in snap.warnings if w.code.startswith("advisor_tokens")] == []
+
+
+def test_the_same_consult_billed_twice_is_still_one_bill(tmp_path):
+    """A repeated `advisor` row is the one thing that may never be added.
+
+    Packing is a second CALL; a second row for the same answer is the ledger
+    disagreeing with itself, and adding it would invent spend. The first keeps
+    it, the packing is added to it, and the repeat is stated.
+    """
+    repeated = "3,2026-08-14T07:28:33.000000,advisor,Unknown,gpt-5.4-mini,2713,2575,138,0,138\n"
+    snap = build_trajectory(
+        _consulting_session(tmp_path, REAL_TOKEN_CSV + PACKED_CONSULT_ROWS + repeated)
+    )
+
+    consult = snap.turns[2]
+    assert (consult.advisor_tokens.input, consult.advisor_tokens.output) == (3135, 178)
+    assert [(w.code, w.detail) for w in snap.warnings] == [
+        (
+            "advisor_tokens_duplicate_row",
+            "1 duplicate advisor row(s) for iteration 3 bill nothing; "
+            "the first row keeps the bill",
+        )
+    ]
+
+
+def test_a_packing_call_with_no_advice_after_it_is_still_the_advisor_spending(tmp_path):
+    """A consult that packed and then failed still spent what the packing cost."""
+    packing_only = (
+        "3,2026-08-14T07:28:31.000000,advisor_compression,Unknown,gpt-5.4-mini,600,560,40,0,40\n"
+    )
+    snap = build_trajectory(_consulting_session(tmp_path, REAL_TOKEN_CSV + packing_only))
+
+    consult = snap.turns[2]
+    assert (consult.advisor_tokens.input, consult.advisor_tokens.output) == (560, 40)
+    assert [w.code for w in snap.warnings if w.code.startswith("advisor_tokens")] == []
+
+
 def test_a_packing_call_is_the_advisor_spending_too(tmp_path):
     """`advisor_compression` is the advisor's own call under a longer name.
 
     The row is written by the same tracker on the same consult, and a reader
-    matching the word `advisor` exactly would drop it. Two advisor-side rows on
-    one iteration bill one turn between them, on the same first-row-wins rule
-    the model's bills follow — and the second says so.
+    matching the word `advisor` exactly would drop it. Neither turn below asked
+    for advice, so both rows reach nobody and both are stated — the packing is
+    not a duplicate of the answer, so only the repeat of one kind is.
     """
-    tokens = REAL_TOKEN_CSV + ADVISOR_ROW + COMPRESSION_ROW
+    tokens = REAL_TOKEN_CSV + COMPRESSION_ROW + ADVISOR_ROW
     snap = build_trajectory(_session(tmp_path, events="\n".join(EVENT_LINES) + "\n", tokens=tokens))
     assert [(w.code, w.detail) for w in snap.warnings] == [
-        (
-            "advisor_tokens_duplicate_row",
-            "1 duplicate advisor row(s) for iteration 1 bill nothing; "
-            "the first row keeps the bill",
-        ),
         ("advisor_tokens_unattributed", "1 advisor row(s) bill no turn: iteration(s) 1"),
     ]
 

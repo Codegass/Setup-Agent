@@ -6665,8 +6665,12 @@ class ReActEngine:
         claimed.add(iteration)
         return row.get("prompt_tokens"), row.get("completion_tokens")
 
+    #: How the tracker files the advisor's own answer. Anything else beginning
+    #: with `advisor` is a call the consult had to make before it had one.
+    _ADVISOR_ANSWER_TYPE = "advisor"
+
     def _advisor_bill(self, iteration: Optional[int]) -> tuple[Optional[int], Optional[int]]:
-        """What the ADVISOR's own call cost on this iteration, joined in process.
+        """What this iteration's CONSULT cost, joined in process.
 
         The engine is holding this number when it seals the consult's turn: the
         advisor has already answered, and `react_llm._track_advisor_usage` put
@@ -6675,14 +6679,18 @@ class ReActEngine:
         artifact a live reader meets first — `token_usage.csv` is not written
         until the loop exits.
 
-        Every row the tracker writes for the advisor is counted, whatever it
-        calls the kind: a plain consult is `advisor` and the packing call a long
-        consult needs is `advisor_compression`, and matching the one word would
-        drop the second the day it appears.
+        A consult is not always one call. When the context will not fit the
+        advisor's window the engine packs it first, and the tracker files that
+        call as `advisor_compression` — charged before any advice existed, and
+        part of what asking cost — so it is ADDED to the bill. It is also
+        written FIRST, which is why taking the earliest matching row was wrong:
+        it kept the packing and reported it as the advice.
 
-        One row, one turn, on the model bill's rule: the first consult of an
-        iteration keeps it and a second carries none, because copying it would
-        invent spend the run was never charged.
+        The answer itself is billed once. A second exact `advisor` row on one
+        iteration is the ledger disagreeing with itself, and adding it would
+        charge one answer twice, so the first keeps it — the rule the model's
+        own row already follows. And one consult, one turn: an iteration whose
+        bill has been paid to a turn pays nothing to the next.
         """
         if iteration is None:
             return None, None
@@ -6693,19 +6701,26 @@ class ReActEngine:
         if iteration in claimed:
             return None, None
         records = getattr(getattr(self, "token_tracker", None), "token_records", None) or ()
-        row = next(
-            (
-                record
-                for record in records
-                if str(record.get("type") or "").startswith("advisor")
-                and record.get("iteration") == iteration
-            ),
-            None,
-        )
-        if row is None:
+        tokens_in = tokens_out = None
+        answered = False
+        for record in records:
+            kind = str(record.get("type") or "")
+            if not kind.startswith("advisor") or record.get("iteration") != iteration:
+                continue
+            if kind == self._ADVISOR_ANSWER_TYPE:
+                if answered:
+                    continue
+                answered = True
+            prompt = record.get("prompt_tokens")
+            completion = record.get("completion_tokens")
+            if isinstance(prompt, int):
+                tokens_in = prompt if tokens_in is None else tokens_in + prompt
+            if isinstance(completion, int):
+                tokens_out = completion if tokens_out is None else tokens_out + completion
+        if tokens_in is None and tokens_out is None:
             return None, None
         claimed.add(iteration)
-        return row.get("prompt_tokens"), row.get("completion_tokens")
+        return tokens_in, tokens_out
 
     @staticmethod
     def _billed(payload: TurnRecordPayload, **bills: Optional[int]) -> TurnRecordPayload:

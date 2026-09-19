@@ -627,15 +627,22 @@ ADVISOR_PROMPT_TOKENS = 2575
 ADVISOR_COMPLETION_TOKENS = 138
 
 
-def _advisor_usage(tracker, iteration, *, kind="advisor", prompt=ADVISOR_PROMPT_TOKENS):
+def _advisor_usage(
+    tracker,
+    iteration,
+    *,
+    kind="advisor",
+    prompt=ADVISOR_PROMPT_TOKENS,
+    completion=ADVISOR_COMPLETION_TOKENS,
+):
     """Record a consult the way `react_llm._track_advisor_usage` records one."""
     tracker.set_iteration(iteration)
     tracker.track_token_usage(
         SimpleNamespace(
             usage=SimpleNamespace(
-                total_tokens=prompt + ADVISOR_COMPLETION_TOKENS,
+                total_tokens=prompt + completion,
                 prompt_tokens=prompt,
-                completion_tokens=ADVISOR_COMPLETION_TOKENS,
+                completion_tokens=completion,
             )
         ),
         "advisor-model",
@@ -707,14 +714,52 @@ def test_a_packing_call_is_the_advisors_spend_under_a_longer_name(tmp_path):
     """`advisor_compression` is written by the same tracker on the same consult.
 
     A join matching the word `advisor` exactly would drop it, which is how the
-    advisor's rows went unread for two rounds in the first place.
+    advisor's rows went unread for two rounds in the first place. A consult that
+    packed and then got no advice still spent what the packing cost.
     """
     engine = _sealing_engine(tmp_path, [_phase_turn(1)])
-    _advisor_usage(engine.token_tracker, 4, kind="advisor_compression", prompt=600)
+    _advisor_usage(engine.token_tracker, 4, kind="advisor_compression", prompt=560, completion=40)
 
     _seal(engine, actor="controller", tool="advisor", iteration=4)
 
-    assert _events(engine, "turn_record")[0]["payload"]["advisor_tokens_in"] == 600
+    sealed = _events(engine, "turn_record")[0]["payload"]
+    assert (sealed["advisor_tokens_in"], sealed["advisor_tokens_out"]) == (560, 40)
+
+
+def test_packing_a_consult_is_added_to_what_the_consult_cost(tmp_path):
+    """Two calls, one consult — and the engine writes the packing one FIRST.
+
+    `_advisor_messages` packs the context before `get_advisor_response` sends
+    it, so the `advisor_compression` row is already in the tracker when the
+    `advisor` row lands. A rule that kept the first row would seal 600 tokens of
+    packing as the whole bill and never mention the advice.
+    """
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    _advisor_usage(engine.token_tracker, 4, kind="advisor_compression", prompt=560, completion=40)
+    _advisor_usage(engine.token_tracker, 4)
+
+    _seal(engine, actor="controller", tool="advisor", iteration=4)
+
+    sealed = _events(engine, "turn_record")[0]["payload"]
+    assert sealed["advisor_tokens_in"] == 560 + ADVISOR_PROMPT_TOKENS
+    assert sealed["advisor_tokens_out"] == 40 + ADVISOR_COMPLETION_TOKENS
+
+
+def test_one_answer_billed_twice_is_added_to_nothing(tmp_path):
+    """Packing is a second CALL; a repeated `advisor` row is the same call twice.
+
+    Adding a repeat would invent spend the run was never charged, so the first
+    of them keeps the bill — the rule the model's own row already follows.
+    """
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    _advisor_usage(engine.token_tracker, 4)
+    _advisor_usage(engine.token_tracker, 4, prompt=99999)
+
+    _seal(engine, actor="controller", tool="advisor", iteration=4)
+
+    assert _events(engine, "turn_record")[0]["payload"]["advisor_tokens_in"] == (
+        ADVISOR_PROMPT_TOKENS
+    )
 
 
 def test_an_advisor_bill_that_would_not_validate_costs_the_bill_never_the_record(tmp_path):
