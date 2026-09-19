@@ -2066,6 +2066,98 @@ def test_an_outcome_is_written_once_when_the_record_lands_after_the_answer():
     assert "1.0s" not in sink.text
 
 
+def test_a_grading_between_the_answer_and_the_record_keeps_the_turn_its_span():
+    """The order a real failing run produces, and the one that used to lose.
+
+    `gate_decision` lands after the answer and before the record on 128 turns
+    of the archive. The grading's own line needed the terminal, which placed
+    the outcome waiting on it — with the envelope-to-answer gap, the very
+    number this rule exists to stop printing. Worst archived case: turn 29 of
+    `session_20260815_210153_841726_4896cafa7cc3_25962`, `1.3s` on screen
+    against the 23.2s the engine recorded.
+
+    So a grading about the turn whose outcome is still waiting queues behind
+    that outcome instead of placing it, and goes out on the line under it.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "phase", {"action": "done", "outcome": "success"}, "e1"))
+    stream.feed(_result(2, "phase", "e1", {"operation_outcome": "success"}))
+    stream.feed(_gate(3, "partial", "build"))
+    assert "gate: partial" not in sink.text, "the outcome under it has not been written"
+    stream.feed(
+        _event(
+            4,
+            "turn_record",
+            {
+                "actor": "model",
+                "envelope_ref": "e1",
+                "phase": "build",
+                "iteration": 1,
+                "t0": "2026-09-15T01:00:00.100000Z",
+                "t1": "2026-09-15T01:00:03.600000Z",
+            },
+        )
+    )
+    stream.close()
+
+    assert _took_on_screen(sink) == {1: "3.5s"}
+    assert "1.0s" not in sink.text
+    turn_line = next(i for i, line in enumerate(sink.lines) if line.lstrip().startswith("#1"))
+    assert sink.lines[turn_line + 1] == "      ↳ #1 gate: partial"
+    assert sink.text.count("gate: partial") == 1
+
+
+def test_a_turn_whose_record_comes_late_still_reads_the_span_the_record_states():
+    """The shape seven archived runs are written in, turn for turn.
+
+    The engine does not always record a turn before it records the next thing:
+    at `session_20260815_210153_841726_4896cafa7cc3_25962` a gate, a
+    controller turn's own record and a phase closing all land between turn
+    29's answer and turn 29's record. Each of those needs the terminal, and
+    placing the outcome on any of them wrote `1.3s` for a turn the engine
+    measured at 23.2s. So a ledger that records its turns lets the outcome
+    wait: the dispatch line closes without it, and it takes its `↳ #N` when
+    its own record lands.
+
+    The record is recognised by the envelope it names, not by the turn id it
+    carries — those are the engine's sequence, not this view's — which is why
+    another turn's record landing in between places nothing.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_decision(1, "phase", "test"))
+    stream.feed(_envelope(2, "phase", {"action": "done", "outcome": "success"}, "e1"))
+    stream.feed(_result(3, "phase", "e1", {"operation_outcome": "success"}))
+    stream.feed(_gate(4, "failed", "test"))
+    stream.feed(_turn_record(5, actor="controller"))
+    stream.feed(_transition(6, "advance", "test", "workspace_ready"))
+    assert "↳ #2" not in sink.text, "nothing here is turn 2's record"
+    stream.feed(
+        _event(
+            7,
+            "turn_record",
+            {
+                "actor": "model",
+                "envelope_ref": "e1",
+                "phase": "test",
+                "iteration": 1,
+                "t0": "2026-09-15T01:00:00.100000Z",
+                "t1": "2026-09-15T01:00:23.300000Z",
+            },
+        )
+    )
+    stream.close()
+
+    outcome = [line for line in sink.lines if line.lstrip().startswith("↳ #2 ")]
+    assert len(outcome) == 2
+    assert outcome[0].endswith("23.2s")
+    assert outcome[1] == "      ↳ #2 gate: failed"
+    assert "1.0s" not in sink.text
+
+
 def test_an_outcome_no_record_ever_seals_is_placed_before_another_writer_prints():
     """The three record-less fixtures live here too.
 
