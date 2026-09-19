@@ -240,3 +240,31 @@ def test_a_run_that_consulted_nobody_bills_no_advisor(tmp_path):
 
     assert "| **Model** |" in document
     assert "| **Advisor** |" not in document
+
+
+def test_the_document_counts_evidence_instead_of_listing_it():
+    """The old report joined 81 paths into one 6,215-character line."""
+
+    document = render_setup_report(FIXTURE)
+    over_long = [line for line in document.splitlines() if len(line) > 200]
+
+    assert not over_long, over_long
+    assert (
+        "The run cited 72 distinct artifacts: 47 surefire report files, "
+        "13 stored tool outputs, 6 compiled classes, 4 jars, "
+        "1 validator observation, 1 workspace directory."
+    ) in document
+    assert "AlreadySelectedExceptionTest.xml" not in document
+
+
+def test_the_document_says_how_to_open_the_evidence():
+    """A reader on the host reaches the record with commands, not with paths."""
+
+    document = render_setup_report(FIXTURE)
+
+    assert f"uv run sag trajectory {FIXTURE}" in document
+    # The turn named is the one that produced the build receipt, read from the
+    # trajectory rather than written down here.
+    assert f"uv run sag inspect commons-cli --session {FIXTURE} --turn 12" in document
+    assert f"uv run sag result {FIXTURE}" in document
+    assert "uv run sag ui" in document

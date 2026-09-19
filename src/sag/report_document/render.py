@@ -65,6 +65,20 @@ _HOW_PROVISIONED: dict[str, str] = {
     "agent_registered": "registered by the run",
 }
 
+#: What each kind of citation is called, singular and plural. The kinds are
+#: `classify_evidence_ref`'s answers; a kind it does not know is counted under
+#: `other` and named as a citation, because dropping it would make the total
+#: a number that does not add up.
+_EVIDENCE_NOUNS: dict[str, tuple[str, str]] = {
+    "surefire": ("surefire report file", "surefire report files"),
+    "output": ("stored tool output", "stored tool outputs"),
+    "class": ("compiled class", "compiled classes"),
+    "jar": ("jar", "jars"),
+    "validator": ("validator observation", "validator observations"),
+    "directory": ("workspace directory", "workspace directories"),
+    "other": ("other citation", "other citations"),
+}
+
 #: How the document is named, and the format the name's timestamp takes. The
 #: same name the report phase's own deliverable carries, so one run leaves one
 #: report rather than two files a reader has to choose between.
@@ -404,10 +418,131 @@ def _tokens(card: RunResultCard, document: Trajectory) -> list[str]:
     ]
 
 
+def classify_evidence_ref(ref: str) -> str:
+    """Which kind of thing one citation names, by the shape of the citation.
+
+    Six kinds cover everything the archived run cited; anything else is
+    counted under `other`, never dropped — a reader told the run cited 72
+    artifacts and shown 71 has been told a falsehood about the seventy-second.
+    """
+
+    if ref.startswith("output_"):
+        return "output"
+    if ref.startswith("validator:"):
+        return "validator"
+    tail = ref.rsplit("/", 1)[-1]
+    if tail.endswith(".xml") and "surefire" in ref:
+        return "surefire"
+    if tail.endswith(".class"):
+        return "class"
+    if tail.endswith(".jar"):
+        return "jar"
+    if "." not in tail:
+        return "directory"
+    return "other"
+
+
+def _distinct_artifacts(refs: Sequence[str]) -> list[str]:
+    """One entry per artifact, however many ways the run spelled it.
+
+    The same file is cited both absolutely and relative to the project — nine
+    such pairs on the archived run — and counting the spellings would tell a
+    reader the run touched nine files it never touched. A relative citation
+    folds into an absolute one that ends with it, and only when exactly one
+    does: two candidates mean the fold would be a guess.
+    """
+
+    absolute = [ref for ref in refs if ref.startswith("/")]
+    folded: dict[str, str] = {}
+    for ref in refs:
+        key = ref
+        if not ref.startswith("/"):
+            matches = [other for other in absolute if other.endswith(f"/{ref}")]
+            if len(matches) == 1:
+                key = matches[0]
+        folded.setdefault(key, ref)
+    return list(folded)
+
+
+def _counted(kind: str, count: int) -> str:
+    """`47 surefire report files`, `1 jar`, said the way a reader would say it."""
+
+    singular, plural = _EVIDENCE_NOUNS.get(kind, (kind, f"{kind}s"))
+    return f"1 {singular}" if count == 1 else f"{count:,} {plural}"
+
+
+def _build_turn(document: Trajectory) -> Turn | None:
+    """The turn that ran the build, which is the one worth opening first."""
+
+    for turn in document.turns:
+        if turn.call is not None and turn.call.tool == "build":
+            return turn
+    return None
+
+
+def _evidence(card: RunResultCard, document: Trajectory, verdict: Mapping[str, Any]) -> list[str]:
+    """What the run cited, counted, and how to reach it. Section C.6.
+
+    The list itself stays in the record. Forty-seven surefire filenames in a
+    paragraph is not something a reader can act on; the count is, and the
+    commands below open the thing the count is about.
+    """
+
+    build_evidence = verdict.get("build_evidence")
+    refs = [
+        str(ref)
+        for ref in (
+            *(verdict.get("input_refs") or ()),
+            *((build_evidence or {}).get("refs") or ()),
+        )
+        if str(ref).strip()
+    ]
+    artifacts = _distinct_artifacts(list(dict.fromkeys(refs)))
+
+    lines: list[str] = []
+    if artifacts:
+        counts: dict[str, int] = {}
+        for artifact in artifacts:
+            kind = classify_evidence_ref(artifact)
+            counts[kind] = counts.get(kind, 0) + 1
+        # Largest class first, and ties by the name a reader sees, so one
+        # run's evidence reads in the same order every time it is rendered.
+        ordered = sorted(
+            counts.items(),
+            key=lambda item: (-item[1], _EVIDENCE_NOUNS.get(item[0], (item[0],))[0]),
+        )
+        said = ", ".join(_counted(kind, count) for kind, count in ordered)
+        lines.extend(
+            [
+                f"The run cited {len(artifacts):,} distinct "
+                f"artifact{'' if len(artifacts) == 1 else 's'}: {said}. "
+                "The full list is in the run's record.",
+                "",
+            ]
+        )
+
+    # A command printed without its argument is not a command a reader can
+    # run, which is the rule the terminal block's Next line already follows.
+    session = card.session_dir
+    if session:
+        commands = [f"uv run sag trajectory {session}"]
+        turn = _build_turn(document)
+        if card.project and turn is not None:
+            commands.append(
+                f"uv run sag inspect {card.project} --session {session} --turn {turn.turn_id}"
+            )
+        commands.append(f"uv run sag result {session}")
+        commands.append("uv run sag ui")
+        lines.extend(["To open it:", "", *[f"    {command}" for command in commands], ""])
+
+    return ["## Evidence", "", *lines] if lines else []
+
+
 def render_setup_report(
     session_dir: Path | str,
     *,
     card: RunResultCard | None = None,
+    verdict: Any = None,
     project_meta: Mapping[str, Any] | None = None,
     run_pin: Mapping[str, Any] | None = None,
     env_overlay: Mapping[str, Any] | None = None,
@@ -452,6 +587,13 @@ def render_setup_report(
     turns = _trajectory_of(base)
     lines.extend(_the_run(turns))
     lines.extend(_tokens(resolved_card, turns))
+    lines.extend(
+        _evidence(
+            resolved_card,
+            turns,
+            _mapping(verdict) or read_run_document(base, _VERDICT_NAME) or {},
+        )
+    )
     return "\n".join(lines).rstrip("\n") + "\n"
 
 

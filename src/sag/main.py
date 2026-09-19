@@ -435,6 +435,7 @@ def _write_reader_report(
     card: RunResultCard,
     *,
     session_dir: str | None,
+    verdict: Any = None,
     project_url: str | None = None,
     env_overlay: Mapping[str, Any] | None = None,
 ) -> str | None:
@@ -451,6 +452,7 @@ def _write_reader_report(
         document = render_setup_report(
             session_dir,
             card=card,
+            verdict=verdict,
             project_meta={"project_url": project_url},
             env_overlay=env_overlay,
         )
@@ -983,6 +985,7 @@ def project(
             target,
             card,
             session_dir=session_dir,
+            verdict=snapshot,
             project_url=repo_url,
             env_overlay=_read_env_overlay_for_cli(orchestrator),
         )
