@@ -1876,10 +1876,12 @@ def test_on_this_run_the_phases_the_seal_completed_are_bands_the_fraction_counts
 
     The seal records a phase `completed`; the bands say whether the run left
     it on a grading that passed. Those are different questions and the archive
-    shows exactly where they answer differently: over the 98 archived runs
-    that carry both a ledger and a seal — 454 bands — fifteen bands close
-    `evidence_close` on a `failed` grading while the seal calls that same
-    phase completed. The fraction follows the band there, deliberately. It is
+    shows exactly where they answer differently: over the archive's top-level
+    runs that carry both a ledger and a seal — `logs/session_*`, 97 runs and
+    449 bands — fifteen bands close `evidence_close` on a `failed` grading
+    while the seal calls that same phase completed. Every run is archived more
+    than once under `logs/`, and counting every `control_events.jsonl` there
+    the same shape is 59 bands of 4,960. The fraction follows the band there, deliberately. It is
     the same call the turn stream makes when it prints `✗ <phase> blocked`,
     and a card that counted a phase the table above it crosses out would be
     two surfaces disagreeing about one run.

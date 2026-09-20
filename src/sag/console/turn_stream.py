@@ -17,9 +17,10 @@ and never read as the outcome of the line above it.
 the turn down. The engine states its own start and end for every turn it takes,
 and the trajectory, the written report and the browser all state that span — so
 a stream timing the gap between two events instead would put a different number
-beside the same turn. On the archived commons-cli run the record lands 60 ms to
-3.4 s after the answer (3.4 s of it on a two-minute build), and that wait is the
-whole price of the four surfaces agreeing on one number per turn. A ledger that
+beside the same turn. On the archived commons-cli run the record lands between
+0.1 s and 3.4 s after the answer — all nineteen of them measured, the longest on
+the two-minute build — and that wait is the whole price of the four surfaces
+agreeing on one number per turn. A ledger that
 records nothing — the three sessions that predate the engine's per-turn
 record — keeps its outcome only until the next thing needs the terminal: a
 later turn's first line, a band, a job note, a log sink calling `give_way()`,
@@ -736,10 +737,12 @@ class TurnStreamRenderer:
         record its turns. While it records, or while it has not said yet, a
         turn whose own record is still on its way keeps waiting: the open line
         closes without it and it takes a `↳ #N` line when the record lands. The
-        engine does seal turns out of order — a phase closing between a turn's
-        answer and its record is how seven archived runs are written — and
-        placing the outcome on that close would state the gap between two
-        events for a turn the engine measured at 23 seconds.
+        engine does close turns out of order — a phase closing between a turn's
+        answer and its record is how seven of the archive's top-level runs
+        (`logs/session_*`) are written, and 126 lines over every
+        `control_events.jsonl` under `logs/` — and placing the outcome on that
+        close would state the gap between two events for a turn the engine
+        measured at 23 seconds.
         """
 
         # `_pending` is cleared BEFORE anything is written, so the `_emit`
