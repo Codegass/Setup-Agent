@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react"
 import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
 import { statusMeta } from "@/components/common/status"
 import { Tooltip } from "@/components/ui/tooltip"
+import { durationText } from "@/lib/durationText"
 import { cn } from "@/lib/utils"
 
 function SecondaryButton({
@@ -45,6 +46,16 @@ function usefulMetadata(value: string | null | undefined): string | null {
     : null
 }
 
+/** `model gpt-5.4-mini`, or nothing when the card names no such model.
+ *
+ *  Two models answer in a run and the card holds them apart, so the line names
+ *  which is which. A run that consulted nobody says nothing about an advisor
+ *  rather than printing a dash beside the word. */
+function namedModel(role: string, value: string | null | undefined): string | null {
+  const name = usefulMetadata(value)
+  return name ? `${role} ${name}` : null
+}
+
 export function DetailHeader({
   workspace,
   detail,
@@ -81,14 +92,26 @@ export function DetailHeader({
   const sessions = workspace.sessions ?? []
   const entry = detail?.entry?.trim()
 
+  // What answered and how long it took, out of the run's own result card. The
+  // docker container's name used to open this line; it is the same string as
+  // the workspace this page is already on, and it was taking the room the two
+  // model names needed. `detail.model` is the old metrics pin — one string
+  // spelling "thinking=...;action=..." for a run with no such thing in it —
+  // and the card names both models properly, so the pin is left in its file
+  // and this line stops reading it.
+  const stats = detail?.resultCard?.stats
+  // The card's own wall clock, formatted the way its Setup row formats it: the
+  // row sits an inch below this line and the two cannot state two lengths.
+  const ranFor = durationText(stats?.wallClockSeconds) ?? usefulMetadata(detail?.duration)
+
   // Single mono metadata line: omit any null/empty piece, join with " · ".
   const meta = [
-    usefulMetadata(workspace.container),
     usefulMetadata(workspace.stack),
     usefulMetadata(workspace.commit),
-    usefulMetadata(detail?.model),
+    namedModel("model", stats?.model),
+    namedModel("advisor", stats?.advisorModel),
     stepsClause(detail?.steps, detail?.stepBudget),
-    usefulMetadata(detail?.duration),
+    ranFor,
     usefulMetadata(detail?.finish) ? `finished ${usefulMetadata(detail?.finish)}` : null,
   ]
     .filter((piece): piece is string => Boolean(piece && String(piece).trim()))

@@ -1,9 +1,24 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
+import type { ExecutionSessionDetail, ResultCard, ResultStats, WorkspaceSummary } from "@/api/types"
 
 import { DetailHeader } from "./DetailHeader"
+
+/** A card carrying only the stats the header reads. The rest of the card is
+ *  the result band's business and nothing in this file looks at it. */
+function cardWith(stats: ResultStats): ResultCard {
+  return {
+    schemaVersion: 1,
+    runId: "SETUP-commons-cli-20260917-183204",
+    verdict: "success",
+    verdictSource: "snapshot",
+    rows: [],
+    stats,
+    attention: [],
+    notes: [],
+  }
+}
 
 const workspace: WorkspaceSummary = {
   id: "sag-acme",
@@ -56,17 +71,88 @@ describe("DetailHeader", () => {
     expect(screen.getByText("setup")).toBeInTheDocument()
   })
 
-  it("shows model and steps in the metadata line", () => {
+  it("names the two models the card names, and the steps", () => {
     render(
       <DetailHeader
         workspace={{ id: "sag-acme", project: "acme-platform", stack: "maven", commit: "9f8e7d6" } as WorkspaceSummary}
-        detail={{ model: "claude-sonnet-4.5", steps: 6, stepBudget: 40, duration: "8m 01s" } as ExecutionSessionDetail}
+        detail={{
+          steps: 6,
+          stepBudget: 40,
+          duration: "8m 01s",
+          resultCard: cardWith({ model: "claude-sonnet-4.5", advisorModel: "claude-haiku-4.5" }),
+        } as ExecutionSessionDetail}
         sessionId="S1"
         {...noopHandlers}
       />,
     )
-    expect(screen.getByText(/claude-sonnet-4\.5/)).toBeInTheDocument()
+    expect(screen.getByText(/model claude-sonnet-4\.5/)).toBeInTheDocument()
+    expect(screen.getByText(/advisor claude-haiku-4\.5/)).toBeInTheDocument()
     expect(screen.getByText(/6\s*\/\s*40 steps/)).toBeInTheDocument()
+  })
+
+  it("reads the archived run's line off the card, not the container or the old pin", () => {
+    // The line this replaces, seen on the workspace page for the archived
+    // commons-cli run: the docker container's name, then a legacy pin string
+    // spelling "thinking", then a duration the result card's own Setup row an
+    // inch below it disagreed with.
+    render(
+      <DetailHeader
+        workspace={{
+          id: "sag-commons-cli",
+          project: "commons-cli",
+          container: "sag-commons-cli",
+          stack: "maven",
+          commit: "e171117",
+        } as WorkspaceSummary}
+        detail={{
+          model: "thinking=gpt-5.4-mini;action=gpt-5.4-mini",
+          duration: "6m 08s",
+          finish: "2026-09-17 18:38:14",
+          resultCard: cardWith({
+            model: "gpt-5.4-mini",
+            advisorModel: "gpt-5.4-mini",
+            wallClockSeconds: 368.4298,
+          }),
+        } as ExecutionSessionDetail}
+        sessionId="S1"
+        {...noopHandlers}
+      />,
+    )
+
+    expect(
+      screen.getByText(
+        "maven · e171117 · model gpt-5.4-mini · advisor gpt-5.4-mini · 6m 08s · finished 2026-09-17 18:38:14",
+      ),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/sag-commons-cli/)).toBeNull()
+    expect(screen.queryByText(/thinking=/)).toBeNull()
+  })
+
+  it("names no advisor when the card names none", () => {
+    render(
+      <DetailHeader
+        workspace={{ id: "sag-acme", project: "acme-platform" } as WorkspaceSummary}
+        detail={{
+          resultCard: cardWith({ model: "gpt-5.4-mini", wallClockSeconds: 41.04 }),
+        } as ExecutionSessionDetail}
+        sessionId="S1"
+        {...noopHandlers}
+      />,
+    )
+    expect(screen.getByText("model gpt-5.4-mini · 41.0s")).toBeInTheDocument()
+    expect(screen.queryByText(/advisor/)).toBeNull()
+  })
+
+  it("names no model at all for a run that recorded no card", () => {
+    render(
+      <DetailHeader
+        workspace={{ id: "sag-acme", project: "acme-platform", stack: "maven" } as WorkspaceSummary}
+        detail={{ model: "thinking=x;action=y", duration: "8m 01s" } as ExecutionSessionDetail}
+        sessionId="S1"
+        {...noopHandlers}
+      />,
+    )
+    expect(screen.getByText("maven · 8m 01s")).toBeInTheDocument()
   })
 
   it("falls back to a bare step count when no budget is present", () => {
