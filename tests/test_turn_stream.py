@@ -2258,6 +2258,42 @@ def test_a_second_turn_answering_does_not_cost_the_first_its_recorded_span():
     assert "2.0s" not in reverse.text
 
 
+def test_a_log_line_during_a_hold_takes_the_screen_and_leaves_the_span_alone():
+    """`give_way()` mid-hold, on a ledger already known to record its turns.
+
+    This is the live shape: the console log sink calls `give_way()` before
+    every line it writes, and a warning logged in the window between a turn's
+    answer and its record used to place the outcome — with the gap between two
+    events. The warning still gets the screen and the dispatch line still
+    closes for it; what changed is that the outcome is not written there.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    # A first turn, recorded, so the ledger has said it records its turns.
+    stream.feed(_decision(1, "bash", "build"))
+    stream.feed(_envelope(2, "bash", {"command": "first"}, "e1"))
+    stream.feed(_result(3, "bash", "e1", {"operation_outcome": "success"}))
+    stream.feed(_span_record(4, "e1", "2026-09-15T01:00:02Z", "2026-09-15T01:00:08.500000Z"))
+
+    stream.feed(_envelope(5, "bash", {"command": "second"}, "e2"))
+    stream.feed(_result(6, "bash", "e2", {"operation_outcome": "success"}))
+    stream.give_way()
+    assert sink.text.endswith("\n"), "the other writer gets a line of its own"
+    assert "1.0s" not in sink.text, "and not the gap between two events"
+    sink("a line from outside the ledger\n")
+    stream.feed(
+        _span_record(7, "e2", "2026-09-15T01:00:00.100000Z", "2026-09-15T01:00:03.600000Z")
+    )
+    stream.close()
+
+    lines = sink.lines
+    dispatched = next(i for i, line in enumerate(lines) if line.lstrip().startswith("#3"))
+    assert lines[dispatched + 1] == "a line from outside the ledger"
+    assert lines[dispatched + 2].startswith("      ↳ #3 ")
+    assert lines[dispatched + 2].endswith("3.5s")
+
+
 def test_a_turn_whose_record_comes_late_still_reads_the_span_the_record_states():
     """The shape seven archived runs are written in, turn for turn.
 

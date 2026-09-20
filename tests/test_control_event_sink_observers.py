@@ -906,8 +906,13 @@ def test_a_console_line_written_while_a_turn_is_open_lands_on_its_own_line(
         )
     )
     # The turn is #2: a `loop_decision` ahead of its envelope opens a call-less
-    # #1, which is how these fixtures state the phase before the dispatch.
+    # #1, which is how these fixtures state the phase before the dispatch. And
+    # the line carries the span the record states — 2.0s — not the 1.0s
+    # between the envelope and the answer, which is the whole reason it waited
+    # for the record rather than going out when the warning took the screen.
     assert "↳ #2" in buffer.getvalue()
+    assert "2.0s" in buffer.getvalue()
+    assert "1.0s" not in buffer.getvalue()
 
     main_module._close_turn_stream(renderer)
     logger_module._console_sink("18:32:57 | WARNING  | after\n")
