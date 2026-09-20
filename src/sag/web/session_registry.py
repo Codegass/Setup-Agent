@@ -10,7 +10,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,7 @@ from sag.agent.verdict_finalizer import (
 from sag.result_card.build import _verdict_source, build_result_card
 from sag.result_card.run_evidence import ReportDeliveryOnly, read_run_counts
 from sag.result_card.models import RunResultCard
+from sag.result_card.rows import duration_text
 from sag.runtime.container_io import container_report_path, resolve_control_execute
 from sag.trajectory.builder import CONTROL_EVENTS_NAME, build_trajectory
 from sag.web.context_trace import ContextTraceBuilder
@@ -1164,6 +1165,7 @@ def _setup_artifact_item(
     comparison = snapshot.ci_comparison if snapshot is not None else None
     task_completion = snapshot.task_completion if snapshot is not None else None
     result_card = None
+    run_dir: Path | None = None
     if snapshot is not None:
         # Named by the run it belongs to, never by "the newest directory of
         # this project": pointing a reader at another run's evidence is worse
@@ -1209,6 +1211,21 @@ def _setup_artifact_item(
     # start disagreeing.
     workspace_result = _workspace_result(result_card, snapshot)
 
+    # When the run's own ledger is readable, it says how long the run was and
+    # when it began and ended — and it is what the card already measured its
+    # wall clock from. Subtracting the trunk's `created_at` from the report's
+    # `**Generated:**` line answered something else: on the archived commons-cli
+    # run that read 5m 56s while the card's Setup row, an inch below it on the
+    # same page, read 6m 08s. One run cannot last two lengths, so the ledger
+    # answers for all three fields or for none of them.
+    started, ended, ran_for = _ledger_times(run_dir, result_card)
+    start_text = started or _normalize_timestamp(created) or created or "—"
+    finish_text = ended or (_normalize_timestamp(finish) if status == "completed" else None)
+    length_text = ran_for or _duration(
+        _normalize_timestamp(created) or created,
+        _normalize_timestamp(finish) or finish,
+    )
+
     return {
         "id": session_id,
         "workspace": workspace_id,
@@ -1228,12 +1245,9 @@ def _setup_artifact_item(
         "verdict_source": verdict_source,
         "report_delivery_status": _durable_report_delivery_status(trunk_data),
         "entry": "CLI",
-        "start": _normalize_timestamp(created) or created or "—",
-        "finish": _normalize_timestamp(finish) if status == "completed" else None,
-        "duration": _duration(
-            _normalize_timestamp(created) or created,
-            _normalize_timestamp(finish) or finish,
-        ),
+        "start": start_text,
+        "finish": finish_text,
+        "duration": length_text,
         "build": build_payload,
         "test": test,
         "modules": _modules_payload_from_metrics(module_metrics),
@@ -2096,6 +2110,79 @@ def _session_dir_run_id(session_dir: Path) -> str | None:
     if stated is not None:
         return stated
     return _run_pin_run_id(_read_text_file(session_dir / "run-pin.json"))
+
+
+#: How a time is written where a person reads it: the run's own day and clock
+#: time, the way the written report's header states it.
+_HOST_CLOCK = "%Y-%m-%d %H:%M:%S"
+
+
+def _ledger_times(
+    run_dir: Path | None, result_card: dict[str, Any] | None
+) -> tuple[str | None, str | None, str | None]:
+    """When the run began, when it ended, and how long it took — from its ledger.
+
+    All three or none. They are readings of one file, and a page that took the
+    length from the ledger while taking the end from the report's byline would
+    print two times that do not reach back to each other.
+
+    The length is the card's own `wall_clock_seconds`, formatted by the
+    function the Setup row formats it with, so the header line and the row an
+    inch below it cannot state different lengths. The card measures that number
+    from this same ledger's two ends, which is why asking the file for the ends
+    and the card for the length is one reading rather than two.
+    """
+
+    if run_dir is None or not isinstance(result_card, dict):
+        return None, None, None
+    stats = result_card.get("stats")
+    seconds = stats.get("wall_clock_seconds") if isinstance(stats, dict) else None
+    ran_for = duration_text(seconds) if isinstance(seconds, (int, float)) else None
+    if ran_for is None:
+        return None, None, None
+    span = _ledger_span(run_dir / CONTROL_EVENTS_NAME)
+    if span is None:
+        return None, None, None
+    first, last = span
+    return first, last, ran_for
+
+
+def _ledger_span(control_events: Path) -> tuple[str, str] | None:
+    """The first and last times a control ledger records, in the reader's clock.
+
+    A stamp without a zone is read as UTC, which is the clock every SAG artifact
+    is written against, and then shown in the clock of the host doing the
+    reading — the same two steps the written report takes for its own header.
+    """
+
+    stamps: list[str] = []
+    try:
+        with control_events.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if not line.lstrip().startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                recorded = event.get("timestamp") if isinstance(event, dict) else None
+                if isinstance(recorded, str) and recorded:
+                    stamps.append(recorded)
+    except OSError as exc:
+        logger.debug(f"the run's own times could not be read from {control_events}: {exc}")
+        return None
+    if not stamps:
+        return None
+    ends = []
+    for stamp in (stamps[0], stamps[-1]):
+        try:
+            moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        ends.append(moment.astimezone().strftime(_HOST_CLOCK))
+    return ends[0], ends[1]
 
 
 def _ledger_run_id(control_events: Path) -> str | None:

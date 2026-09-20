@@ -1956,3 +1956,97 @@ def test_no_surface_names_the_run_counts_one_at_a_time():
         "these files name a run count by keyword instead of splatting "
         f"read_run_counts(...): {offenders}"
     )
+
+
+#: A ledger whose two events are 368.43 seconds apart, which is what the
+#: archived commons-cli run measured. Written in UTC, as every SAG artifact is.
+_LEDGER_FIRST = "2026-07-17T11:53:45.500000Z"
+_LEDGER_LAST = "2026-07-17T11:59:53.930000Z"
+
+
+def _ledger(run_id: str) -> str:
+    events = [
+        {
+            "event_id": f"control-00000{index}",
+            "kind": "evidence_store_bound",
+            "payload": {"run_id": run_id, "store_identity": "docker:fixture"},
+            "run_id": run_id,
+            "sequence": index,
+            "source": None,
+            "timestamp": stamp,
+        }
+        for index, stamp in enumerate((_LEDGER_FIRST, _LEDGER_LAST), start=1)
+    ]
+    return "".join(f"{json.dumps(event)}\n" for event in events)
+
+
+def _host_local(stamp: str) -> str:
+    from datetime import datetime
+
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def _run_with_a_ledger(tmp_path, tvm_snapshot):
+    session_dir = tmp_path / "session_20260717_115345"
+    session_dir.mkdir()
+    (session_dir / "command_project_tvm.log").write_text("setup\n", encoding="utf-8")
+    (session_dir / "control_events.jsonl").write_text(
+        _ledger(tvm_snapshot.run_id), encoding="utf-8"
+    )
+    files = {
+        VERDICT_PATH: tvm_snapshot.model_dump_json(),
+        "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+        "/workspace/setup-report-20260717-120000.md": _report_text(total=987, passed=987),
+    }
+    item = _setup_artifact_item(SnapshotOrchestrator(files), "sag-tvm", tmp_path)
+    return _session_detail(item, "sag-tvm", None)
+
+
+def test_the_header_states_the_length_the_setup_row_states(tmp_path, tvm_snapshot):
+    """One run, one length.
+
+    The detail used to subtract the trunk's `created_at` from the report's
+    `**Generated:**` line and call the difference the run's duration. On the
+    archived commons-cli run that read 5m 56s, an inch above a Setup row that
+    read 6m 08s — two numbers for one run, on one screen. The run's own ledger
+    is what the card measured, so it is what the header line says too.
+    """
+    from sag.result_card.rows import duration_text
+
+    detail = _run_with_a_ledger(tmp_path, tvm_snapshot)
+
+    assert detail.result_card is not None
+    assert detail.result_card.stats.wall_clock_seconds == pytest.approx(368.43)
+    assert detail.duration == duration_text(368.43) == "6m 08s"
+    assert detail.result_card.row("setup").headline.endswith("6m 08s")
+
+
+def test_the_run_ends_when_its_ledger_ends_in_the_reader_s_own_clock(tmp_path, tvm_snapshot):
+    """Start and finish are the ledger's two ends, not the report's byline.
+
+    The Overview's Time tile prints them under the wall clock, so a reader can
+    see the two numbers add up. Taking the finish from the report's `Generated`
+    line instead put a time there that the length did not reach back to.
+    """
+    detail = _run_with_a_ledger(tmp_path, tvm_snapshot)
+
+    assert detail.start == _host_local(_LEDGER_FIRST)
+    assert detail.finish == _host_local(_LEDGER_LAST)
+
+
+def test_a_run_without_a_readable_ledger_keeps_the_times_it_could_read(tmp_path, tvm_snapshot):
+    """No ledger, no invention: the trunk and the report still answer."""
+    files = {
+        VERDICT_PATH: tvm_snapshot.model_dump_json(),
+        "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+        "/workspace/setup-report-20260717-120000.md": _report_text(total=987, passed=987),
+    }
+    item = _setup_artifact_item(SnapshotOrchestrator(files), "sag-tvm", tmp_path)
+    detail = _session_detail(item, "sag-tvm", None)
+
+    assert detail.result_card is not None
+    assert detail.result_card.stats.wall_clock_seconds is None
+    assert detail.duration == "1h 0m"
+    assert detail.finish == "2026-07-17T12:00:00"
