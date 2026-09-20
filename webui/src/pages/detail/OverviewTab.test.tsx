@@ -120,9 +120,13 @@ describe("OverviewTab", () => {
     expect(screen.getByText("ev-7742")).toBeInTheDocument()
   })
 
-  it("says so plainly when nothing needs attention", () => {
+  it("shows no attention box at all when nothing needs attention", () => {
+    // A bordered box whose only content was "Nothing needs attention." took a
+    // band across the top of the tab on every clean run and said nothing a
+    // reader could act on. A section with no items is not drawn.
     render(<OverviewTab detail={cleanDetail()} />)
-    expect(screen.getByText("Nothing needs attention.")).toBeInTheDocument()
+    expect(screen.queryByText("Nothing needs attention.")).toBeNull()
+    expect(screen.queryByRole("heading", { name: "Needs attention" })).toBeNull()
   })
 
   it("does not restate the result band's Build and Tests rows", () => {

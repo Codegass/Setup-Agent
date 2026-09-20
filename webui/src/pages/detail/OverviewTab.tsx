@@ -1,6 +1,5 @@
 import type { AttentionItem, ExecutionSessionDetail } from "@/api/types"
 import { ModuleTable } from "@/components/session/ModuleTable"
-import { cn } from "@/lib/utils"
 
 function AttentionRow({ item }: { item: AttentionItem }) {
   const refs = item.refs ?? []
@@ -52,37 +51,31 @@ export function OverviewTab({ detail }: { detail: ExecutionSessionDetail }) {
 
   return (
     <div>
-      {card ? (
+      {/* Only when there is something to attend to. The box used to be drawn
+          on every run with a card, and on a clean one its whole content was
+          the sentence "Nothing needs attention." — a bordered band across the
+          top of the tab holding no item a reader could act on, above the
+          things they came for. A run with no card has no attention list at
+          all, and the band two inches above already says that run recorded no
+          result, so nothing is said about it here either. */}
+      {attention.length > 0 ? (
         <section
           aria-labelledby="overview-attention"
-          className={cn(
-            "overflow-hidden rounded-xl border bg-card",
-            attention.length > 0 ? "border-status-attention-border" : "border-border",
-          )}
+          className="overflow-hidden rounded-xl border border-status-attention-border bg-card"
         >
           <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-            {attention.length > 0 ? (
-              <span className="h-[7px] w-[7px] rounded-full bg-status-failed" />
-            ) : null}
+            <span className="h-[7px] w-[7px] rounded-full bg-status-failed" />
             <h2 className="text-[14px] font-bold text-foreground" id="overview-attention">
               Needs attention
             </h2>
           </div>
-          {attention.length > 0 ? (
-            <ul>
-              {attention.map((item, index) => (
-                <AttentionRow item={item} key={`${item.kind}-${index}-${item.title}`} />
-              ))}
-            </ul>
-          ) : (
-            <p className="px-4 py-3 text-[13px] text-muted-foreground">Nothing needs attention.</p>
-          )}
+          <ul>
+            {attention.map((item, index) => (
+              <AttentionRow item={item} key={`${item.kind}-${index}-${item.title}`} />
+            ))}
+          </ul>
         </section>
-      ) : // A run with no card has no attention list to show, and the band said
-      // "No result was recorded for this run yet." two inches above this line —
-      // repeating it here put the same sentence on the screen twice. What this
-      // tab can still say about such a run is below: its goal, and its modules.
-      null}
+      ) : null}
 
       {goal ? (
         // Below what needs attention, not above it: a real goal is a paragraph

@@ -161,13 +161,13 @@ describe("DetailPane", () => {
   it("switches panels when a tab is clicked (real switch, not scroll)", () => {
     render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
     // Overview content is visible up front.
-    expect(screen.getByText("Nothing needs attention.")).toBeInTheDocument()
+    expect(screen.getByText("Module details are not available for this run.")).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: /^Build/ }))
     const build = screen.getByRole("button", { name: /^Build/ })
     expect(build).toHaveAttribute("aria-current", "true")
     // The Build facet now owns the panel; the Overview's own sections are gone.
-    expect(screen.queryByText("Nothing needs attention.")).not.toBeInTheDocument()
+    expect(screen.queryByText("Module details are not available for this run.")).not.toBeInTheDocument()
     expect(screen.getByText("Compiled all modules")).toBeInTheDocument()
   })
 
