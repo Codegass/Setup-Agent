@@ -812,8 +812,18 @@ def test_the_run_ending_on_a_failed_grading_is_not_a_tick():
     surfaces read refuses a band that closed on a grading saying the phase had
     not passed. Ticking it anyway is the two surfaces disagreeing about one
     run — the same defect `✗ test blocked` was written to fix, one branch
-    further on. Zero archived runs end this way (`flow_close` is `success` 85
-    times and `partial` 3), so the corpus cannot catch it and this can.
+    further on.
+
+    The archive does reach this, and the first version of this fence said it
+    could not. Over every `control_events.jsonl` under `logs/` — 1,112 of
+    them, deduplicated — `flow_close` closes on `success` 995 times, on
+    `partial` 17 and on `failed` 12, and those twelve are four distinct runs
+    each archived three times. Over the archive's top-level runs alone
+    (`logs/session_*`, 99 ledgers) it is `success` 84 and `partial` 3, with no
+    `failed` — which is the count the "zero archived runs" claim was taken
+    from. The card already counted those four runs' last phase as not
+    finished, so what changed on them is that the line and the fraction now
+    agree.
     """
 
     from sag.trajectory.phases import band_finished
@@ -826,6 +836,36 @@ def test_the_run_ending_on_a_failed_grading_is_not_a_tick():
 
     assert closes == ["✗ test blocked"]
     assert not band_finished({"termination": "flow_close", "gates": [{"word": "failed"}]})
+
+
+def test_a_real_run_that_ends_on_a_failed_grading_ends_without_a_tick():
+    """The smallest of the four archived runs that end this way, replayed.
+
+    `commons-dbutils-v3` closes its `report` band with `flow_close` on two
+    `failed` gradings. Its whole ledger is 134 events and its whole rendering
+    is 36 lines; the last of them used to read `✓ run ended` over a band the
+    result card refused to count.
+    """
+
+    from sag.trajectory.phases import band_finished
+
+    sink = _render("commons-dbutils-v3")
+    document = build_trajectory(FIXTURE_DIR / "commons-dbutils-v3")
+    report = document.phases[-1]
+
+    assert sink.lines[-1] == "✗ report blocked"
+    assert "✓ run ended" not in sink.text
+    assert [line for line in sink.lines if line[0] in "✓✗→"] == [
+        "✓ provision advanced",
+        "✓ analyze finished",
+        "✗ report blocked",
+    ]
+    # And the rule the line reads is the rule the fraction reads: the band is
+    # `flow_close` on `failed`, and the card counts two of this run's three.
+    assert (report.name, report.termination) == ("report", "flow_close")
+    assert [gate.word for gate in report.gates] == ["failed", "failed"]
+    assert not band_finished(report.model_dump(mode="json"))
+    assert sum(band_finished(band.model_dump(mode="json")) for band in document.phases) == 2
 
 
 def test_an_advance_states_the_phase_and_nothing_machine_made():
