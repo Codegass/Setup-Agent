@@ -1,5 +1,72 @@
-import type { AttentionItem, ExecutionSessionDetail } from "@/api/types"
+import type { ReactNode } from "react"
+
+import type { AttentionItem, ExecutionSessionDetail, ResultStats } from "@/api/types"
 import { ModuleTable } from "@/components/session/ModuleTable"
+import { durationText } from "@/lib/durationText"
+
+/** A count the way a bill prints it: grouped, never shortened, and a dash for
+ *  a number the run did not record. `129.6k` hides the difference between two
+ *  runs that spent a thousand tokens apart. */
+function count(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value) ? "—" : value.toLocaleString("en-US")
+}
+
+/** The model's name, or a dash where the card names none. */
+function named(value: string | null | undefined): string {
+  const text = value?.trim() ?? ""
+  return text ? text : "—"
+}
+
+function spent(inTokens: number | null | undefined, outTokens: number | null | undefined): boolean {
+  return inTokens != null || outTokens != null
+}
+
+/**
+ * The run's token bill, in the words the card and the report already use.
+ *
+ * The model and the advisor are billed on their own lines because they are two
+ * models: one number for both would say the first spent it all. The total is
+ * allowed only underneath them, and only when both lines are there to be
+ * summed — a "total" of one row is that row said twice, and a total whose
+ * parts are off screen is a number nobody can check.
+ */
+function tokenLines(stats: ResultStats): string[] {
+  const model = spent(stats.tokensIn, stats.tokensOut)
+  const advisor = spent(stats.advisorTokensIn, stats.advisorTokensOut)
+  const lines: string[] = []
+  if (model) {
+    lines.push(`Model ${named(stats.model)} · ${count(stats.tokensIn)} in · ${count(stats.tokensOut)} out`)
+  }
+  if (advisor) {
+    lines.push(
+      `Advisor ${named(stats.advisorModel)} · ${count(stats.advisorTokensIn)} in · ${count(stats.advisorTokensOut)} out`,
+    )
+  }
+  const parts = [stats.tokensIn, stats.tokensOut, stats.advisorTokensIn, stats.advisorTokensOut]
+  if (model && advisor && parts.every((part) => typeof part === "number")) {
+    lines.push(
+      `Total (model + advisor) · ${count(stats.tokensIn! + stats.advisorTokensIn!)} in · ` +
+        `${count(stats.tokensOut! + stats.advisorTokensOut!)} out`,
+    )
+  }
+  return lines
+}
+
+function Tile({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="rounded-[10px] border border-border bg-card px-4 py-3">
+      <div className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">
+        {label}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+function usefulTime(value: string | null | undefined): string | null {
+  const text = value?.trim() ?? ""
+  return text && !["unknown", "none", "—", "-", "now"].includes(text.toLowerCase()) ? text : null
+}
 
 function AttentionRow({ item }: { item: AttentionItem }) {
   const refs = item.refs ?? []
@@ -48,6 +115,14 @@ export function OverviewTab({ detail }: { detail: ExecutionSessionDetail }) {
   const goal = card?.goal ?? detail.context?.trunk.goal ?? null
   const attention = card?.attention ?? []
   const notes = card?.notes ?? []
+  // What the run cost, in time and in tokens. Every value below is a field of
+  // `card.stats` — the same numbers the terminal block and the written report
+  // state — so nothing here is recomputed from turns or rows.
+  const stats = card?.stats
+  const ranFor = durationText(stats?.wallClockSeconds)
+  const started = usefulTime(detail.start)
+  const finished = usefulTime(detail.finish)
+  const bill = stats ? tokenLines(stats) : []
 
   return (
     <div>
@@ -74,6 +149,37 @@ export function OverviewTab({ detail }: { detail: ExecutionSessionDetail }) {
               <AttentionRow item={item} key={`${item.kind}-${index}-${item.title}`} />
             ))}
           </ul>
+        </section>
+      ) : null}
+
+      {/* What the run cost. Two tiles side by side on a wide pane, one column
+          on a narrow one. Drawn only for a card that measured something: a
+          tile of dashes is a shape where a number was expected. */}
+      {ranFor || bill.length > 0 ? (
+        <section aria-label="Run" className="mt-3 grid gap-3 first:mt-0 sm:grid-cols-2">
+          {ranFor ? (
+            <Tile label="Time">
+              <div className="mt-1 text-[22px] font-bold leading-none tracking-[-0.01em] text-foreground">
+                {ranFor}
+              </div>
+              {started && finished ? (
+                <div className="mt-1.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                  {`started ${started} · finished ${finished}`}
+                </div>
+              ) : null}
+            </Tile>
+          ) : null}
+          {bill.length > 0 ? (
+            <Tile label="Tokens">
+              <ul className="mt-1.5 space-y-1">
+                {bill.map((line) => (
+                  <li className="font-mono text-[12px] leading-relaxed text-foreground" key={line}>
+                    {line}
+                  </li>
+                ))}
+              </ul>
+            </Tile>
+          ) : null}
         </section>
       ) : null}
 

@@ -204,3 +204,104 @@ describe("OverviewTab", () => {
     expect(screen.getByText("Module details are not available for this run.")).toBeInTheDocument()
   })
 })
+
+describe("OverviewTab · the Run section", () => {
+  /** The archived commons-cli run, as its card states it. */
+  function archived(): ExecutionSessionDetail {
+    return detail({
+      start: "2026-09-17 18:32:05",
+      finish: "2026-09-17 18:38:14",
+      resultCard: card({
+        stats: {
+          model: "gpt-5.4-mini",
+          advisorModel: "gpt-5.4-mini",
+          tokensIn: 129567,
+          tokensOut: 1932,
+          advisorTokensIn: 81516,
+          advisorTokensOut: 477,
+          wallClockSeconds: 368.4298,
+        },
+      }),
+    })
+  }
+
+  it("states the run's length and its two ends", () => {
+    render(<OverviewTab detail={archived()} />)
+    const run = screen.getByRole("region", { name: "Run" })
+    expect(within(run).getByText("6m 08s")).toBeInTheDocument()
+    expect(
+      within(run).getByText("started 2026-09-17 18:32:05 · finished 2026-09-17 18:38:14"),
+    ).toBeInTheDocument()
+  })
+
+  it("bills the model and the advisor apart, then says what the total sums", () => {
+    render(<OverviewTab detail={archived()} />)
+    const run = screen.getByRole("region", { name: "Run" })
+    expect(within(run).getByText("Model gpt-5.4-mini · 129,567 in · 1,932 out")).toBeInTheDocument()
+    expect(within(run).getByText("Advisor gpt-5.4-mini · 81,516 in · 477 out")).toBeInTheDocument()
+    expect(
+      within(run).getByText("Total (model + advisor) · 211,083 in · 2,409 out"),
+    ).toBeInTheDocument()
+  })
+
+  it("shows the model line alone when the run consulted nobody", () => {
+    // A total of one row is that row said twice.
+    render(
+      <OverviewTab
+        detail={detail({
+          resultCard: card({
+            stats: { model: "gpt-5.4-mini", tokensIn: 129567, tokensOut: 1932 },
+          }),
+        })}
+      />,
+    )
+    const run = screen.getByRole("region", { name: "Run" })
+    expect(within(run).getByText("Model gpt-5.4-mini · 129,567 in · 1,932 out")).toBeInTheDocument()
+    expect(within(run).queryByText(/^Advisor/)).toBeNull()
+    expect(within(run).queryByText(/^Total/)).toBeNull()
+  })
+
+  it("draws a dash for a model the card does not name", () => {
+    render(
+      <OverviewTab
+        detail={detail({
+          resultCard: card({ stats: { tokensIn: 10, tokensOut: 2 } }),
+        })}
+      />,
+    )
+    expect(screen.getByText("Model — · 10 in · 2 out")).toBeInTheDocument()
+  })
+
+  it("shows no Tokens tile for a run that recorded no token counts", () => {
+    render(
+      <OverviewTab
+        detail={detail({
+          resultCard: card({ stats: { model: "gpt-5.4-mini", wallClockSeconds: 368.4298 } }),
+        })}
+      />,
+    )
+    const run = screen.getByRole("region", { name: "Run" })
+    expect(within(run).getByText("6m 08s")).toBeInTheDocument()
+    expect(within(run).queryByText("Tokens")).toBeNull()
+  })
+
+  it("omits the two ends when the run could not state them", () => {
+    render(
+      <OverviewTab
+        detail={detail({
+          start: "",
+          finish: null,
+          resultCard: card({ stats: { wallClockSeconds: 368.4298 } }),
+        })}
+      />,
+    )
+    const run = screen.getByRole("region", { name: "Run" })
+    expect(within(run).getByText("6m 08s")).toBeInTheDocument()
+    expect(within(run).queryByText(/started/)).toBeNull()
+  })
+
+  it("draws no Run section for a run whose card measured neither", () => {
+    render(<OverviewTab detail={cleanDetail()} />)
+    expect(screen.queryByRole("region", { name: "Run" })).toBeNull()
+  })
+})
