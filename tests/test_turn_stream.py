@@ -2174,6 +2174,90 @@ def test_a_grading_between_the_answer_and_the_record_keeps_the_turn_its_span():
     assert sink.text.count("gate: partial") == 1
 
 
+def _span_record(sequence: int, envelope_ref: str, t0: str, t1: str) -> str:
+    """A record for one turn, stating a span of its own."""
+
+    return _event(
+        sequence,
+        "turn_record",
+        {
+            "actor": "model",
+            "envelope_ref": envelope_ref,
+            "phase": "build",
+            "iteration": 1,
+            "t0": t0,
+            "t1": t1,
+        },
+    )
+
+
+def _two_in_flight(order: tuple[int, ...]) -> _Sink:
+    """Two turns answered before either is recorded, recorded in `order`.
+
+    The `loop_decision` states the phase so both calls are dispatched rather
+    than held for a band; it opens a call-less `#1`, so the calls are `#2` and
+    `#3`. Each envelope-to-answer gap is 2.0s and neither record states it.
+    """
+
+    spans = {
+        2: ("e1", "2026-09-15T01:00:00.100000Z", "2026-09-15T01:00:03.600000Z"),
+        3: ("e2", "2026-09-15T01:00:00.200000Z", "2026-09-15T01:00:04.700000Z"),
+    }
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_decision(1, "bash", "build"))
+    stream.feed(_envelope(2, "bash", {"command": "first"}, "e1"))
+    stream.feed(_envelope(3, "bash", {"command": "second"}, "e2"))
+    stream.feed(_result(4, "bash", "e1", {"operation_outcome": "success"}))
+    stream.feed(_result(5, "bash", "e2", {"operation_outcome": "success"}))
+    # The sequence numbers follow the order the records are written in: a
+    # ledger states its own order, and a stream fed one out of sequence is a
+    # torn ledger, which is a different test.
+    for sequence, turn_id in enumerate(order, start=6):
+        stream.feed(_span_record(sequence, *spans[turn_id]))
+    stream.close()
+    return sink
+
+
+def test_a_second_turn_answering_does_not_cost_the_first_its_recorded_span():
+    """Two turns answered before either is recorded, and both wait.
+
+    One slot held the waiting outcome, so a second turn answering displaced
+    the first — written there and then, with the gap between its envelope and
+    its answer, and the record that followed restated a turn whose line was
+    already gone. Nothing corrected it. The engine is sequential so no
+    archived ledger writes this, but the rule it broke is the rule everything
+    else in this file is about, and one placer disagreeing with the other two
+    is how the first version of this shipped.
+
+    Each outcome is written when its own record lands, which is also why the
+    reverse order reads the way it does: the stream states what the ledger has
+    finished with, in the order the ledger finishes, and every line names its
+    own turn.
+    """
+
+    forward = _two_in_flight((2, 3))
+    written = [line for line in forward.lines if line.lstrip().startswith("↳")]
+
+    assert len(written) == 2
+    assert written[0].startswith("      ↳ #2 ") and written[0].endswith("3.5s")
+    assert written[1].startswith("      ↳ #3 ") and written[1].endswith("4.5s")
+    assert "2.0s" not in forward.text
+
+    # Recorded the other way round, `#3` is the line still open when its own
+    # record lands, so its outcome finishes that line in place and `#2` takes
+    # the continuation. Both spans are still the engine's.
+    reverse = _two_in_flight((3, 2))
+    second = [line for line in _turn_lines(reverse) if line.lstrip().startswith("#3")]
+
+    assert len(second) == 1 and second[0].endswith("4.5s")
+    assert [line for line in reverse.lines if line.lstrip().startswith("↳")] == [
+        "      ↳ #2 ok"
+        "                                                                                   3.5s"
+    ]
+    assert "2.0s" not in reverse.text
+
+
 def test_a_turn_whose_record_comes_late_still_reads_the_span_the_record_states():
     """The shape seven archived runs are written in, turn for turn.
 

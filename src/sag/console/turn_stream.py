@@ -306,6 +306,22 @@ class _Line:
         return "".join(out)
 
 
+class _Waiting:
+    """An outcome decided and not yet written, and what goes out beside it.
+
+    Deciding and writing are two moments, and everything but the span is
+    settled at the first: whether the gate's word is part of the line, and a
+    grading that landed afterwards and belongs on the line under it.
+    """
+
+    __slots__ = ("turn", "gate", "queued_gate")
+
+    def __init__(self, turn: Turn, *, gate: bool) -> None:
+        self.turn = turn
+        self.gate = gate
+        self.queued_gate: str | None = None
+
+
 class TurnStreamRenderer:
     """Folds control-event lines into terminal lines. Writes; never reads files.
 
@@ -352,19 +368,12 @@ class TurnStreamRenderer:
         #: or under the band already open if anything else needs the terminal
         #: first.
         self._pending: Turn | None = None
-        #: A turn whose outcome is decided and not yet written. It waits for the
-        #: engine's own record of the turn, because that record carries the span
-        #: every other surface states.
-        self._outcome: Turn | None = None
-        #: Whether that outcome line carries the gate's word. Decided when the
-        #: outcome was, not when it is written: a gate that lands in between
-        #: takes a continuation line of its own, exactly as it does today.
-        self._outcome_gate = False
-        #: A gate's word for the turn whose outcome is still waiting. It cannot
-        #: be written yet — the line it belongs under has not been written —
-        #: and it must not place that line either, because the record has not
-        #: landed and the span would be the gap between two events.
-        self._queued_gate: str | None = None
+        #: Outcomes decided and not yet written, by turn id, in the order the
+        #: ledger answered them. Each waits for the engine's own record of its
+        #: turn, because that record carries the span every other surface
+        #: states. More than one can wait: a turn answering is news about that
+        #: turn and says nothing about the one before it.
+        self._waiting: dict[int, _Waiting] = {}
         #: What the `turn_record` line just read names: the envelope it was
         #: taken for and the span it states. Read by the delta that follows it,
         #: which is where the reducer restates that turn with those very
@@ -537,9 +546,9 @@ class TurnStreamRenderer:
         # An outcome still waiting always takes the newest statement of its own
         # turn. The record's start and end arrive on a restatement, and a line
         # written from the statement before it states a span nothing else does.
-        waiting = self._outcome is not None and self._outcome.turn_id == turn.turn_id
-        if waiting:
-            self._outcome = turn
+        waiting = self._waiting.get(turn.turn_id)
+        if waiting is not None:
+            waiting.turn = turn
         recorded = self._is_recorded(turn)
 
         # Another turn's news means the held one has waited long enough: place it
@@ -549,7 +558,7 @@ class TurnStreamRenderer:
 
         if turn.turn_id not in self._printed:
             self._printed.add(turn.turn_id)
-            if self._records is None and self._outcome is not None:
+            if self._records is None and self._waiting:
                 # The ledger has moved on to a turn it had not reached when the
                 # waiting one was answered, and never recorded that one. So this
                 # is a ledger that does not record its turns, and from here an
@@ -578,8 +587,8 @@ class TurnStreamRenderer:
             if self._answered(turn):
                 self._hold_outcome(turn)
         else:
-            if waiting and recorded:
-                self._place()
+            if waiting is not None and recorded:
+                self._place(turn.turn_id)
             if turn.gate is not None and turn.turn_id not in self._gated:
                 self._gated.add(turn.turn_id)
                 if self._gate_adds(turn):
@@ -590,8 +599,8 @@ class TurnStreamRenderer:
                     # this now would place that outcome before the record, with
                     # the gap between two events for its span. So it waits with
                     # it and goes out directly under it.
-                    if waiting and self._outcome is not None:
-                        self._queued_gate = turn.gate.word
+                    if waiting is not None:
+                        waiting.queued_gate = turn.gate.word
                     else:
                         self._emit(
                             _Line(self._continuation(turn.turn_id)).add(
@@ -637,27 +646,29 @@ class TurnStreamRenderer:
     def _hold_outcome(self, turn: Turn) -> None:
         """Decide what the turn's outcome says; write it when the record lands.
 
-        Deciding and writing are two moments now, and everything the outcome
+        Deciding and writing are two moments, and everything the outcome
         depends on other than the span is fixed here, at the first moment the
         ledger answered the turn: the turn is spoken for, and the gate's word
         is part of the line only if the grading was already in hand.
+
+        A turn answering while another turn's outcome is still waiting does
+        not place that one. It is news about this turn and says nothing about
+        the one before it, and placing it there would write the gap between
+        two events for a turn whose record is still coming — with no second
+        chance, because the record then restates a turn whose line is gone.
         """
 
-        if self._outcome is not None and self._outcome.turn_id != turn.turn_id:
-            # Two outcomes cannot wait at once: the one already waiting belongs
-            # to the line that is open, and this one does not. Its own queued
-            # grading goes out under it, where it belongs.
-            self._place()
-        self._outcome = turn
         # The grading is part of this line only if it was already in hand. A
         # restatement can hand the waiting outcome a gate that landed after it
         # was decided, and that gate's place is the `↳ #N` line below.
-        self._outcome_gate = turn.gate is not None and turn.turn_id not in self._gated
+        self._waiting[turn.turn_id] = _Waiting(
+            turn, gate=turn.gate is not None and turn.turn_id not in self._gated
+        )
         self._said.add(turn.turn_id)
         if turn.gate is not None:
             self._gated.add(turn.turn_id)
         if self._is_recorded(turn):
-            self._place()
+            self._place(turn.turn_id)
 
     def _is_recorded(self, turn: Turn) -> bool:
         """Is this the turn the record just read was taken for?
@@ -680,23 +691,37 @@ class TurnStreamRenderer:
             return turn.t0 == t0 and turn.t1 == t1
         return False
 
-    def _place(self) -> None:
-        """Write the outcome that was waiting, then any grading queued under it.
+    def _place(self, turn_id: int) -> None:
+        """Write one waiting outcome: the turn the ledger has finished with."""
 
-        Both are cleared BEFORE the write, so an `_emit` inside either
-        re-enters `_flush` and finds nothing left to place.
+        held = self._waiting.pop(turn_id, None)
+        if held is not None:
+            self._write_outcome(held)
+
+    def _place_all(self) -> None:
+        """Write every outcome still waiting, in the order they were answered.
+
+        Taken out of the map BEFORE any of them is written, so an `_emit`
+        inside the first re-enters `_flush` and finds nothing left to place —
+        which is what keeps them in order rather than inside out.
         """
 
-        turn, self._outcome = self._outcome, None
-        queued, self._queued_gate = self._queued_gate, None
-        if turn is None:
-            return
-        gate = self._outcome_gate
-        settled = self._settle(turn, self._outcome_at(self._open_cost), gate=gate)
+        waiting, self._waiting = self._waiting, {}
+        for held in waiting.values():
+            self._write_outcome(held)
+
+    def _write_outcome(self, held: _Waiting) -> None:
+        """The outcome line, and then any grading queued under it."""
+
+        settled = self._settle(
+            held.turn, self._outcome_at(self._open_cost), gate=held.gate
+        )
         if settled is not None:
-            self._complete(turn, settled, gate=gate)
-        if queued is not None:
-            self._emit(_Line(self._continuation(turn.turn_id)).add(f"{_GATE} {queued}"))
+            self._complete(held.turn, settled, gate=held.gate)
+        if held.queued_gate is not None:
+            self._emit(
+                _Line(self._continuation(held.turn.turn_id)).add(f"{_GATE} {held.queued_gate}")
+            )
 
     def _flush(self) -> None:
         """Place what is waiting: an outcome first, then a held first line.
@@ -723,7 +748,7 @@ class TurnStreamRenderer:
         # fire. `_place` clears its own.
         pending, self._pending = self._pending, None
         if self._records is False:
-            self._place()
+            self._place_all()
         if pending is not None:
             self._dispatch(pending)
 
@@ -1051,10 +1076,10 @@ class TurnStreamRenderer:
 
         if self._closed:
             return
-        # Whatever is still waiting goes out here, recorded or not: a run that
-        # ended owes the reader every outcome it has, and nothing may be held
-        # past this point.
-        self._place()
+        # Whatever is still waiting goes out here, recorded or not, in the
+        # order the ledger answered them: a run that ended owes the reader
+        # every outcome it has, and nothing may be held past this point.
+        self._place_all()
         self._flush()
         self._close_line()
         for warning in sorted(self._held, key=warning_order):
