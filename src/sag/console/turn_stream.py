@@ -371,12 +371,15 @@ class TurnStreamRenderer:
         #: values. The record's own turn ids are ITS sequence and are not this
         #: view's, so the turn is recognised by what the record says about it.
         self._record: tuple[str | None, str | None, str | None] | None = None
-        #: Whether this ledger records its turns at all. Once it has shown one
-        #: record it will show the rest, so an outcome here has something to
-        #: wait for and waits for it. A ledger that has never shown one has
-        #: nothing coming, and its outcome goes out with the next thing that
-        #: needs the terminal.
-        self._records = False
+        #: Whether this ledger records its turns. `None` until it says, and
+        #: until it says an outcome WAITS: nothing has recorded yet is not the
+        #: same statement as nothing will, and the difference is the first turn
+        #: of every recording run. It says so two ways. A record makes it
+        #: `True` and the rest are coming. Moving on to another turn while an
+        #: outcome is still waiting makes it `False` — a ledger that does not
+        #: record its turns — and from there the outcome goes out with the next
+        #: thing that needs the terminal, which is where it has always gone.
+        self._records: bool | None = None
         #: Statements currently true about the ledger, and the ones already
         #: shown. A statement is shown at most once and only while it stands.
         self._held: dict[Warning, None] = {}
@@ -546,6 +549,14 @@ class TurnStreamRenderer:
 
         if turn.turn_id not in self._printed:
             self._printed.add(turn.turn_id)
+            if self._records is None and self._outcome is not None:
+                # The ledger has moved on to a turn it had not reached when the
+                # waiting one was answered, and never recorded that one. So this
+                # is a ledger that does not record its turns, and from here an
+                # outcome goes out with the next thing that needs the terminal.
+                # Only from `None`: a ledger that HAS recorded may seal out of
+                # order, and one late record is not a ledger changing its mind.
+                self._records = False
             if turn.phase == UNKNOWN_PHASE and not self._answered(turn):
                 # The ledger has not placed the run yet. Hold the line rather
                 # than print it above the band it turns out to belong to. A
@@ -696,14 +707,14 @@ class TurnStreamRenderer:
         under is the one already open, which is the fallback for a phase that
         never resolves.
 
-        An outcome is placed here only while the ledger has shown no record at
-        all. Once it has shown one, the rest are coming, and a turn whose own
-        record is still on its way keeps waiting: the open line closes without
-        it and it takes a `↳ #N` line when the record lands. The engine does
-        seal turns out of order — a phase closing between a turn's answer and
-        its record is how five archived runs are written — and placing the
-        outcome on that close would state the gap between two events for a turn
-        the engine measured at 23 seconds.
+        An outcome is placed here only once the ledger has SAID it does not
+        record its turns. While it records, or while it has not said yet, a
+        turn whose own record is still on its way keeps waiting: the open line
+        closes without it and it takes a `↳ #N` line when the record lands. The
+        engine does seal turns out of order — a phase closing between a turn's
+        answer and its record is how seven archived runs are written — and
+        placing the outcome on that close would state the gap between two
+        events for a turn the engine measured at 23 seconds.
         """
 
         # `_pending` is cleared BEFORE anything is written, so the `_emit`
@@ -711,7 +722,7 @@ class TurnStreamRenderer:
         # re-entry guard; a flag as well would be a second one that can never
         # fire. `_place` clears its own.
         pending, self._pending = self._pending, None
-        if not self._records:
+        if self._records is False:
             self._place()
         if pending is not None:
             self._dispatch(pending)
@@ -749,6 +760,13 @@ class TurnStreamRenderer:
         The gate word is recorded after any band change, so a turn that both
         enters a phase and carries its grading records the grading against the
         phase it is in rather than the one it left.
+
+        A band opening while this turn's own outcome is still waiting does not
+        place it. The turn's line would then read a span its record is about
+        to move — `commons-dbutils-v3` `#24` is `0.0s` written that way and
+        `0.1s` recorded — and the number outranks the band the outcome sits
+        under, because the outcome carries its own turn id and the band does
+        not claim it.
         """
 
         if turn.phase and turn.phase != UNKNOWN_PHASE and turn.phase != self._phase:

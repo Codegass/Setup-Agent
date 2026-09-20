@@ -2227,19 +2227,93 @@ def test_an_outcome_no_record_ever_seals_is_placed_before_another_writer_prints(
     """The three record-less fixtures live here too.
 
     With no record to wait for, the held outcome goes out the moment anything
-    else needs the terminal — and `give_way()` is a log sink saying so.
+    else needs the terminal — and `give_way()` is a log sink saying so. What
+    makes "no record to wait for" a fact rather than a guess is the ledger
+    moving on: turn 2 is dispatched and turn 1 was never recorded, so this is
+    a ledger that does not record its turns, and from there the old rule
+    holds.
     """
 
     sink = _Sink()
     stream = TurnStreamRenderer(sink, width=100)
-    stream.feed(_envelope(1, "build", {"command": "mvn test"}, "e1"))
-    stream.feed(_result(2, "build", "e1", _build_ok()))
+    # The phase is stated first so the turns below are dispatched rather than
+    # held for a band; it opens a call-less #1, so the calls are #2 and #3.
+    stream.feed(_decision(1, "build", "build"))
+    stream.feed(_envelope(2, "build", {"command": "mvn test"}, "e1"))
+    stream.feed(_result(3, "build", "e1", _build_ok()))
     assert "exit 0" not in sink.text, "the ledger has not finished with the turn yet"
-    stream.give_way()
+    # The ledger moves on without recording #2, which is what says it does not
+    # record. #2's outcome is placed by that, in place, as it always was.
+    stream.feed(_envelope(4, "build", {"command": "mvn verify"}, "e2"))
     assert "exit 0 · 994 tests" in sink.text
+    assert [line.split()[0] for line in _turn_lines(sink)] == ["#1", "#2", "#3"]
+
+    stream.feed(_result(5, "build", "e2", _build_ok()))
+    assert sink.text.count("exit 0 · 994 tests") == 1, "#3 is still waiting"
+    stream.give_way()
+    assert sink.text.count("exit 0 · 994 tests") == 2
     assert sink.text.endswith("\n")
     stream.close()
-    assert len(_turn_lines(sink)) == 1
+    assert len(_turn_lines(sink)) == 3
+
+
+def test_the_first_turn_of_a_run_waits_for_its_record_like_every_other():
+    """Nothing has recorded yet, and that is not the same as nothing will.
+
+    Waiting was released by "this ledger has shown a record", which is true of
+    every turn of a recording run except the first. In that window — the
+    60 ms to 3.4 s between a turn's answer and its record — a log line asking
+    for the screen placed the outcome with the gap between two events, which
+    is the number this whole rule exists to stop printing. A replay never
+    calls `give_way()`, so the corpus cannot reach it; a live run registers it
+    as the hook the console sink calls before every line it writes.
+
+    So an answered outcome waits from the start. What releases it early is the
+    ledger MOVING ON — dispatching another turn without having recorded this
+    one, which is a ledger that does not record its turns.
+    """
+
+    record = _event(
+        4,
+        "turn_record",
+        {
+            "actor": "model",
+            "envelope_ref": "e1",
+            "phase": "build",
+            "iteration": 1,
+            "t0": "2026-09-15T01:00:00.100000Z",
+            "t1": "2026-09-15T01:00:03.600000Z",
+        },
+    )
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "bash", {"command": "mvn test"}, "e1"))
+    stream.feed(_result(2, "bash", "e1", {"operation_outcome": "success"}))
+    stream.give_way()
+    assert "1.0s" not in sink.text, "the record has not said how long the turn took"
+    assert sink.text.endswith("\n"), "the open line is still finished for the other writer"
+    stream.feed(record)
+    stream.close()
+
+    outcome = [line for line in sink.lines if line.lstrip().startswith("↳ #1 ")]
+    assert len(outcome) == 1
+    assert outcome[0].endswith("3.5s")
+    assert "1.0s" not in sink.text
+
+    # And the same in the shape a replay can reach: a band line, not a log line.
+    other = _Sink()
+    stream = TurnStreamRenderer(other, width=100)
+    stream.feed(_envelope(1, "bash", {"command": "mvn test"}, "e1"))
+    stream.feed(_result(2, "bash", "e1", {"operation_outcome": "success"}))
+    stream.feed(_transition(3, "advance", "build", "workspace_ready"))
+    stream.feed(record)
+    stream.close()
+
+    outcome = [line for line in other.lines if line.lstrip().startswith("↳ #1 ")]
+    assert len(outcome) == 1
+    assert outcome[0].endswith("3.5s")
+    assert "1.0s" not in other.text
 
 
 # --- the sink a real terminal actually is --------------------------------
@@ -2371,13 +2445,17 @@ def test_a_turn_that_arrives_already_answered_is_not_held_for_a_band():
     assert not [line for line in sink.lines if line.startswith("▸")]
 
 
-def test_a_band_opens_after_a_late_outcome_and_not_before_it():
+def test_a_band_that_opens_between_a_turn_and_its_outcome_does_not_claim_it():
     """A turn that moves from one KNOWN phase to another.
 
-    No archived ledger does this — the only phase moves in all four sessions are
-    `unknown` to a real phase — so only a hand-built pair of turns reaches the
-    ordering. The outcome belongs to the band the turn was dispatched in, so it
-    is written before the new band opens, not under it.
+    No archived ledger does this — the only phase moves in all five sessions
+    are `unknown` to a real phase — so only a hand-built pair of turns reaches
+    the ordering. The outcome used to be written above the opening band,
+    because anything that needed the terminal placed it. It waits now, and it
+    is the right trade: `commons-dbutils-v3` `#24` is a real turn whose band
+    opens in this window, and placing its outcome on that band writes `0.0s`
+    for a turn the engine recorded at `0.1s`. The band does not claim the
+    line under it, and the line names its own turn.
     """
 
     sink = _Sink()
@@ -2391,7 +2469,12 @@ def test_a_band_opens_after_a_late_outcome_and_not_before_it():
         )
     )
     stream.close()
-    assert [line.strip()[:9] for line in sink.lines] == ["▸ build", "#1   bash", "▸ test"]
+    assert [line.strip()[:9] for line in sink.lines] == [
+        "▸ build",
+        "#1   bash",
+        "▸ test",
+        "↳ #1 ok",
+    ]
 
 
 def test_an_outcome_never_lands_on_another_turns_open_line():
@@ -2437,8 +2520,15 @@ def test_a_gate_in_hand_when_a_held_line_is_finally_written_is_not_said_twice():
     stream.feed(_result(3, "phase", "e1", {"operation_outcome": "success"}))
     stream.feed(_decision(4, "phase", "build"))
     stream.close()
+    # The `loop_decision` states the phase, so a band opens between the turn's
+    # line and its outcome and the outcome takes a continuation. What is being
+    # fenced is the word: on the line once, and not again on the restatement
+    # that follows.
     assert sink.text.count("gate: partial") == 1
-    assert "↳" not in sink.text
+    assert [line for line in sink.lines if line.lstrip().startswith("↳")] == [
+        "      ↳ #1 ok · gate: partial"
+        "                                                                   2.0s"
+    ]
 
 
 def test_held_statements_are_released_in_the_order_warnings_have():
