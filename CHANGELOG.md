@@ -2,6 +2,85 @@
 
 All notable changes to Setup-Agent (SAG) are documented here.
 
+## [Unreleased]
+
+This iteration rebuilds every surface a run has — the terminal, the written
+report, and the Workbench — on two shared derivations of one record, so the
+three cannot describe the same run differently.
+
+### The record and its derivations
+
+- **One ledger, two derivations.** Everything a run states about itself now
+  comes from `control_events.jsonl`, the append-only control ledger the engine
+  writes on the host and mirrors into the container. The **trajectory**
+  (`src/sag/trajectory/`) folds it into turns — call, result, grading, recorded
+  span, token bill; the **result card** (`src/sag/result_card/`) states the run
+  as seven rows in a fixed order. Console logs are no longer a source anywhere.
+- **`sag trajectory`** prints a session as a table (one line per turn, as the
+  run happened), as the trajectory document (`--format json`, `--detail full`),
+  or tails a running session (`--follow`). **`sag result`** prints the card from
+  a container or a recorded session directory (`--json` for programs).
+  `sag inspect --turn N` shows one turn end to end.
+- Each turn's `turn_record` carries the engine's own start and end for the turn
+  and its token bill; phase calls carry the outcome the model stated beside the
+  word the gate delivered.
+
+### Terminal
+
+- **Turn stream.** The console prints one readable line per turn, live, grouped
+  under phase bands, in place of a log that was mostly docker-exec noise. A
+  turn's outcome line is settled when the ledger records the turn, so the
+  duration it prints is the one the trajectory, the report, and the Workbench
+  print. A gate continuation appears only when the gate's word differs from what
+  the model stated. Warnings written to the console no longer land inside an
+  open turn line: the log sink lets the stream finish its line first.
+- **Result block.** The run ends with the seven-row card. Exit code follows the
+  Setup row.
+- The console shows warnings only by default; `--verbose` opens the debug log.
+  Validator probes whose negative answer is expected, and the orchestrator's
+  head-and-tail output cut, are logged as facts at DEBUG rather than as failures.
+
+### Report
+
+- **Rendered on the host at run end**, from the record, after the run's last
+  event — so it states the run that finished (the in-loop report was written one
+  turn before the run ended and disagreed with the terminal by a turn and nine
+  seconds). Written into the session directory and copied back into the
+  container, best-effort. Sections: header, Result, What was set up, The run
+  (one row per turn), Tokens, Evidence (counted, with the commands that open
+  it), Evidence accounting; blockers directly under the Result table when
+  there are any.
+- The in-loop `report` tool now writes only the header and the Result table in
+  setup mode; the report phase gate is unchanged.
+- The Setup row's phase fraction counts the run's phases from the ledger rather
+  than the judgment's records, which are written before the report phase
+  exists; a phase that closed blocked is not counted as finished.
+
+### Advisor accounting
+
+- The advisor's own model calls are recorded on the turn that consulted it —
+  in the ledger's `turn_record`, in `token_usage.csv`, on the trajectory's
+  `advisor_tokens`, on the card's `advisor_tokens_in/out` — and shown apart
+  from the executing model's spend on every surface. Where a total is shown it
+  is labelled as the sum of the two. The advisor's model name resolves from the
+  run pin's `same-model` mode.
+
+### Workbench
+
+- Result band (collapsible) above the tabs; Overview with time and token tiles
+  and an attention list that appears only when something needs attention; a
+  Turns tab with three per-turn strips (model tokens, advisor tokens, duration)
+  whose hover panel says what the turn ran; an Official CI tab; evidence
+  accounting; a header that names the model and the advisor. The disconnected
+  `--ui` mode is retired.
+
+### Development
+
+- `scripts/ship_gate.py` runs vitest, the TypeScript build, the bundle, and
+  pytest, and reports each leg. Archived real runs under
+  `tests/fixtures/trajectory/` and `tests/fixtures/report_document/` replay
+  end to end as fences for every surface.
+
 ## [0.3.0] - 2026-06-14
 
 This release reworks how SAG drives a project setup. An engine-owned **phase
