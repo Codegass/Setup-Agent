@@ -383,6 +383,43 @@ def test_a_legacy_bare_major_requirement_keeps_its_major_match():
     assert result.succeeded is True
 
 
+@pytest.mark.parametrize(
+    ("version", "requirement", "accepted"),
+    [
+        ("1.8.0_504", "[8,)", True),
+        ("1.8.0_504", "[8,9)", True),
+        ("1.8.0_504", ">=8", True),
+        ("1.8.0_504", ">=8,<9", True),
+        ("1.8.0_504", "(,8)", False),
+        ("1.8.0_504", "<=7", False),
+        ("1.8.0_504", "[9,)", False),
+        ("1.8.0_504", "[1.8.0_500,1.8.0_505)", True),
+        ("1.8.0_504", ">=1.8.0_505", False),
+        ("1.8.0_504", "8.0.504", True),
+        ("1.8.0_504", "8.0.503", False),
+        ("21.0.9", "[17,)", True),
+        ("21.0.9", "[17,21)", False),
+    ],
+)
+def test_env_java_constraints_compare_observed_runtime_versions(version, requirement, accepted):
+    """A2 exposed Java 8 rejected as major 1; bounds must stay patch-sensitive."""
+    orchestrator = FakeJavaOverlayOrchestrator(version=version)
+    result = EnvTool(orchestrator).execute(
+        action="register",
+        tool="java",
+        executable="/opt/jdk/bin/java",
+        requirement=requirement,
+        activate=True,
+    )
+    assert result.succeeded is accepted
+    if accepted:
+        candidate = EnvOverlayStore(orchestrator).active_candidate("java")
+        assert candidate["version"] == version
+    else:
+        assert result.error_code == "ENV_RUNTIME_REQUIREMENT_MISMATCH"
+        assert EnvOverlayStore(orchestrator).active_candidate("java") is None
+
+
 def test_env_register_without_any_requirement_is_unchanged():
     """No requirement in force means no version to disprove — the old path stands."""
     orchestrator = FakeJavaOverlayOrchestrator()

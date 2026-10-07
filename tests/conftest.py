@@ -153,10 +153,11 @@ def exact_build_facade_authority(monkeypatch):
         bound.apply_defaults()
         values = bound.arguments
         params = {
-            "action": values["action"],
             "working_directory": values["working_directory"],
         }
         for key in (
+            "action",
+            "command",
             "args",
             "timeout",
             "maven_version_requirement",

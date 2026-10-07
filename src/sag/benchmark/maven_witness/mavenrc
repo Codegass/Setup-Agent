@@ -1,0 +1,5 @@
+# Frozen benchmark observer. Existing JVM options and core extensions are kept.
+# Only shell assignments produced by the trusted local launcher are evaluated.
+if [ -x /usr/bin/python3 ] && [ -f /opt/sag-maven-witness/launch.py ]; then
+  eval "$(/usr/bin/python3 /opt/sag-maven-witness/launch.py --launcher-pid "$$" "$0" "$@")"
+fi

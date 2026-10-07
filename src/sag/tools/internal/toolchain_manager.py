@@ -12,6 +12,11 @@ from loguru import logger
 
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.tools.internal.build_preflight import read_live_build_requirements
+from sag.tools.internal.java_versions import (
+    java_constraint_matches,
+    java_major,
+    names_bare_java_major,
+)
 
 RequirementSource = Literal[
     "acceptance_task",
@@ -187,7 +192,7 @@ class ToolchainManager:
             candidate
             for candidate in candidates
             if all(
-                self._matches_requirement(candidate.version, requirement)
+                self._matches_requirement(candidate.version, requirement, tool=spec.name)
                 for requirement in requirements
             )
         ]
@@ -227,9 +232,11 @@ class ToolchainManager:
         self,
         version: Optional[str],
         requirement: Optional[ToolVersionRequirement],
+        *,
+        tool: Optional[str] = None,
     ) -> bool:
         """Public compatibility check shared by discovery and env registration."""
-        return self._matches_requirement(version, requirement)
+        return self._matches_requirement(version, requirement, tool=tool)
 
     def observed_requirements(
         self,
@@ -466,7 +473,7 @@ class ToolchainManager:
             for candidate in usable
             if requirements
             and all(
-                self._matches_requirement(candidate.version, requirement)
+                self._matches_requirement(candidate.version, requirement, tool=spec.name)
                 for requirement in requirements
             )
         ]
@@ -728,7 +735,11 @@ class ToolchainManager:
         return priorities[source]
 
     def _matches_requirement(
-        self, version: Optional[str], requirement: Optional[ToolVersionRequirement]
+        self,
+        version: Optional[str],
+        requirement: Optional[ToolVersionRequirement],
+        *,
+        tool: Optional[str] = None,
     ) -> bool:
         if requirement is None:
             return True
@@ -736,6 +747,8 @@ class ToolchainManager:
             return True
         if version is None:
             return False
+        if tool == "java":
+            return self._matches_java_requirement(version, requirement)
         if requirement.kind == "exact":
             return self._same_version(version, requirement.raw)
         if requirement.kind == "minimum":
@@ -745,6 +758,36 @@ class ToolchainManager:
         if requirement.kind == "range":
             return self._matches_range(version, requirement.raw)
         return False
+
+    @staticmethod
+    def _matches_java_requirement(version: str, requirement: ToolVersionRequirement) -> bool:
+        """Use Java's legacy version spelling without weakening exact patch bounds."""
+        raw = requirement.raw
+        if requirement.kind == "exact":
+            if names_bare_java_major(raw):
+                return java_major(version) == java_major(raw)
+            constraints = [f"[{raw}]"]
+        elif raw.startswith(("[", "(")):
+            constraints = [raw]
+        else:
+            constraints = []
+            for clause in raw.split(","):
+                match = re.fullmatch(r"\s*(>=|<=|>|<)?\s*([^\s,]+)\s*", clause)
+                if match is None:
+                    return False
+                operator, bound = match.groups()
+                constraints.append(
+                    {
+                        ">=": f"[{bound},)",
+                        ">": f"({bound},)",
+                        "<=": f"(,{bound}]",
+                        "<": f"(,{bound})",
+                        None: f"[{bound}]",
+                    }[operator]
+                )
+        # The Java parser preserves patch/update numbers and returns unknown
+        # for unsupported expressions. Unknown cannot satisfy a hard constraint.
+        return all(java_constraint_matches(bound, version) is True for bound in constraints)
 
     def _matches_range(self, version: str, raw_range: str) -> bool:
         if not raw_range.startswith(("[", "(")):

@@ -1009,7 +1009,8 @@ def test_the_unnarrowed_state_cannot_pair_a_passing_verdict_with_a_minority_scan
     )
 
     assert observation.state is ValidatorState.GREEN
-    assert observation.reason.startswith("JVM build execution validated.")
+    assert observation.reason.startswith("JVM compilation evidence observed.")
+    assert "Required command receipts determine task completion." in observation.reason
     assert "All expected build artifacts found" not in observation.reason
     assert "Module coverage: 1/26 built" in observation.reason
     assert "100%" not in observation.reason

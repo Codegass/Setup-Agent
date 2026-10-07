@@ -333,6 +333,38 @@ def test_public_requirement_matcher_uses_same_range_semantics_as_resolution():
     assert manager.matches_requirement("4.0.0", requirement) is False
 
 
+@pytest.mark.parametrize(("constraint", "accepted"), [("[8,9)", True), ("<=7", False)])
+def test_java_resolution_and_registration_share_legacy_version_semantics(constraint, accepted):
+    path = "/opt/jdk8/bin/java"
+    orchestrator = FakeToolchainOrchestrator({path: 'openjdk version "1.8.0_504"'})
+    orchestrator.publish_overlay(
+        {
+            "version": 1,
+            "tools": {
+                "java": {
+                    "active": path,
+                    "candidates": {path: {"executable": path, "version": "1.8.0_504"}},
+                }
+            },
+        }
+    )
+    requirement = ToolVersionRequirement.from_raw(constraint)
+    manager = ToolchainManager(orchestrator)
+    resolved = manager.resolve(
+        ToolchainSpec(name="java", executable="java", version_requirement=requirement)
+    )
+    assert (resolved is not None) is accepted
+    assert manager.matches_requirement("1.8.0_504", requirement, tool="java") is accepted
+
+
+def test_java_version_normalization_does_not_change_other_tool_versions():
+    manager = ToolchainManager(FakeToolchainOrchestrator())
+    requirement = ToolVersionRequirement.from_raw("[8,9)")
+    assert manager.matches_requirement("1.8.0_504", requirement, tool="maven") is False
+    assert manager.matches_requirement("1.8.0_504", requirement) is False
+    assert manager.matches_requirement("unknown", requirement, tool="java") is False
+
+
 def test_bare_resolution_inherits_observed_overlay_requirement():
     orchestrator = FakeToolchainOrchestrator(
         {

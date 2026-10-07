@@ -35,6 +35,84 @@ class AdvisorContextNeedsSplit(AdvisorContextUnavailable):
     """The protected source must be reviewed in multiple requests, never cut."""
 
 
+def select_advisor_sections(
+    sections: list[AdvisorSection], *, model: str
+) -> tuple[list[AdvisorSection], list[dict]]:
+    """Use caller-supplied fact projections before capacity-based packing.
+
+    No token target: irrelevant verbose originals do not return just because
+    the model has a large window. Required keep-policy sections are unchanged.
+    Originals and selection reasons remain inspectable in the source audit.
+    """
+    from dataclasses import replace
+
+    count, method = _counter(model)
+    selected, audit = [], []
+    for section in sections:
+        summary = section.summary if section.policy != "keep" else None
+        source_sha = hashlib.sha256(section.text.encode()).hexdigest()
+        ref = section.ref or f"sha256:{source_sha}"
+        view = section.text
+        if summary is not None:
+            view = f"[SELECTED SUMMARY/EXCERPT; source={ref}; full source archived]\n{summary}"
+        selected.append(replace(section, text=view, summary=None))
+        audit.append(
+            {
+                "name": section.name,
+                "source_ref": ref,
+                "source_sha256": source_sha,
+                "source_chars": len(section.text),
+                "rendered_chars": len(view),
+                "representation": "summary_or_excerpt" if summary is not None else "full",
+                "reason": (
+                    "structured facts or relevant log lines"
+                    if summary is not None
+                    else "no safe shorter projection"
+                ),
+                "estimated_source_tokens": count([{"role": "user", "content": section.text}]),
+                "estimated_selected_tokens": count([{"role": "user", "content": view}]),
+                "token_count_method": method,
+            }
+        )
+    return selected, audit
+
+
+def build_log_advisor_summary(header: str, output: str, *, succeeded: bool, facts: dict) -> str:
+    """Project build log noise only; never change execution or evidence bytes."""
+    # Dependency/transport failures need their transfer context. Do not hide
+    # it based on the same low-information lines that dominate healthy builds.
+    dependency_failure = not succeeded and re.search(
+        r"could not (?:resolve|transfer|find)|failed to (?:download|fetch)|"
+        r"PKIX|UnknownHost|connection (?:refused|reset)|timed? out|HTTP[^\n]*(?:401|403|404|429|50[0-9])",
+        output,
+        re.I,
+    )
+    if dependency_failure:
+        return header + "\n" + output
+    transfer = re.compile(r"^(?:\[INFO\]\s*)?(?:Downloading|Downloaded|Progress)(?:\s|:)")
+    lines = [line for line in output.replace("\r", "\n").splitlines() if not transfer.match(line)]
+    if succeeded:
+        # A successful invocation is not a successful task. Preserve warnings,
+        # errors and skip disclosures as well as structured receipt/test facts.
+        lines = [
+            line
+            for line in lines
+            if re.search(
+                r"\[ERROR\]|\[WARNING\]|\b(?:error|exception|failed|failure|skip\w*|unknown)\b|"
+                r"Tests run:|BUILD (?:SUCCESS|FAILURE)|Total time:",
+                line,
+                re.I,
+            )
+        ]
+    return (
+        header
+        + "\n"
+        + json.dumps(facts, sort_keys=True, ensure_ascii=False)
+        + "\n"
+        + "\n".join(lines)
+    )
+
+
 def _local_model_info(model: str) -> dict:
     # Do not invoke provider discovery, load HF tokenizers, or query a proxy.
     # Only remove an explicit OpenAI prefix; arbitrary deployment aliases are
@@ -212,6 +290,7 @@ def pack_advisor_context(
     max_output_tokens: int,
     context_window: int | None = None,
     summarizer: Callable | None = None,
+    reserved_input_tokens: int = 0,
 ) -> tuple[list[dict], dict]:
     """Rank, compact, recount, and deliver a view within the advisor's budget.
 
@@ -237,14 +316,17 @@ def pack_advisor_context(
         limit = 32_768 - max_output_tokens
         source = "unknown_window:32768_fallback_budget"
     margin = max(256, int(max(0, limit) * 0.05))
-    budget = max(0, limit - margin)
+    input_budget = max(0, limit - margin)
+    budget = max(0, input_budget - reserved_input_tokens)
     count, tokenizer = _counter(model)
     audit = {
         "model": model,
         "context_window": context_window,
         "catalog_max_input_tokens": input_limit,
         "budget_source": source,
-        "input_token_budget": budget,
+        "input_token_budget": input_budget,
+        "text_token_budget": budget,
+        "reserved_input_tokens": reserved_input_tokens,
         "reserved_output_tokens": max_output_tokens,
         "safety_margin_tokens": margin,
         "token_count_method": tokenizer,
@@ -473,7 +555,12 @@ def pack_advisor_contexts(**kwargs) -> list[tuple[list[dict], dict]]:
                     )
                     try:
                         pack_advisor_context(
-                            **{**kwargs, "required": [candidate], "optional": [], "summarizer": None}
+                            **{
+                                **kwargs,
+                                "required": [candidate],
+                                "optional": [],
+                                "summarizer": None,
+                            }
                         )
                     except AdvisorContextNeedsSplit:
                         pass

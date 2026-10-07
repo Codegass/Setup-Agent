@@ -21,6 +21,11 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.3'
+      - name: Install the optional code runtime for regression tests
+        run: npm ci --ignore-scripts --prefix src/sag/code_runtime
       - run: uv sync --extra dev
       - run: uv run python -m pytest -q
       - name: Type check the CI scope kernel

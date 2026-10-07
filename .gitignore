@@ -165,6 +165,15 @@ uv.lock
 # log
 /logs
 
+# Generated experiment archives and temporary work files. Keep scripts and
+# small versioned protocols in their source directories, not these snapshots.
+/output/
+/archives/
+/tmp/
+/.vite/
+/.playwright-cli/
+/src/sag/code_runtime/node_modules/
+
 # Claude Code
 Claude.md
 .claude

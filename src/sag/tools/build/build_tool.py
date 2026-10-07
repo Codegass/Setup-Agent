@@ -912,6 +912,12 @@ class BuildTool(BaseTool):
             # still assessed as a test invocation.
             materialized["_source_argv"] = list(source_argv)
             materialized["fail_at_end"] = False
+            if system == "maven":
+                # A complete invocation already names its launcher family.
+                # Wrapper discovery is only a default for action-based calls;
+                # it must not silently change an explicit mvn into ./mvnw.
+                declared_runner = shlex.split(command or source_command)[0]
+                materialized["use_wrapper"] = posixpath.basename(declared_runner) == "mvnw"
         effective_action = backend.effective_action(materialized)
         if source_argv is not None and system == "gradle":
             materialized["tasks"] = effective_action

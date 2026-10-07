@@ -39,6 +39,7 @@ class ReActPromptBuilder:
         repository_url: str | None,
         repository_ref: str | None = None,
         workflow_mode: str = "setup",
+        compact_setup_prompt: bool = False,
     ) -> str:
         """Build the system prompt sent with EVERY native request.
 
@@ -96,7 +97,8 @@ class ReActPromptBuilder:
             # the floor, not the ceiling: this block is what lets the model
             # consult BEFORE a redirect has to make it.
             # Prompt key: initial_system.advisor_guidance
-            parts.append(self.prompts.get("initial_system.advisor_guidance"))
+            if "advisor" in self.tools:
+                parts.append(self.prompts.get("initial_system.advisor_guidance"))
 
         context_part = f"""
 
@@ -116,17 +118,31 @@ Next Task: {context_info.get('next_task', 'No pending tasks')}
 Current Task: {context_info.get('task', 'Not specified')}
 Current Focus: {context_info.get('focus', 'Not specified')}
 """
+        if compact_setup_prompt and not is_run_task:
+            context_lines = [
+                f"{label}: {context_info[key]}"
+                for key, label in (
+                    ("goal", "Goal"),
+                    ("task", "Current Task"),
+                    ("focus", "Current Focus"),
+                    ("progress", "Progress"),
+                    ("next_task", "Next Task"),
+                )
+                if context_info.get(key)
+                not in (None, "", "unknown", "Not specified", "Not available", "No pending tasks")
+            ]
+            context_part = "\n".join(["CURRENT CONTEXT:", *context_lines]) if context_lines else ""
         parts.append(context_part.strip())
 
         if is_run_task:
             # Prompt key: initial_system.run_task_response_format
             parts.append(self.prompts.get("initial_system.run_task_response_format"))
-        else:
+        elif not compact_setup_prompt:
             # Prompt key: initial_system.response_format
             parts.append(self.prompts.get("initial_system.response_format"))
 
         # Add repository URL reminder if available
-        if repository_url and not is_run_task:
+        if repository_url and not is_run_task and not compact_setup_prompt:
             # Prompt key: initial_system.repository_url_reminder
             parts.append(
                 self.prompts.format(
@@ -139,7 +155,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         if is_run_task:
             # Prompt key: initial_system.run_task_completion_reminder
             parts.append(self.prompts.get("initial_system.run_task_completion_reminder"))
-        else:
+        elif not compact_setup_prompt:
             # Prompt key: initial_system.continuous_cycle_reminder
             parts.append(self.prompts.get("initial_system.continuous_cycle_reminder"))
 

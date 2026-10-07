@@ -74,6 +74,53 @@ def make_response(content="", tool_calls=None):
     )
 
 
+def test_advisor_read_turn_preserves_call_identity_and_bills_final_turn(monkeypatch):
+    import sag.agent.react_llm as module
+    from sag.agent.advisor_review import EVIDENCE_TOOLS
+
+    client = make_client()
+    requests = []
+    raw = '{"action": "read", "source_id": "e1"}'
+    responses = iter([
+        make_response(tool_calls=[SimpleNamespace(id="review-read-1", function=SimpleNamespace(
+            name="advisor_evidence", arguments=raw))]),
+        make_response(content="Recorded Java is 8; activate the required JDK."),
+    ])
+    def completion(**params):
+        requests.append(params)
+        return next(responses)
+    monkeypatch.setattr(module.litellm, "completion", completion)
+    messages = [{"role": "user", "content": "Review failure."}]
+    first = client.get_advisor_turn(messages, model="openai/gpt-5.4-mini", max_tokens=1000, tools=EVIDENCE_TOOLS)
+    assert first.tool_calls[0].id == "review-read-1"
+    assert client.last_advisor_receipt["tool_calls"][0]["raw_arguments"] == raw
+    assert requests[0]["tools"] == EVIDENCE_TOOLS and requests[0]["parallel_tool_calls"] is False
+    final = client.get_advisor_turn(messages, model="openai/gpt-5.4-mini", max_tokens=1000, tools=[])
+    assert final.text and not final.tool_calls and "tools" not in requests[1]
+    assert [c[2] for c in client.token_tracker.calls] == ["advisor_review", "advisor_review"]
+
+
+def test_schema_projection_tracks_the_actual_sealed_dispatch_policy():
+    from sag.agent.react_engine import ReActEngine
+
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.run_evidence_state = SimpleNamespace(sealed=False)
+    tools = {}
+    for name in ("phase", "report", "bash", "file_io", "search", "build", "advisor"):
+        tool = ExampleTool()
+        tool.name = name
+        tools[name] = tool
+    client = make_client(make_config(action_provider="openai"), tools)
+    client.tool_available = engine._tool_available
+    names = lambda: {
+        (s.get("function") or s)["name"] for s in client.build_tools_schema(ReactModelMode.ACTION)
+    }
+    assert names() == set(tools)
+    engine.run_evidence_state.sealed = True
+    assert names() == {"phase", "report"}
+    assert all(engine._tool_available(name) == (name in names()) for name in tools)
+
+
 @pytest.mark.parametrize("effort", [None, "low"])
 def test_advisor_reasoning_is_independent_and_receipt_names_returned_model(monkeypatch, effort):
     client = make_client(make_config(advisor_reasoning_effort=effort, gpt5_reasoning_effort="high"))

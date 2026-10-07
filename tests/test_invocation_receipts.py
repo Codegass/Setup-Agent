@@ -1086,7 +1086,9 @@ def test_record_invocation_accepts_a_prefrozen_receipt_id_for_settlement_replay(
         after={},
     )
 
-    assert metadata == {"receipt_id": "inv-maven-settlement-fixed"}
+    assert metadata["receipt_id"] == "inv-maven-settlement-fixed"
+    assert metadata["receipt_view_status"] == "available"
+    assert metadata["receipt_view"]["observed"]["argv"] == "./mvnw verify"
     assert receipts_written(execute.commands)[0]["receipt_id"] == ("inv-maven-settlement-fixed")
     assert receipts_written(execute.commands)[0]["run_id"] == "run-pytest"
 
@@ -1915,7 +1917,8 @@ def test_record_invocation_carries_the_gradle_sections_to_the_one_assembly_point
         gradle_row_disclosure=dict(GRADLE_DISCLOSURE),
     )
 
-    assert metadata == {"receipt_id": "inv-gradle-test-0004"}
+    assert metadata["receipt_id"] == "inv-gradle-test-0004"
+    assert metadata["receipt_view_status"] == "available"
     written = receipts_written(execute.commands)
     assert len(written) == 1
     assert written[0]["gradle_suite_summaries"]["suites"] == [GRADLE_SUITE]

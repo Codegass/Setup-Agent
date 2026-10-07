@@ -103,10 +103,10 @@ def test_setup_provider_failure_records_abort_naming_the_cause():
 def test_setup_iteration_exhaustion_records_abort_without_advancing():
     engine = _engine()
 
-    termination = engine.run_setup_loop("set up project", max_iterations=2)
+    termination = engine.run_setup_loop("set up project", max_iterations=1)
 
     assert termination.termination is RunTerminationStatus.ABORTED
-    assert engine.current_iteration == 2
+    assert engine.current_iteration == 1
     _assert_setup_abort(engine, "iteration budget exhausted")
 
 
@@ -241,9 +241,7 @@ def test_run_task_abnormal_exit_does_not_record_setup_abort():
 
 def test_run_task_plain_or_empty_text_is_not_completion():
     for text in ("I am still checking the result.", ""):
-        engine = _engine(
-            turn=NativeTurn(text=text, tool_calls=(), model_used="test-model")
-        )
+        engine = _engine(turn=NativeTurn(text=text, tool_calls=(), model_used="test-model"))
 
         succeeded = engine.run_react_loop(
             "perform one task",
@@ -272,8 +270,7 @@ def test_run_task_prefixed_first_turn_without_task_tool_evidence_is_not_completi
 
     assert succeeded is False
     assert any(
-        "no task tool evidence" in str(getattr(step, "content", ""))
-        for step in engine.steps
+        "no task tool evidence" in str(getattr(step, "content", "")) for step in engine.steps
     )
 
 
@@ -573,6 +570,4 @@ def test_run_task_interrupt_cleans_an_already_registered_detached_job(monkeypatc
 
     assert succeeded is False
     assert cleaned == [registered]
-    assert engine._termination_cleanup_results["job-registered"].code == (
-        "terminated_after_term"
-    )
+    assert engine._termination_cleanup_results["job-registered"].code == ("terminated_after_term")

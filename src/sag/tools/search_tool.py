@@ -7,6 +7,7 @@ WebSearchTool internals; file/job targets grep inside the container.
 
 import shlex
 import posixpath
+import json
 from typing import Any, Dict, Mapping, Optional
 
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
@@ -14,6 +15,7 @@ from sag.runtime.container_io import command_did_not_run
 
 from .base import BaseTool, ToolResult
 from .internal.build_utils import classify_detached_completion
+from .search_snippets import grep_line_page
 
 SEARCH_FAILED = "SEARCH_FAILED"
 
@@ -71,7 +73,9 @@ class SearchTool(BaseTool):
                 "for a ref id, omit pattern to read the stored output itself."
                 " Ref reads support zero-based start_line, exclusive end_line, column_offset "
                 "and max_chars; follow Next read to continue. Ref searches support "
-                "offset (matching lines to skip) and context_lines. "
+                "offset (matching lines to skip) and context_lines. File searches also support "
+                "offset, column_offset (next match within a long line), and max_chars; "
+                "long lines return labeled match excerpts with Next search arguments. "
                 "Use bash rg -n -C 3 or sed -n with returned container log paths."
             ),
         )
@@ -95,7 +99,8 @@ class SearchTool(BaseTool):
     ) -> ToolResult:
         target = (target or "").strip()
         if target.startswith("file:"):
-            return self._grep_container(target[5:], pattern, max_results, ignore_case=ignore_case)
+            return self._grep_container(target[5:], pattern, max_results, ignore_case=ignore_case,
+                                        offset=offset, column_offset=column_offset, max_chars=max_chars)
         if target.startswith("name:"):
             return self._find_by_name(target[5:], pattern, max_results)
         if target.startswith("job:"):
@@ -130,6 +135,8 @@ class SearchTool(BaseTool):
                 grep_pattern=pattern,
                 limit=max_results,
                 offset=offset,
+                column_offset=column_offset,
+                max_chars=max_chars,
                 context_lines=context_lines,
                 ignore_case=ignore_case,
                 show_line_numbers=True,
@@ -265,6 +272,9 @@ class SearchTool(BaseTool):
         max_results: int,
         *,
         ignore_case: bool = False,
+        offset: int = 0,
+        column_offset: int = 0,
+        max_chars: int = 20_000,
     ) -> ToolResult:
         """Grep inside the container, keeping "did not run" apart from "found nothing".
 
@@ -278,6 +288,9 @@ class SearchTool(BaseTool):
         """
 
         limit = max(1, int(max_results))
+        if offset < 0 or column_offset < 0 or max_chars < 1:
+            return self._search_failed(path, pattern, None, "Invalid search range")
+        read_limit = offset + limit
         quoted_path = shlex.quote(path)
         # Extended regex: plain grep is BRE, where `|` is a literal character,
         # so an alternation like `(^|/)build\.gradle$|(^|/)gradlew$` can never
@@ -294,8 +307,8 @@ class SearchTool(BaseTool):
         command = (
             "set -o pipefail; "
             f"if test -d {quoted_path}; then "
-            f"grep -rn{grep_flags} -e {quoted_pattern} -- {quoted_path} | head -{limit}; "
-            f"else grep -n{grep_flags} -e {quoted_pattern} -- {quoted_path} | head -{limit}; fi"
+            f"grep -rn{grep_flags} -e {quoted_pattern} -- {quoted_path} | head -{read_limit}; "
+            f"else grep -n{grep_flags} -e {quoted_pattern} -- {quoted_path} | head -{read_limit}; fi"
         )
         result = self.docker_orchestrator.execute_command(
             command, workdir=None, timeout=60, truncate_output=False
@@ -307,11 +320,30 @@ class SearchTool(BaseTool):
         if command_did_not_run(result):
             return self._search_failed(path, pattern, exit_code, diagnostic or stdout)
         if exit_code in (_GREP_MATCHED, _GREP_CAPPED_BY_HEAD):
-            lines = stdout.splitlines()[:limit]
-            capped = len(lines) >= limit
+            all_lines = stdout.splitlines()
+            lines = all_lines[offset:read_limit]
+            capped = len(all_lines) >= read_limit
+            try:
+                preview, continuation, locations = grep_line_page(
+                    lines, pattern, ignore_case=ignore_case, offset=offset,
+                    column_offset=column_offset, max_chars=max_chars)
+            except (ValueError, OSError, TimeoutError) as exc:
+                return self._search_failed(path, pattern, exit_code, f"Match excerpt unavailable: {exc}")
+            if continuation is None and capped:
+                continuation = {"offset": read_limit, "column_offset": 0}
+            if capped:
+                preview += f"\n... [capped at {limit} matching lines; more may exist]"
+            if continuation:
+                preview += "\nNext search: " + json.dumps({
+                    "target": f"file:{path}", "pattern": pattern, "max_results": limit,
+                    "ignore_case": ignore_case, "max_chars": min(max_chars, 100_000),
+                    **continuation,
+                }, ensure_ascii=False)
             return ToolResult.completed_success(
-                output="\n".join(lines)
-                + (f"\n... [capped at {limit} results; more may exist]" if capped else ""),
+                output=preview or "No further matching lines in the requested range.",
+                raw_output="\n".join(lines),
+                metadata={"output_page": True, "next": continuation,
+                          "match_locations": locations, "source_path": path},
                 facts={
                     "target": path,
                     "pattern": pattern,

@@ -29,6 +29,7 @@ SMALL = (
 LOCK = threading.Lock()
 STOP = threading.Event()
 MAX_SOURCE_PATCH_BYTES = 16 * 1024 * 1024
+REQUIREMENTS_PROTOCOL = "requirements-v2"
 ENV_ALIASES = {
     "thinking_max_tokens": "SAG_MAX_THINKING_TOKENS",
     "action_max_tokens": "SAG_MAX_ACTION_TOKENS",
@@ -42,6 +43,116 @@ def now() -> str:
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def requirements_protocol(manifest: dict) -> bool:
+    """Old manifests retain their original, explicitly narrower protocol."""
+    protocol = manifest.get("protocol")
+    if protocol not in (None, "legacy", REQUIREMENTS_PROTOCOL):
+        raise ValueError(f"Unsupported campaign protocol: {protocol}")
+    return protocol == REQUIREMENTS_PROTOCOL
+
+
+def requirements_preflight(manifest: dict, project: dict) -> dict | None:
+    """Freeze the task, CI target and sidecar before inspecting any container."""
+    if not requirements_protocol(manifest):
+        return None
+    from sag.agent.acceptance_task import load_acceptance_task
+    from sag.agent.ci_comparison import load_ci_target
+    from sag.benchmark.requirements import (
+        POLICY_VERSION, canonical_digest, load_requirements,
+        requirements_evidence_root, validate_ci_count_metadata,
+    )
+
+    if not re.fullmatch(r"[0-9a-f]{40}", str(project.get("sha", ""))):
+        raise ValueError("Formal campaign requires a full frozen project ref")
+    if project.get("acceptance_command"):
+        raise ValueError("Formal campaign uses the ordered task, not acceptance_command")
+    for file_key, hash_key in (
+        ("acceptance_task_file", "acceptance_task_sha256"),
+        ("target_file", "target_sha256"),
+        ("requirements_file", "requirements_file_sha256"),
+    ):
+        if not project.get(file_key) or not re.fullmatch(
+            r"[0-9a-f]{64}", str(project.get(hash_key, ""))
+        ):
+            raise ValueError(f"Formal campaign requires {file_key} and {hash_key}")
+        if digest(Path(project[file_key])) != project[hash_key]:
+            raise ValueError(f"Prepared {file_key} bytes changed")
+    task = load_acceptance_task(project["acceptance_task_file"])
+    target = load_ci_target(project["target_file"])
+    if (task.repo, task.sha) != (project.get("repo"), project["sha"]):
+        raise ValueError("Formal acceptance task subject differs")
+    if (target.record.repo, target.record.sha) != (task.repo, task.sha):
+        raise ValueError("Formal CI target subject differs")
+    if "matched_cell" in project and target.record.matched_cell != project["matched_cell"]:
+        raise ValueError("Frozen target cell changed")
+    spec = load_requirements(project["requirements_file"], task=task.model_dump(mode="json"))
+    if spec.get("annotation_completeness", {}).get("status") != "complete":
+        raise ValueError("Formal requirements annotation is not complete; metadata review required")
+    count_semantics = validate_ci_count_metadata(
+        spec, base=requirements_evidence_root(project["requirements_file"]), required=True)
+    if manifest.get("require_ci_count_comparability") is True and count_semantics["status"] != "available":
+        raise ValueError("Campaign requires source-verified CI count comparability")
+    protocol = {
+        "protocol": REQUIREMENTS_PROTOCOL,
+        "task_sha256": task.sha256,
+        "requirements_sha256": canonical_digest(spec),
+        "requirements_file_sha256": project["requirements_file_sha256"],
+        "policy_version": POLICY_VERSION,
+    }
+    prepared_identity = project.get("evaluation_protocol")
+    if prepared_identity is not None and prepared_identity != protocol:
+        raise ValueError("Prepared evaluation protocol changed")
+    return protocol
+
+
+def collected_protocol_mismatches(pin: Any, project: dict, protocol: dict | None) -> list[str]:
+    if protocol is None:
+        return []
+    config = pin.get("sanitized_config") if isinstance(pin, dict) else None
+    if not isinstance(config, dict):
+        return ["evaluation_protocol", "ci_target"]
+    mismatches = []
+    if config.get("evaluation_protocol") != protocol:
+        mismatches.append("evaluation_protocol")
+    target = config.get("ci_target")
+    expected = {
+        "record_sha256": project["target_sha256"],
+        "repo": project["repo"],
+        "sha": project["sha"],
+        "matched_cell": project.get("matched_cell"),
+    }
+    if not isinstance(target, dict) or any(target.get(k) != v for k, v in expected.items()):
+        mismatches.append("ci_target")
+    return mismatches
+
+
+def intervention_telemetry(result: dict, *, process_started: bool, process_finished: bool) -> dict:
+    """Report only channels the runner observes; never turn silence into total zero."""
+    events = []
+    if result.get("cancelled"):
+        events.append({"kind": "manual_cancel", "source": "campaign_signal_handler"})
+    observed = process_started and process_finished
+    return {
+        "schema_version": 2,
+        "run_id": result.get("run_id"),
+        "run_key": result["run_key"],
+        "source": "campaign_noninteractive_process_record",
+        "runner_sha256": digest(Path(__file__)),
+        "entrypoint": "sag project",
+        "observation_start": result.get("process_started_at"),
+        "observation_end": result.get("process_finished_at"),
+        "input_policy": {"stdin": "DEVNULL", "runner_control_input": "disabled"},
+        "controlled_channel_coverage": "complete" if observed else "unavailable",
+        "controlled_channel_interventions": len(events) if observed else None,
+        "external_intervention_coverage": "unavailable",
+        "external_intervention_limit": "Host or Docker edits outside this runner are not monitored",
+        "human_interventions": None,
+        "events": events,
+        "automatic_timeout": result.get("outer_timeout", False),
+        "autonomous_success_eligibility": "unavailable",
+    }
 
 
 def save(path: Path, value: Any) -> None:
@@ -186,6 +297,27 @@ def prepare(args: argparse.Namespace) -> dict:
             "files": verify_source(baseline, BASELINE_SHA),
         }
     projects = selected_projects(args.phase, reference, args.targets_dir.resolve())
+    protocol = getattr(args, "protocol", "legacy")
+    if protocol == REQUIREMENTS_PROTOCOL:
+        if args.phase == "paired":
+            raise ValueError("The frozen historical paired baseline does not implement requirements-v2")
+        tasks_dir = getattr(args, "acceptance_tasks_dir", None)
+        requirements_dir = getattr(args, "requirements_dir", None)
+        if tasks_dir is None or requirements_dir is None:
+            raise ValueError("Formal preparation requires task and requirements directories")
+        for project in projects:
+            task_file = tasks_dir.resolve() / f"{project['seat']}.json"
+            requirements_file = requirements_dir.resolve() / f"{project['seat']}.json"
+            project.update(
+                target_file=project["target_source"],
+                acceptance_task_file=str(task_file),
+                acceptance_task_sha256=digest(task_file),
+                requirements_file=str(requirements_file),
+                requirements_file_sha256=digest(requirements_file),
+            )
+            project["evaluation_protocol"] = requirements_preflight(
+                {"protocol": protocol}, project
+            )
     image = reference["docker_image_id"]
     image_info = json.loads(
         command(["docker", "image", "inspect", "--format", "{{json .}}", image])
@@ -215,6 +347,7 @@ def prepare(args: argparse.Namespace) -> dict:
         if inspect_container(project["container"]) is not None:
             raise RuntimeError(f"Refusing existing container {project['container']}")
     manifest = {
+        "protocol": protocol,
         "campaign": out.name,
         "created_at": now(),
         "phase": args.phase,
@@ -236,7 +369,11 @@ def prepare(args: argparse.Namespace) -> dict:
         "evaluation": {
             "local_completion": "original task scope and execution completion",
             "ci": "missing target/scope/authority unscored; no post-run cell substitution",
-            "baseline": "no --ci-target-file; no production CI comparison result",
+            "baseline": (
+                "Every formal arm receives the same frozen task, CI target and requirements"
+                if protocol == REQUIREMENTS_PROTOCOL
+                else "no --ci-target-file; no production CI comparison result"
+            ),
             "runs_per_subject_variant": 1,
             "efficiency_claim": "exploratory pair only, not a stable general speedup estimate",
         },
@@ -245,12 +382,26 @@ def prepare(args: argparse.Namespace) -> dict:
         "python_environment": str(args.python_environment.resolve()),
         "projects": projects,
     }
+    intervention_file = getattr(args, "intervention_protocol_file", None)
+    if intervention_file is not None:
+        from sag.benchmark.intervention_protocol import validate_protocol
+
+        manifest["intervention_protocol"] = validate_protocol(json.loads(intervention_file.read_bytes()))
     out.mkdir(parents=True)
     for project in projects:
         dest = out / "targets" / f"{project['run_key']}.json"
         dest.parent.mkdir(exist_ok=True)
         shutil.copyfile(project["target_source"], dest)
         project["target_file"] = str(dest)
+        if protocol == REQUIREMENTS_PROTOCOL:
+            from sag.benchmark.requirements import copy_ci_count_sources
+            copy_ci_count_sources(project["requirements_file"], out)
+            for key, child in (("acceptance_task_file", "tasks"), ("requirements_file", "requirements")):
+                dest = out / child / f"{project['run_key']}.json"
+                dest.parent.mkdir(exist_ok=True)
+                shutil.copyfile(project[key], dest)
+                project[key] = str(dest)
+            requirements_preflight(manifest, project)
     for variant, identity in sources.items():
         command(
             [
@@ -269,7 +420,11 @@ def prepare(args: argparse.Namespace) -> dict:
         f"# {out.name}\n\nPrepared {manifest['created_at']}; phase {args.phase}.\n\n"
         "The manifest fixes both source revisions, each target byte digest and cell, base image, model parameters, budgets, resources and ordering before execution. All failed, partial, timeout and unavailable outcomes are retained. Existing result files are returned without rerunning. An incomplete attempt directory is a review boundary. Only newly observed containers whose project label, creation time and image match this attempt may be stopped.\n\n"
         f"Cache: {manifest['cache_policy']}.\n\nJDK: {manifest['jdk_policy']}.\n\n"
-        "The baseline cannot publish the new production CI comparison; this is recorded explicitly. Separate corrected historical labels from newly completed tasks. The independent Jenkins control is a changed task and is excluded from original 23-project progress. No efficiency claim is justified by one pair.\n"
+        + (
+            "The requirements-v2 protocol passes and verifies all three frozen inputs for every arm. Requirements with pending metadata review cannot start a formal attempt. Controlled process input is disabled; external host and Docker intervention coverage remains unavailable, so the runner does not claim an all-channel human-intervention zero.\n"
+            if protocol == REQUIREMENTS_PROTOCOL
+            else "The baseline cannot publish the new production CI comparison; this is recorded explicitly. Separate corrected historical labels from newly completed tasks. The independent Jenkins control is a changed task and is excluded from original 23-project progress. No efficiency claim is justified by one pair.\n"
+        )
     )
     return manifest
 
@@ -316,6 +471,13 @@ def runtime_environment(manifest: dict, project: dict) -> dict[str, str]:
 
 
 def cli_command(manifest: dict, project: dict) -> list[str]:
+    formal = requirements_protocol(manifest)
+    if formal:
+        required = ("acceptance_task_file", "target_file", "requirements_file")
+        if any(not project.get(key) for key in required):
+            raise ValueError("Formal command requires acceptance task, CI target and requirements")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(project.get("sha", ""))):
+            raise ValueError("Formal command requires a full frozen project ref")
     source = manifest["sources"][project["variant"]]["path"]
     argv = [
         shutil.which("uv") or "uv",
@@ -337,12 +499,14 @@ def cli_command(manifest: dict, project: dict) -> list[str]:
     ]
     if project.get("goal"):
         argv.extend(["--goal", project["goal"]])
-    if project["variant"] == "candidate":
+    if formal or project["variant"] == "candidate":
         argv.extend(["--ci-target-file", project["target_file"]])
         if project.get("acceptance_command"):
             argv.extend(["--acceptance-command", project["acceptance_command"]])
         if project.get("acceptance_task_file"):
             argv.extend(["--acceptance-task-file", project["acceptance_task_file"]])
+        if formal:
+            argv.extend(["--requirements-file", project["requirements_file"]])
     return argv
 
 
@@ -756,13 +920,45 @@ def stop_process(process: subprocess.Popen) -> None:
             continue
 
 
+def configuration_failure(out: Path, manifest: dict, project: dict, exc: Exception) -> dict:
+    """A frozen slot stays in the denominator even when it cannot be dispatched."""
+    result = {
+        "run_key": project["run_key"],
+        "repo": project.get("repo"),
+        "target_sha": project.get("sha"),
+        "variant": project.get("variant"),
+        "protocol": manifest.get("protocol"),
+        "status": "unavailable",
+        "authority_ok": False,
+        "dispatched": False,
+        "configuration_error": f"{type(exc).__name__}: {exc}",
+        "planned_slot_retained": True,
+        "finished_at": now(),
+    }
+    directory = out / "runs" / project["run_key"]
+    if directory.exists():
+        raise RuntimeError("Protocol preflight failed for an existing attempt; review before reuse") from exc
+    save(directory / "result.json", result)
+    event(out, "configuration_unavailable", run_key=project["run_key"], error=result["configuration_error"])
+    return result
+
+
 def run_one(out: Path, manifest: dict, project: dict) -> dict:
+    try:
+        protocol = requirements_preflight(manifest, project)
+        intervention_policy = manifest.get("intervention_protocol")
+        if intervention_policy is not None:
+            from sag.benchmark.intervention_protocol import validate_protocol
+
+            validate_protocol(intervention_policy)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return configuration_failure(out, manifest, project, exc)
     task_hash = None
     task_pin = None
     if project.get("acceptance_task_file"):
         from sag.agent.acceptance_task import load_acceptance_task
 
-        if project["variant"] != "candidate":
+        if project["variant"] != "candidate" and protocol is None:
             raise ValueError("The baseline does not support a required task file")
         task_path = Path(project["acceptance_task_file"])
         task_hash = digest(task_path)
@@ -787,6 +983,14 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
             "target_record_file_sha256": project["target_sha256"],
             "acceptance_task_file_sha256": task_hash,
         }
+        if protocol is not None:
+            expected["evaluation_protocol"] = protocol
+        if intervention_policy is not None:
+            from sag.benchmark.requirements import canonical_digest
+
+            expected["intervention_protocol_sha256"] = canonical_digest(intervention_policy)
+        elif previous.get("intervention_protocol_sha256") is not None:
+            raise RuntimeError("Existing result used a different intervention protocol")
         if any(previous.get(key) != value for key, value in expected.items()):
             raise RuntimeError("Existing result does not belong to this prepared attempt")
         return previous
@@ -817,6 +1021,28 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
         "production_ci_result_supported": project["variant"] == "candidate",
         "authority_ok": False,
     }
+    if protocol is not None:
+        from sag.benchmark.requirements import copy_ci_count_sources
+        copy_ci_count_sources(project["requirements_file"], directory)
+        result.update(
+            protocol=REQUIREMENTS_PROTOCOL,
+            evaluation_protocol=protocol,
+            production_ci_result_supported=True,
+        )
+        for file_key, expected_digest, filename, flag in (
+            ("target_file", project["target_sha256"], "ci-target.json", "--ci-target-file"),
+            ("requirements_file", project["requirements_file_sha256"], "requirements.json", "--requirements-file"),
+        ):
+            archived = directory / filename
+            shutil.copyfile(project[file_key], archived)
+            if digest(archived) != expected_digest:
+                raise RuntimeError(f"{file_key} changed during archival")
+            flag_index = result["command"].index(flag)
+            result["command"][flag_index + 1] = str(archived)
+    if intervention_policy is not None:
+        from sag.benchmark.requirements import canonical_digest
+
+        result["intervention_protocol_sha256"] = canonical_digest(intervention_policy)
     if task_hash is not None:
         result["acceptance_task_file_sha256"] = task_hash
         shutil.copyfile(project["acceptance_task_file"], directory / "acceptance-task.json")
@@ -830,22 +1056,49 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
     event(out, "started", run_key=project["run_key"], container=project["container"])
     container_id = None
     process = None
+    process_tick = None
+    intervention_ledger = None
+
+    def close_intervention_ledger():
+        if intervention_ledger is not None:
+            from sag.benchmark.intervention_protocol import close
+
+            try:
+                close(intervention_ledger, result, process_started=process is not None,
+                      process_finished=process is not None and process.poll() is not None)
+            except Exception as exc:
+                result["intervention_protocol_error"] = f"{type(exc).__name__}: {exc}"
+
     try:
+        if intervention_policy is not None:
+            from sag.benchmark.intervention_protocol import initialize
+
+            intervention_ledger = directory / "intervention-ledger"
+            initialize(intervention_ledger, policy=intervention_policy,
+                       run_key=result["run_key"], runner_file=Path(__file__), manifest=manifest)
         save(
             directory / "effective-config.json",
             effective_config(manifest, project, environment, directory),
         )
         with (directory / "console.log").open("wb") as log:
+            result["process_started_at"] = now()
+            process_tick = time.monotonic()
             process = subprocess.Popen(
                 result["command"],
                 cwd=directory,
                 env=environment,
+                stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            result["process_id"] = process.pid
             save(
                 directory / "process.json", {"pid": process.pid, "started_at": result["started_at"]}
+            )
+            save(
+                directory / "intervention-telemetry.json",
+                intervention_telemetry(result, process_started=True, process_finished=False),
             )
             while process.poll() is None:
                 if container_id is None:
@@ -871,6 +1124,11 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
                     break
                 time.sleep(2)
             result["exit_code"] = process.returncode
+            result["process_finished_at"] = now()
+            result["process_seconds"] = round(time.monotonic() - process_tick, 3)
+            if STOP.is_set():
+                result["cancelled"] = True
+            close_intervention_ledger()
         verify_source(source, identity["sha"], identity["files"])
         sessions = sorted((directory / "logs").glob("session_*"))
         result["sessions"] = [str(path.relative_to(out)) for path in sessions]
@@ -916,6 +1174,7 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
                     or (pin.get("sanitized_config") or {}).get("acceptance_task") != task_pin
                 ):
                     mismatches.append("acceptance_task")
+                mismatches.extend(collected_protocol_mismatches(pin, project, protocol))
                 if mismatches:
                     raise RuntimeError(
                         "Collected run pin differs from prepared values: " + ", ".join(mismatches)
@@ -936,7 +1195,17 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
         if process is not None:
             stop_process(process)
             result["exit_code"] = process.returncode
+            # Collection can fail after the process and its intervention ledger
+            # are already closed. Preserve that observed execution window;
+            # collector/archive time is not agent execution time.
+            if "process_finished_at" not in result:
+                result["process_finished_at"] = now()
+            if "process_seconds" not in result:
+                result["process_seconds"] = round(time.monotonic() - process_tick, 3)
+            if STOP.is_set():
+                result["cancelled"] = True
     finally:
+        close_intervention_ledger()
         try:
             if container_id is None:
                 data = inspect_container(project["container"])
@@ -961,6 +1230,33 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
             result["archive_error"] = f"{type(exc).__name__}: {exc}"
             result["evidence_archive_complete"] = False
         result.update(finished_at=now(), seconds=round(time.monotonic() - started, 2))
+        telemetry = intervention_telemetry(
+            result, process_started=process is not None,
+            process_finished=process is not None and process.poll() is not None,
+        )
+        if intervention_ledger is not None:
+            from sag.benchmark.intervention_protocol import summary
+
+            try:
+                telemetry.update(summary(intervention_ledger, result))
+                telemetry["autonomous_success_eligibility"] = "protocol_observed" if telemetry["coverage"] == "complete" else "unavailable"
+            except Exception as exc:
+                telemetry["protocol_error"] = f"{type(exc).__name__}: {exc}"
+        save(directory / "intervention-telemetry.json", telemetry)
+        result["intervention_telemetry_sha256"] = digest(directory / "intervention-telemetry.json")
+        if protocol is not None:
+            try:
+                from sag.benchmark.campaign_telemetry import finalize_campaign_analysis
+
+                sessions = sorted((directory / "logs").glob("session_*"))
+                if len(sessions) != 1:
+                    raise ValueError("Expected one host session for requirements analysis")
+                result["requirements_analysis"] = finalize_campaign_analysis(
+                    sessions[0], result, runner_file=Path(__file__),
+                    intervention_file=directory / "intervention-telemetry.json",
+                )
+            except Exception as exc:
+                result["requirements_analysis"] = {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
         save(result_path, result)
         event(
             out,
@@ -978,12 +1274,19 @@ def main() -> None:
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--prepare", action="store_true")
     action.add_argument("--run", action="store_true")
+    action.add_argument("--record-intervention", metavar="RUN_KEY")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--expected-sha")
     parser.add_argument("--baseline-source", type=Path)
     parser.add_argument("--baseline-sha", default=BASELINE_SHA)
     parser.add_argument("--targets-dir", type=Path)
+    parser.add_argument("--protocol", choices=("legacy", REQUIREMENTS_PROTOCOL), default="legacy")
+    parser.add_argument("--acceptance-tasks-dir", type=Path)
+    parser.add_argument("--requirements-dir", type=Path)
+    parser.add_argument("--intervention-protocol-file", type=Path)
+    parser.add_argument("--intervention-kind", choices=("guidance", "manual_edit", "environment_change", "manual_restore", "manual_cancel", "unknown"))
+    parser.add_argument("--intervention-detail")
     parser.add_argument("--phase", choices=("paired", "23", "official-control"), default="paired")
     parser.add_argument("--reference-manifest", type=Path, default=REFERENCE)
     parser.add_argument("--python-environment", type=Path, default=ROOT / ".venv")
@@ -999,6 +1302,17 @@ def main() -> None:
         return
     out = safe_output(args.out)
     manifest = load_manifest(out)
+    if args.record_intervention:
+        from sag.benchmark.intervention_protocol import record_event
+
+        if args.record_intervention not in {p["run_key"] for p in manifest["projects"]}:
+            parser.error("--record-intervention must name a prepared run key")
+        if not args.intervention_kind or not args.intervention_detail:
+            parser.error("Recording an intervention requires its kind and description")
+        recorded = record_event(out / "runs" / args.record_intervention / "intervention-ledger",
+                                kind=args.intervention_kind, detail=args.intervention_detail)
+        print(json.dumps(recorded))
+        return
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: STOP.set())
     chosen = set(args.only or [project["run_key"] for project in manifest["projects"]])

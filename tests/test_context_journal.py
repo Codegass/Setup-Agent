@@ -126,3 +126,27 @@ def test_engine_journals_nothing_for_ledgerless_iterations():
     assert len(recs) == 1
     assert "ledger_text" not in recs[0]
     assert recs[0]["segments"]["ledger"] == 0
+
+
+def test_request_snapshot_survives_phase_reset_and_keeps_next_intro_dirty():
+    from types import SimpleNamespace
+    engine, orch = _engine_for_journal()
+    engine.phase_machine = SimpleNamespace(current_phase="build")
+    engine._journal_intro_dirty = True
+    old_intro = engine.steps[0].content
+    messages = [{"role": "user", "content": old_intro}]
+    engine._capture_request_context(messages)
+    engine.steps = [SimpleNamespace(content="TEST INTRO")]
+    engine.phase_machine.current_phase = "test"
+    engine._journal_intro_dirty = True
+    engine._native_request_receipts = [{"request_id": "attempt1", "status": "error"},
+                                       {"request_id": "attempt2", "response_id": "resp2", "status": "returned"}]
+    engine._record_context_journal("NEXT LEDGER", n_compacted=10, added=3, total_chars=99999)
+    record = _journal_payloads(orch)[0]
+    assert record["phase"] == record["request_phase"] == "build"
+    assert record["next_phase"] == "test"
+    assert record["intro_text"] == old_intro
+    assert record["segments"]["ledger"] == 0
+    assert record["total_chars"] == engine._native_message_chars(messages)
+    assert record["requests"][-1]["response_id"] == "resp2"
+    assert engine._journal_intro_dirty is True

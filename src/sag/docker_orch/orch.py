@@ -2757,6 +2757,13 @@ class DockerOrchestrator:
             ],
         }
 
+        if self.config.docker_memory_limit_bytes is not None:
+            config["mem_limit"] = self.config.docker_memory_limit_bytes
+            # Equal RAM and combined RAM/swap limits disable additional swap.
+            config["memswap_limit"] = self.config.docker_memory_limit_bytes
+        if self.config.docker_cpu_limit is not None:
+            config["nano_cpus"] = int(self.config.docker_cpu_limit * 1_000_000_000)
+
         return config
 
     def _create_volume(self) -> bool:

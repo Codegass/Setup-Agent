@@ -10,6 +10,8 @@ from sag.agent.advisor_context import (
     AdvisorSection,
     pack_advisor_context,
     pack_advisor_contexts,
+    build_log_advisor_summary,
+    select_advisor_sections,
 )
 
 
@@ -50,6 +52,170 @@ def test_model_budget_preserves_task_and_whole_call_result_pair():
     assert exchange.text in large[1]["content"]
     assert sa["sections"][-1]["status"] == "summary"
     assert sa["estimated_input_tokens"] <= sa["input_token_budget"]
+
+
+def test_relevant_success_view_does_not_grow_with_unrelated_downloads():
+    # Transfer syntax is from archived DbUtils/Gson Maven output. Synthetic
+    # repetitions vary noise volume, not the receipt or actual task evidence.
+    header = json.dumps({"producer_execution_id": "build-1", "output_ref": "output_build"})
+    footer = "[INFO] Tests run: 523, Failures: 0, Errors: 0, Skipped: 0\n[INFO] BUILD SUCCESS"
+    facts = {"receipt_id": "inv-build-1", "exit_code": 0}
+    views = []
+    for repetitions in (1, 2000):
+        output = (
+            "Downloaded from central: https://repo.maven.apache.org/maven2/public.jar\n"
+            * repetitions
+            + footer
+        )
+        summary = build_log_advisor_summary(header, output, succeeded=True, facts=facts)
+        selected, audit = select_advisor_sections(
+            [
+                AdvisorSection(
+                    "build log", header + "\n" + output, ref="output_build", summary=summary
+                )
+            ],
+            model="large",
+        )
+        messages, packed = pack(context_window=100000, optional=selected)
+        views.append(messages)
+        assert "inv-build-1" in messages[1]["content"] and "523" in messages[1]["content"]
+        assert "Downloaded from central" not in messages[1]["content"]
+        assert audit[0]["source_ref"] == "output_build"
+        assert audit[0]["source_chars"] > audit[0]["rendered_chars"] if repetitions > 1 else True
+        assert packed["estimated_input_tokens"] <= packed["input_token_budget"]
+    assert views[0] == views[1]
+
+
+def test_dependency_failure_keeps_transfer_context_and_error():
+    output = (
+        "Downloading from central: https://repo.maven.apache.org/maven2/a.jar\n"
+        "[ERROR] Could not transfer artifact a: connection reset\n"
+    )
+    summary = build_log_advisor_summary("producer=build-1", output, succeeded=False, facts={})
+    assert output in summary
+
+
+def test_success_projection_preserves_warnings_skips_and_unknowns():
+    output = (
+        "[WARNING] Missing artifact\n[INFO] Tests are skipped.\n"
+        "[ERROR] Child result unknown\n[INFO] BUILD SUCCESS"
+    )
+    summary = build_log_advisor_summary(
+        "producer=build-1", output, succeeded=True, facts={"receipt_id": "inv-1"}
+    )
+    assert output in summary
+
+
+def test_relevance_selection_never_summarizes_protected_constraints():
+    section = AdvisorSection(
+        "TASK",
+        "JDK 17; mvn -Pci verify; tracked clean",
+        policy="keep",
+        summary="omitted constraints",
+    )
+    selected, audit = select_advisor_sections([section], model="small")
+    assert selected[0].text == section.text
+    assert audit[0]["representation"] == "full"
+
+
+@pytest.mark.parametrize(
+    ("producer", "has_receipt"), [("maven", True), ("bash", True), ("bash", False)]
+)
+def test_relevant_selection_reaches_the_actual_advisor_request_and_archives_sources(
+    tmp_path, producer, has_receipt
+):
+    from sag.agent.evidence_state import RunEvidenceState, StateScope
+    from sag.agent.output_storage import OutputStorageManager, attach_durable_output_ref
+    from sag.evidence import TestStats
+    from sag.tools.base import ToolResult
+    from tests.test_advisor_tool import _advisor_engine
+
+    engine = _advisor_engine(phase="test")
+    engine.config.advisor_context_selection = "relevant"
+    engine.config.advisor_context_window = 65536
+    engine.config.advisor_max_tokens = 2048
+    engine.output_storage = OutputStorageManager(tmp_path / "contexts")
+    engine.control_event_sink = SimpleNamespace(path=tmp_path / "control_events.jsonl")
+    engine.run_evidence_state = RunEvidenceState(run_id="advisor-selection")
+    engine._executor_task_prompt = "Build and test with JDK 17; preserve the pinned commands."
+    engine._executor_base_system_prompt = (
+        "Actor lifecycle protocol\n\n" + engine._executor_task_prompt
+    )
+    raw = "Downloaded from central: https://repo.maven.apache.org/maven2/a.jar\n" * 2000
+    raw += "[INFO] Tests run: 523, Failures: 0, Errors: 0, Skipped: 0\n[INFO] BUILD SUCCESS"
+    result = ToolResult.completed_success(
+        output=raw,
+        test_stats=TestStats(executed=523, passed=523, failed=0, errors=0, skipped=0),
+        metadata={
+            "receipt_id": "inv-build-1",
+            "system": "maven",
+            "command": "mvn clean test",
+            "exit_code": 0,
+        },
+    )
+    if not has_receipt:
+        result.metadata.pop("receipt_id")
+    result = attach_durable_output_ref(
+        result, engine.output_storage, task_id="build", tool_name=producer, action="test"
+    )
+    engine.run_evidence_state.ingest_tool_result(
+        StateScope.ARTIFACTS, producer, result, execution_id="build-1", source_phase="build"
+    )
+    before = engine.run_evidence_state.model_dump_json()
+    advice = engine.consult_advisor()
+    assert advice.metadata["advisor"] == "advice"
+    content = engine.llm_client.calls[0]["messages"][1]["content"]
+    assert "523" in content and "JDK 17" in content
+    if has_receipt:
+        assert "inv-build-1" in content
+        assert "Downloaded from central" not in content
+    else:
+        # Shell output without a runner receipt may be a probe or a file read.
+        # It must not inherit the build-log projection from a command substring.
+        assert "Downloaded from central" in content
+    assert "QUOTED EXECUTOR FRAMEWORK" not in content
+    assert engine.run_evidence_state.model_dump_json() == before
+    audit = engine.advisor_telemetry["calls"][0]["context"]
+    assert audit["selection_mode"] == "relevant" and audit["selection_source_ref"]
+    assert any(s["representation"] == "omitted" for s in audit["selection"])
+    source = engine.output_storage.retrieve_output(audit["selection_source_ref"])
+    assert "Downloaded from central" in source
+
+
+def test_relevant_capabilities_preserve_tool_purpose_and_receipt_contract(tmp_path):
+    from sag.tools.bash import BashTool
+    from sag.tools.build.build_tool import BuildTool
+    from tests.test_advisor_tool import _advisor_engine
+
+    engine = _advisor_engine(phase="build")
+    engine.config.advisor_context_selection = "relevant"
+    engine.config.advisor_context_window = 65536
+    engine.control_event_sink = SimpleNamespace(path=tmp_path / "control_events.jsonl")
+    tools = [BuildTool(None), BashTool()]
+    engine.llm_client.build_tools_schema = lambda _mode: [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.get_parameter_schema(),
+            },
+        }
+        for tool in tools
+    ]
+    result = engine.consult_advisor()
+    assert result.metadata["advisor"] == "advice"
+    content = engine.llm_client.calls[0]["messages"][1]["content"]
+    capability_text = content.split("=== EXECUTOR CAPABILITIES (not callable by advisor) ===\n", 1)[
+        1
+    ].split("\n\n===", 1)[0]
+    capabilities = {item["name"]: item for item in json.loads(capability_text)}
+    # Names and parameter types alone do not explain which tool produces the
+    # evidence the advisor is asking for. Use the current tool-owned contract.
+    assert "durable invocation receipt" in capabilities["build"]["description"]
+    for tool in tools:
+        assert capabilities[tool.name]["description"] == tool.description
+    assert "EXECUTOR TOOL SCHEMA" not in content
 
 
 def test_configured_window_reserves_output_and_margin():

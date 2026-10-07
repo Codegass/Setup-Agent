@@ -10,6 +10,7 @@ scheduler in Plan 2 Task 8.
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -59,6 +60,8 @@ class ReactLLMClient:
         logger=logger,
         trace_context: Optional[Callable[[], dict[str, Any]]] = None,
         repair_context_provider: Optional[Callable[[], Any]] = None,
+        tool_available: Optional[Callable[[str], bool]] = None,
+        request_ledger: Any = None,
     ):
         self.config = config
         self.tools = tools
@@ -66,7 +69,10 @@ class ReactLLMClient:
         self.logger = logger
         self.trace_context = trace_context
         self.repair_context_provider = repair_context_provider
+        self.tool_available = tool_available
+        self.request_ledger = request_ledger
         self.last_advisor_receipt: dict[str, Any] = {}
+        self.last_actor_receipt: dict[str, Any] = {}
         self._capability_cache: dict[ReactModelMode, ReactModelCapabilities] = {}
 
     def setup(self) -> None:
@@ -138,6 +144,8 @@ class ReactLLMClient:
         tools_schema = []
 
         for tool in self.tools.values():
+            if self.tool_available is not None and not self.tool_available(tool.name):
+                continue
             schema = tool.get_parameter_schema()
             schema = self._repair_aware_schema(tool.name, schema)
 
@@ -229,11 +237,7 @@ class ReactLLMClient:
                     "items": {
                         "type": "string",
                         "maxLength": 256,
-                        **(
-                            {"enum": schema_observations}
-                            if schema_observations
-                            else {}
-                        ),
+                        **({"enum": schema_observations} if schema_observations else {}),
                     },
                     "minItems": 1,
                     "maxItems": 64,
@@ -274,7 +278,7 @@ class ReactLLMClient:
         capabilities = self.capabilities_for(ReactModelMode.ACTION)
         params = self._build_native_request_params(messages, capabilities, include_tools)
         try:
-            response = litellm.completion(**params)
+            response = self._completion(params, role="actor")
         except Exception as exc:
             # Logged, never swallowed: the loop turns a provider failure into a
             # typed abort, which a None return could not express.
@@ -304,6 +308,21 @@ class ReactLLMClient:
         "proceed with your best judgment" result, because a broken advisor must
         degrade to Plan-2 behavior rather than abort the run.
         """
+        response = self._advisor_response(messages, model=model, max_tokens=max_tokens)
+        return getattr(response.choices[0].message, "content", None) or ""
+
+    def get_advisor_turn(self, messages, *, model, max_tokens, tools) -> NativeTurn:
+        """A reviewer turn with an explicit, read-only tool allowlist supplied by the harness."""
+        response = self._advisor_response(messages, model=model, max_tokens=max_tokens, tools=tools)
+        message = response.choices[0].message
+        return NativeTurn(
+            text=getattr(message, "content", None) or "",
+            tool_calls=tuple(self._native_tool_call(call, i) for i, call in enumerate(
+                getattr(message, "tool_calls", None) or ())),
+            model_used=getattr(response, "model", None) or model,
+        )
+
+    def _advisor_response(self, messages, *, model, max_tokens, tools=None):
         params: dict[str, Any] = {
             "model": model,
             "messages": list(messages),
@@ -316,14 +335,19 @@ class ReactLLMClient:
         effort = getattr(self.config, "advisor_reasoning_effort", None)
         if effort is not None:
             params["reasoning_effort"] = effort
+        if tools:
+            params["tools"] = tools
+            params["tool_choice"] = "auto"
+            params["parallel_tool_calls"] = False
         self.last_advisor_receipt = {}
         self._add_ollama_api_base(params, model)
         try:
-            response = litellm.completion(**params)
+            response = self._completion(params, role="advisor")
         except Exception as exc:
             self.last_advisor_receipt = {"error_type": type(exc).__name__}
             raise
-        self._track_advisor_usage(response, model)
+        # Every retrieval turn is billable, not just the final prose answer.
+        self._track_advisor_usage(response, model, request_type=("advisor_review" if tools is not None else "advisor"))
         choice = response.choices[0]
         content = getattr(choice.message, "content", None) or ""
         usage = getattr(response, "usage", None)
@@ -333,8 +357,13 @@ class ReactLLMClient:
             "finish_reason": getattr(choice, "finish_reason", None),
             "usage": usage.model_dump(mode="json") if hasattr(usage, "model_dump") else usage,
             "content": content,
+            **({"tool_calls": [
+                {"id": call.id, "name": call.name, "arguments": call.arguments, "raw_arguments": call.raw_arguments}
+                for i, raw in enumerate(getattr(choice.message, "tool_calls", None) or ())
+                for call in [self._native_tool_call(raw, i)]
+            ]} if tools is not None else {}),
         }
-        return content
+        return response
 
     def summarize_advisor_context(self, messages, *, max_tokens: int) -> dict:
         """Use the executor model without tools; account separately from advice."""
@@ -350,7 +379,7 @@ class ReactLLMClient:
         if self.config.is_gpt5_model("action"):
             params["reasoning_effort"] = self.config.gpt5_reasoning_effort
         self._add_ollama_api_base(params, model)
-        response = litellm.completion(**params)
+        response = self._completion(params, role="summary")
         if self.token_tracker is not None:
             try:
                 self.token_tracker.track_token_usage(response, model, "advisor_compression")
@@ -366,12 +395,61 @@ class ReactLLMClient:
             "content": getattr(choice.message, "content", None) or "",
         }
 
-    def _track_advisor_usage(self, response: Any, model: str) -> None:
+    def _completion(self, params, *, role):
+        """Account at the harness boundary without changing provider parameters."""
+        ledger = self.request_ledger
+        request_id = None
+        messages_sha256 = hashlib.sha256(json.dumps(
+            params.get("messages", []), sort_keys=True, ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()).hexdigest()
+        trace = self._get_trace_context()
+        if ledger is not None:
+            try:
+                request_id = ledger.begin(
+                    role=role,
+                    model=params["model"],
+                    iteration=getattr(self.token_tracker, "current_iteration", None),
+                    request_phase=trace.get("phase"),
+                    messages_sha256=messages_sha256,
+                )
+            except Exception as exc:
+                self.logger.warning(f"Request begin accounting unavailable: {type(exc).__name__}")
+        if role == "actor":
+            self.last_actor_receipt = {
+                "request_id": request_id, "messages_sha256": messages_sha256,
+                "response_id": None, "status": "pending",
+            }
+        try:
+            response = litellm.completion(**params)
+        except BaseException as error:
+            if role == "actor":
+                self.last_actor_receipt.update(status="error", error_type=type(error).__name__)
+            if ledger is not None:
+                try:
+                    ledger.finish(request_id, error=error)
+                except Exception as exc:
+                    self.logger.warning(
+                        f"Request error accounting unavailable: {type(exc).__name__}"
+                    )
+            raise
+        if role == "actor":
+            self.last_actor_receipt.update(status="returned", response_id=getattr(response, "id", None))
+        if ledger is not None:
+            try:
+                ledger.finish(request_id, response=response)
+            except Exception as exc:
+                self.logger.warning(
+                    f"Request response accounting unavailable: {type(exc).__name__}"
+                )
+        return response
+
+    def _track_advisor_usage(self, response: Any, model: str, request_type="advisor") -> None:
         if self.token_tracker is None:
             return
 
         try:
-            self.token_tracker.track_token_usage(response, model, "advisor")
+            self.token_tracker.track_token_usage(response, model, request_type)
         except Exception as exc:  # pragma: no cover - defensive accounting path
             self.logger.debug(f"Could not track advisor token usage: {exc}")
 

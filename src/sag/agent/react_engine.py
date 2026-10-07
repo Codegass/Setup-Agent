@@ -567,6 +567,7 @@ class ReActEngine:
         # ReAct state
         self.steps: List[ReActStep] = []
         self.current_iteration = 0
+        self._logical_tool_calls = 0
         self.max_iterations = self.config.max_iterations
 
         # Context switching guidance
@@ -628,6 +629,8 @@ class ReActEngine:
             self.phase_handoff = PhaseHandoff(
                 self.run_evidence_state,
                 orchestrator=orchestrator,
+                retain_context=getattr(self.config, "phase_context_policy", "legacy") in {"retained", "facts", "relevant"},
+                context_policy=getattr(self.config, "phase_context_policy", "legacy"),
             )
 
         # Initialize physical validator for fact-based validation
@@ -645,6 +648,9 @@ class ReActEngine:
         )
         self._analysis_facts_recovery_attempted = False
         phase_tool = self.tools.get("phase")
+        bind_report_delivery = getattr(phase_tool, "bind_report_delivery", None)
+        if callable(bind_report_delivery):
+            bind_report_delivery(lambda: getattr(self, "_report_delivery", None))
         bind_plan_evidence = getattr(phase_tool, "bind_execution_plan_evidence", None)
         if callable(bind_plan_evidence):
             bind_plan_evidence(self.output_storage)
@@ -683,17 +689,22 @@ class ReActEngine:
 
         # Initialize token tracker and LLM client for monitoring model usage
         self.token_tracker = TokenTracker()
+        self.model_request_ledger = None
         if llm_client is None:
+            self.model_request_ledger = self._create_model_request_ledger()
             self.llm_client = ReactLLMClient(
                 config=self.config,
                 tools=self.tools,
                 token_tracker=self.token_tracker,
+                request_ledger=self.model_request_ledger,
                 trace_context=lambda: {
                     "iteration": self.current_iteration,
+                    "phase": getattr(self.phase_machine, "current_phase", None),
                     "timestamp": self._get_timestamp(),
                     "agent_logger": self.agent_logger,
                 },
                 repair_context_provider=lambda: self._pending_repair_context,
+                tool_available=self._tool_available,
             )
             self.llm_client.setup()
         else:
@@ -871,7 +882,7 @@ class ReActEngine:
     # Evidence ownership and run closure (setup mode only)
     # ------------------------------------------------------------------
 
-    _NON_EVIDENCE_TOOLS = frozenset({"phase", "manage_context", "report"})
+    _NON_EVIDENCE_TOOLS = frozenset({"phase", "manage_context", "report", "code"})
     _BUILD_EVIDENCE_TOOLS = frozenset({"build", "maven", "gradle", "python"})
 
     @staticmethod
@@ -1008,7 +1019,22 @@ class ReActEngine:
         if tool_name == "report":
             self._report_attempted = True
             if attempted_execution and result.succeeded:
-                self._report_delivered = True
+                if getattr(self, "phase_machine", None) is None:
+                    self._report_delivered = True
+                else:
+                    from .report_delivery import verify_report_delivery
+
+                    delivery = result.metadata.get("report_delivery")
+                    try:
+                        if not self._report_execution_allowed():
+                            raise ValueError("no current sealed verdict")
+                        verify_report_delivery(self.orchestrator, delivery)
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                        self._report_failed = True
+                        logger.warning(f"Report delivery unverified: {exc}")
+                    else:
+                        self._report_delivery = dict(delivery)
+                        self._report_delivered = True
             elif result.is_terminal or not attempted_execution:
                 self._report_failed = True
             return result
@@ -1114,6 +1140,8 @@ class ReActEngine:
             state,
             self._dedupe_strings([durable.output_ref, *durable.evidence_refs, *durable.refs]),
         )
+        if durable.metadata.get("receipt_id"):
+            self._deliver_runtime_handoff()
         return durable
 
     def _report_execution_allowed(self) -> bool:
@@ -1129,15 +1157,22 @@ class ReActEngine:
         )
 
     def _evidence_execution_closed(self, call: ToolCall) -> bool:
-        state = getattr(self, "run_evidence_state", None)
-        return bool(
-            state is not None and state.sealed and call.name not in self._NON_EVIDENCE_TOOLS
-        )
+        return not self._tool_available(call.name)
+
+    def _tool_available(self, name: str) -> bool:
+        """Schema projection and dispatch share the same sealed-state rule."""
+        if name == "code":
+            return not self._evidence_is_sealed()
+        return not self._evidence_is_sealed() or name in self._NON_EVIDENCE_TOOLS
 
     @staticmethod
     def _refused_closed_evidence_execution(call: ToolCall) -> ToolExecution:
         result = ToolResult.completed(
-            output="Tool execution refused because setup evidence is already sealed.",
+            output=(
+                "Tool execution refused because setup evidence is already sealed. "
+                "Use report(action='generate', status=...) to render the sealed snapshot; "
+                "the controller verifies delivery and closes the report phase."
+            ),
             operation_outcome=OperationOutcome.SKIPPED,
             metadata={"execution_refused": "evidence_closed"},
         )
@@ -1445,14 +1480,7 @@ class ReActEngine:
         }
         invocation_status = getattr(getattr(result, "invocation_status", None), "value", "")
         poll_ref = str(getattr(result, "poll_ref", None) or "").strip()
-        source_tool = next(
-            (
-                str(getattr(step, "tool_name", None) or "").strip()
-                for step in reversed(getattr(self, "steps", None) or ())
-                if getattr(step, "step_type", None) is StepType.ACTION
-            ),
-            "",
-        )
+        source_tool = str(getattr(self._answered_action_step(), "tool_name", "") or "")
         detached_shaped = bool(
             detached_status
             or persistence_present
@@ -2385,6 +2413,9 @@ class ReActEngine:
                     dict(summary),
                     evidence_ref="coverage://module-metrics",
                 )
+            from sag.agent.worktree_evidence import record_worktree_boundary
+
+            record_worktree_boundary(getattr(self, "orchestrator", None), "evidence_close")
         snapshot = finalizer.finalize(state, reason)
         if not was_sealed:
             self._emit_control_event("evidence_close", {"reason": reason.value})
@@ -2466,7 +2497,9 @@ class ReActEngine:
 
         wait = sleep if callable(sleep) else _time.sleep
         attempts = 1 + len(self._NATIVE_TURN_BACKOFF_SECONDS)
+        self._native_request_receipts = []
         for attempt in range(1, attempts + 1):
+            self.llm_client.last_actor_receipt = {}
             try:
                 return self.llm_client.get_native_turn(messages)
             except Exception as exc:
@@ -2482,6 +2515,10 @@ class ReActEngine:
                     f"retrying in {delay:.0f}s: {exc}"
                 )
                 wait(delay)
+            finally:
+                receipt = getattr(self.llm_client, "last_actor_receipt", None)
+                if isinstance(receipt, dict) and receipt:
+                    self._native_request_receipts.append(dict(receipt))
         raise RuntimeError("unreachable: retry loop returns or raises")
 
     def abort(self, *, reason: str) -> RunTermination:
@@ -2961,6 +2998,8 @@ class ReActEngine:
         """Open a clean phase window with state, evidence contract, and budget."""
         machine = self.phase_machine
         phase = machine.current_phase
+        retained = (getattr(self.config, "phase_context_policy", "legacy") in {"retained", "facts", "relevant"}
+                    and (phase != "provision" or bool(machine.records)))
         _, reserved, remaining = self._phase_budget_numbers(phase)
         budget = max(5, remaining - reserved)
         # Framework survey guarantee (analyzer diet, Category 1) runs BEFORE
@@ -2979,7 +3018,7 @@ class ReActEngine:
         lines = [
             f"=== PHASE: {phase.upper()} ===",
             "Run picture so far:",
-            *machine.digest_lines(),
+            *(machine.digest_lines(include_claims=False) if retained else machine.digest_lines()),
             "",
             f"Objective: {objective}",
             f"Budget: flexible — up to ~{budget} iterations available (a small reserve is "
@@ -3015,7 +3054,8 @@ class ReActEngine:
             if inventory_guidance:
                 lines.extend(["", inventory_guidance])
         if phase in ("build", "test"):
-            lines.extend(self._required_task_progress_lines())
+            if not retained:
+                lines.extend(self._required_task_progress_lines())
             if survey_state == "created":
                 lines.append(
                     "(framework survey ran — project facts were computed and "
@@ -3036,7 +3076,9 @@ class ReActEngine:
             smoke = self._native_smoke_guidance(phase)
             if smoke:
                 lines.insert(lines.index(f"Objective: {objective}") + 1, smoke)
-        if phase in ("build", "test", "report"):
+        if retained:
+            lines.extend(self._current_phase_evidence_lines())
+        elif phase in ("build", "test", "report"):
             last_test = self._last_test_attempt_line()
             if last_test:
                 lines.extend(["", last_test])
@@ -3044,10 +3086,19 @@ class ReActEngine:
             lines.extend(["", FAILURE_DIAGNOSIS_GUIDANCE])
         handoff = getattr(self, "phase_handoff", None)
         projection = None
-        if handoff is not None:
-            char_budget = int(getattr(self.config, "phase_handoff_char_budget", 6000))
-            projection = handoff.project_for(phase, char_budget=char_budget)
         contract = "\n".join(lines)
+        policy = getattr(self.config, "phase_context_policy", "legacy")
+        total_budget = int(getattr(self.config, "phase_handoff_char_budget", 6000))
+        contract_omission_ref = None
+        if handoff is not None:
+            char_budget = total_budget
+            if policy in {"facts", "relevant"}:
+                minimum_handoff = len(handoff.project_for(phase, char_budget=1).to_prompt_text())
+                contract_budget = total_budget - minimum_handoff - 2
+                if len(contract) > contract_budget:
+                    contract, contract_omission_ref = self._bounded_phase_contract(contract, contract_budget)
+                char_budget = total_budget - len(contract) - 2
+            projection = handoff.project_for(phase, char_budget=char_budget)
         builder = getattr(self, "prompt_builder", None)
         render_intro = getattr(builder, "build_phase_intro_guidance", None)
         if callable(render_intro):
@@ -3061,11 +3112,79 @@ class ReActEngine:
                 if projection is not None
                 else contract
             )
+        self._phase_handoff_audit = {
+            "policy": getattr(self.config, "phase_context_policy", "legacy"),
+            "phase": phase,
+            "intro_sha256": hashlib.sha256(content.encode()).hexdigest(),
+            "handoff_char_budget": int(getattr(self.config, "phase_handoff_char_budget", 6000)),
+            "intro_chars": len(content),
+            "budget_scope": "whole_intro" if policy in {"facts", "relevant"} else "handoff_only",
+            "contract_omission_ref": contract_omission_ref,
+            "handoff_chars": len(projection.to_prompt_text()) if projection is not None else 0,
+            "source_reads": [
+                {**item.model_dump(exclude={"text"}),
+                 "excerpt_sha256": hashlib.sha256(item.text.encode()).hexdigest()}
+                for item in projection.excerpts
+            ] if projection is not None else [],
+            "omitted_reads": projection.omitted_excerpt_count if projection is not None else 0,
+            "full_state_ref": projection.full_state_ref if projection is not None else None,
+            "delivery": "quoted guidance; no historical tool messages or executions replayed",
+        }
         return ReActStep(
             step_type=StepType.SYSTEM_GUIDANCE,
             content=content,
             timestamp=self._get_timestamp(),
         )
+
+    def _bounded_phase_contract(self, contract: str, max_chars: int) -> tuple[str, str]:
+        """Keep whole observed lines and an exact source when a contract is large.
+
+        This is deterministic selection, not a new model summary. It never
+        cuts a command or count in half; the full phase contract stays readable.
+        """
+        ref = self.output_storage.store_output(
+            task_id=f"phase-{self.phase_machine.current_phase}", tool_name="phase_intro",
+            output=contract, metadata={"kind": "complete_phase_contract"},
+        )
+        footer = f"Phase contract has omitted lines; read the complete observations with search(target='{ref}')."
+        candidates = list(enumerate(contract.splitlines()))
+        important = ("=== PHASE:", "Objective:", "Budget:", "Task ", "Required task", "Runtime observed:", "Receipt source:")
+        ordered = sorted(candidates, key=lambda pair: (not pair[1].startswith(important), pair[0]))
+        selected = []
+        used = len(footer)
+        for index, line in ordered:
+            if used + len(line) + 1 <= max_chars:
+                selected.append((index, line))
+                used += len(line) + 1
+        text = "\n".join([line for _, line in sorted(selected)] + [footer])
+        if len(text) > max_chars:
+            raise ValueError("phase context budget cannot carry its source reference")
+        return text, ref
+
+    def _current_phase_evidence_lines(self) -> List[str]:
+        """Shared read-only facts for Actor and Advisor in the M1 candidate."""
+        lines = ["", "Current evidence (task requirements and observations are distinct):"]
+        try:
+            overlay = self._toolchain_state_line()
+        except Exception as exc:
+            logger.warning(f"Toolchain projection unavailable: {exc}")
+            overlay = ""
+        lines.append(overlay or "Current env overlay: unavailable; no runtime inference.")
+        lines.append(
+            "The env overlay records registrations/activation, not a dispatch observation. "
+            "Required versions are in the pinned task; actual invocation runtime is in its "
+            "bound receipt (effective_jdk.runtime_authority=dispatch_probe)."
+        )
+        lines.extend(self._required_task_progress_lines())
+        for render in (self._last_test_attempt_line, self._native_state_line):
+            try:
+                text = render()
+            except Exception as exc:
+                logger.warning(f"Current runner projection unavailable: {exc}")
+                text = "Runner observation unavailable; do not infer completion."
+            if text:
+                lines.append(text)
+        return lines
 
     def _required_task_progress_lines(self) -> List[str]:
         """Rehydrate task progress from current receipts after a phase reset.
@@ -3106,6 +3225,23 @@ class ReActEngine:
                 for step in snapshot.steps
                 if step.receipt_id
             )
+            if getattr(self.config, "phase_context_policy", "legacy") in {"retained", "facts", "relevant"}:
+                from .evidence_assessments import read_receipt
+
+                for step in snapshot.steps:
+                    if not step.receipt_id:
+                        continue
+                    receipt = read_receipt(orchestrator.execute_command, step.receipt_id)
+                    if receipt is None or receipt.get("run_id") != getattr(state, "run_id", None):
+                        lines.append(f"Task {step.id} receipt runtime: unavailable.")
+                        continue
+                    from .receipt_view import receipt_observation
+
+                    lines.append(
+                        f"Task {step.id} runtime observed by receipt {step.receipt_id} "
+                        f"(current task applicability={step.status}; null means unobserved): "
+                        + receipt_observation(receipt)
+                    )
             if any(step.receipt_id for step in snapshot.steps):
                 lines.append(
                     "Receipt files are readable with file_io or search(target='file:<path>'). "
@@ -3259,6 +3395,14 @@ class ReActEngine:
 
         machine = getattr(self, "phase_machine", None)
         phase = str(getattr(machine, "current_phase", "") or "")
+        if self._evidence_is_sealed():
+            base_system_prompt += (
+                "\n\nEVIDENCE SEALED: only the advertised report/control tools are available. "
+                "Do not read live files, run commands or write a report manually. "
+                "report(action='generate', status=...) renders the authoritative snapshot; "
+                "the controller verifies persistence and closes the report phase. "
+                "The sealed build/test verdict cannot be changed by reporting."
+            )
         if phase not in {"build", "test", "report"}:
             return base_system_prompt
         artifact = self._read_sealed_execution_plan()
@@ -3440,6 +3584,8 @@ class ReActEngine:
             self._journal_intro_dirty = True
             self._journal_last_ledger = None
             self._start_phase_branch()
+            if self._reuse_verified_test_phase():
+                return
             # Guarantee 1 (spec §3.2): the advice lands in the fresh window
             # BEFORE the model plans this phase — including on a repair
             # re-entry.
@@ -3736,6 +3882,33 @@ class ReActEngine:
             elif s.step_type == StepType.OBSERVATION:
                 counts["observations"] += 1
 
+    def _capture_request_context(self, messages) -> None:
+        """Freeze the window before the model or a tool can change phases."""
+        import hashlib
+        import json
+
+        intro = self.steps[0].content if self.steps else ""
+        ledger = next((s.content for s in self.steps
+                       if s.content.startswith("ATTEMPT LEDGER")), None)
+        intro_changed = bool(getattr(self, "_journal_intro_dirty", False))
+        ledger_changed = ledger != getattr(self, "_journal_last_ledger", None)
+        self._request_context_snapshot = {
+            "phase": self.phase_machine.current_phase,
+            "iteration": self.current_iteration,
+            "segments": {"intro": len(intro), "ledger": len(ledger or ""), "steps": len(self.steps)},
+            "total_chars": self._native_message_chars(messages),
+            "intro_text": intro if intro_changed else None,
+            "ledger_text": ledger if ledger_changed else None,
+            "step_span": len(self.steps),
+            "handoff_audit": getattr(self, "_phase_handoff_audit", None) if intro_changed else None,
+            "window_id": hashlib.sha256(json.dumps(
+                messages, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+            ).encode()).hexdigest(),
+        }
+        # A phase change after dispatch can mark the *next* intro dirty.
+        self._journal_intro_dirty = False
+        self._journal_last_ledger = ledger
+
     def _record_context_journal(
         self, ledger: Optional[str], n_compacted: int, added: int, total_chars: int
     ) -> None:
@@ -3749,6 +3922,19 @@ class ReActEngine:
         with [LEDGER] (round-6 review). The segment SIZES still describe the
         whole window on every record."""
         if self.context_journal is None:
+            return
+        snapshot = getattr(self, "_request_context_snapshot", None)
+        if snapshot is not None:
+            self._request_context_snapshot = None
+            self.context_journal.record(
+                **snapshot, delta={"added": added, "compacted": n_compacted},
+                request_binding={
+                    "request_phase": snapshot["phase"],
+                    "next_phase": self.phase_machine.current_phase,
+                    "requests": list(getattr(self, "_native_request_receipts", [])),
+                    "delta_applies_to": "next_window",
+                },
+            )
             return
         intro_len = len(self.steps[0].content) if self.steps else 0
         intro_text = None
@@ -3772,6 +3958,7 @@ class ReActEngine:
             intro_text=intro_text,
             ledger_text=ledger_text,
             step_span=len(self.steps),
+            handoff_audit=getattr(self, "_phase_handoff_audit", None) if intro_text is not None else None,
         )
 
     def _evidence_is_sealed(self) -> bool:
@@ -3820,6 +4007,7 @@ class ReActEngine:
                 if phase == "analyze"
                 else None
             ),
+            report_delivery=getattr(self, "_report_delivery", None),
         )
 
     NUDGE_EVERY = 15
@@ -4327,6 +4515,8 @@ class ReActEngine:
         self.current_iteration = 0
         self._phase_iterations = 0
         self._reset_advisor_run_state()
+        self._no_tool_corrected_states = set()
+        self._no_tool_floor_attempts = set()
         self._begin_detached_run_scope()
         if phase_mode:
             self.steps = [self._phase_intro_step()]
@@ -4344,6 +4534,7 @@ class ReActEngine:
             repository_url=self.repository_url,
             repository_ref=self.repository_ref,
             workflow_mode=completion_mode,
+            compact_setup_prompt=getattr(self.config, "compact_setup_prompt", False),
         )
         if initial_prompt:
             # The kickoff text lives in the system message ONLY. Repeating it as
@@ -4357,6 +4548,7 @@ class ReActEngine:
         self._executor_task_prompt = initial_prompt or ""
 
         run_started_at = time.time()
+        self._logical_tool_calls = 0
         wall_clock_cap = getattr(self.config, "max_wall_clock_seconds", 7200)
         # The evidence-close wait (§3.2, _await_open_obligations) needs the
         # same clock this loop enforces; a wait that guessed its own margin
@@ -4401,12 +4593,34 @@ class ReActEngine:
                         return self.abort(reason=f"job barrier {barrier_status}")
                     return False
 
+                if phase_mode:
+                    self._deliver_runtime_handoff()
+
+                if phase_mode and self._close_delivered_report():
+                    self._export_token_usage_csv()
+                    return self._close_flow(RunTerminationStatus.COMPLETED)
+
+                if getattr(self, "_logical_tool_calls", 0) >= getattr(self.config, "max_logical_tool_calls", 150):
+                    self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason="logical tool call cap exceeded")
+                    return False
+
                 if phase_entry_advisor_pending:
+                    if self._reuse_verified_test_phase():
+                        phase_entry_advisor_pending = False
+                        continue
                     # A resumed build/test run gets its entry consult only
                     # after every inherited job is terminal and settlement is
                     # resolved. Advisor/model work is forbidden inside barrier.
                     self._maybe_consult_advisor_at_phase_entry()
                     phase_entry_advisor_pending = False
+
+                if (
+                    phase_mode
+                    and getattr(self.config, "advisor_trigger_policy", "phase-entry") in {"problems", "adaptive"}
+                ):
+                    self._maybe_consult_advisor_for_problem()
 
                 if phase_mode and self._enforce_phase_floors() and self.phase_machine.is_complete:
                     self._export_token_usage_csv()
@@ -4427,6 +4641,8 @@ class ReActEngine:
                 # iteration opens refers to THIS array, because this is the
                 # array the model answered from.
                 self._window_digest = self._seal_window_digest(system_prompt, messages)
+                if phase_mode:
+                    self._capture_request_context(messages)
                 turn_started = self._turn_stamp()
                 try:
                     turn = self._native_turn_with_retry(messages)
@@ -4438,6 +4654,8 @@ class ReActEngine:
                     # after the model had self-corrected); what reaches here
                     # is deterministic or exhausted, and the abort is honest.
                     logger.error(f"Native executor request failed: {exc}")
+                    if phase_mode:
+                        self._finish_native_iteration(phase_mode, messages, 0)
                     self._export_token_usage_csv()
                     if phase_mode:
                         return self.abort(reason=f"LLM response unavailable: {exc}")
@@ -4446,6 +4664,7 @@ class ReActEngine:
                 steps_before = len(self.steps)
 
                 if not turn.tool_calls:
+                    stop_for_no_progress = False
                     if turn.text.strip():
                         self.steps.append(
                             ReActStep(
@@ -4476,10 +4695,7 @@ class ReActEngine:
                             return True
                         cue_text = refusal
                     else:
-                        cue_text = (
-                            "No tool was called. Continue with a tool call, "
-                            "or close the phase honestly via phase(...)."
-                        )
+                        cue_text, stop_for_no_progress = self._no_tool_continuation()
                     cue = ReActStep(
                         step_type=StepType.SYSTEM_GUIDANCE,
                         content=cue_text,
@@ -4500,13 +4716,12 @@ class ReActEngine:
                         observation_ref=self._delivered_observation_ref(cue),
                         iteration=getattr(self, "current_iteration", None),
                     )
-                    if phase_mode:
-                        self._record_context_journal(
-                            None,
-                            0,
-                            len(self.steps) - steps_before,
-                            self._native_message_chars(messages),
-                        )
+                    self._finish_native_iteration(
+                        phase_mode, messages, len(self.steps) - steps_before
+                    )
+                    if stop_for_no_progress:
+                        self._export_token_usage_csv()
+                        return self.abort(reason="no tool progress after protocol correction")
                     continue
 
                 executed_steps = self._execute_native_calls(turn)
@@ -4516,6 +4731,7 @@ class ReActEngine:
                     getattr(self, "_fatal_harness_control_failure", "") or ""
                 ).strip()
                 if harness_failure:
+                    self._finish_native_iteration(phase_mode, messages, added)
                     self._export_token_usage_csv()
                     if phase_mode:
                         return self.abort(
@@ -4525,11 +4741,13 @@ class ReActEngine:
 
                 if phase_mode:
                     self._handle_phase_signals(executed_steps)
+                    self._close_delivered_report()
                     if self.phase_machine.is_complete:
                         termination = self.phase_machine.termination_state()
                         self.agent_logger.info(
                             f"All phases complete; flow termination: {termination}"
                         )
+                        self._finish_native_iteration(phase_mode, messages, added)
                         self._export_token_usage_csv()
                         return self._close_flow(RunTerminationStatus.COMPLETED)
                     self._maybe_nudge_phase_done()
@@ -4546,20 +4764,13 @@ class ReActEngine:
                     logger.warning(
                         "Native loop stopped: no build progress after repeated completed tasks"
                     )
+                    self._finish_native_iteration(phase_mode, messages, added)
                     self._export_token_usage_csv()
                     if phase_mode:
                         return self.abort(reason="no physical progress")
                     return False
 
-                ledger, n_compacted = self._compact_window_if_needed(phase_mode)
-
-                if phase_mode:
-                    self._record_context_journal(
-                        ledger,
-                        n_compacted,
-                        added,
-                        self._native_message_chars(messages),
-                    )
+                self._finish_native_iteration(phase_mode, messages, added)
 
                 if executed_steps:
                     self.steps_since_context_switch += 1
@@ -4584,6 +4795,195 @@ class ReActEngine:
             if phase_mode:
                 return self.abort(reason=f"engine exception: {type(e).__name__}")
             return False
+
+    def _finish_native_iteration(self, phase_mode: bool, messages, added: int) -> None:
+        """Account for a completed response, including one with no tool calls."""
+        ledger, n_compacted = self._compact_window_if_needed(phase_mode)
+        if phase_mode:
+            self._record_context_journal(
+                ledger, n_compacted, added, self._native_message_chars(messages)
+            )
+
+    def _close_delivered_report(self) -> bool:
+        """Controller-owned delivery close, through the ordinary gate and policy."""
+        machine = getattr(self, "phase_machine", None)
+        delivery = getattr(self, "_report_delivery", None)
+        if (
+            machine is None
+            or machine.is_complete
+            or machine.current_phase != "report"
+            or not delivery
+            or not self._report_execution_allowed()
+        ):
+            return False
+        claim = PhaseClaim(
+            phase="report",
+            signal="done",
+            claimed_outcome=PhaseOutcome.SUCCESS,
+            key_results="The report was persisted from the current sealed snapshot.",
+            evidence_refs=(delivery["path"],),
+        )
+        gate = check_phase_claim(
+            "report",
+            claim,
+            getattr(self, "physical_validator", None),
+            self.orchestrator,
+            self._project_name_for_gate(),
+            sealed=True,
+            disclosed_job_ids=sorted(self._disclosed_live_jobs()),
+            report_delivery=delivery,
+        )
+        if not gate.accepted or gate.validator_state is not ValidatorState.GREEN:
+            return False
+        self._seal_engine_gate(claim, gate, carry=False)
+        record = machine.close_attempt(gate)
+        route = self.transition_policy.decide(
+            record, state=self.run_evidence_state, budgets=self._repair_budgets()
+        )
+        self._apply_phase_decision(record, route)
+        return machine.is_complete
+
+    def _deliver_runtime_handoff(self) -> None:
+        if not getattr(self.config, "export_runtime_handoff", False):
+            return
+        from .acceptance_task import AcceptanceTask
+        from .runtime_handoff import deliver_runtime_handoff
+
+        orchestrator = getattr(self, "orchestrator", None)
+        task = getattr(orchestrator, "acceptance_task", None)
+        if not isinstance(task, AcceptanceTask):
+            return
+        try:
+            deliver_runtime_handoff(orchestrator, getattr(self, "run_evidence_state", None),
+                validator=getattr(self, "physical_validator", None), task=task,
+                project_root=getattr(orchestrator, "acceptance_task_root", None),
+                repository=getattr(orchestrator, "acceptance_task_repository", None),
+                output_storage=getattr(self, "output_storage", None))
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning(f"Runtime path delivery unavailable: {exc}")
+
+    def _reuse_verified_test_phase(self) -> bool:
+        """Close Test through its real gate when the pinned task is already complete."""
+        if not getattr(getattr(self, "config", None), "reuse_verified_test_phase", False):
+            return False
+        machine = getattr(self, "phase_machine", None)
+        state = getattr(self, "run_evidence_state", None)
+        phase_tool = getattr(self, "tools", {}).get("phase")
+        if (
+            machine is None
+            or machine.is_complete
+            or machine.current_phase != "test"
+            or state is None
+            or state.sealed
+            or not callable(getattr(phase_tool, "grade_claim", None))
+        ):
+            return False
+        claim = PhaseClaim(
+            phase="test",
+            signal="done",
+            claimed_outcome=PhaseOutcome.SUCCESS,
+            key_results="Existing current-run tests and the complete pinned task were verified by the phase gate.",
+        )
+        # PhaseTool also applies the pinned command/runtime/worktree cap. Calling
+        # the physical test probe alone would bypass that required-task contract.
+        try:
+            if self._missing_required_test_attempt() is not None:
+                return False
+            gate = phase_tool.grade_claim(claim, "test", sealed=False)
+        except Exception as exc:
+            logger.warning(f"Existing test evidence could not be assessed: {exc}")
+            return False
+        if not gate.accepted or gate.validator_state is not ValidatorState.GREEN:
+            return False
+        facts = gate.validated_facts
+        completion = facts.get("task_completion") or {}
+        rollup = facts.get("test.stats") or {}
+        counts = rollup.get("unique") or {}
+        test_receipts = set(rollup.get("execution_receipt_ids") or ())
+        task_receipts = {step.get("receipt_id") for step in completion.get("steps", ())}
+        if (
+            completion.get("status") != "complete"
+            or rollup.get("execution_state") != "completed"
+            or rollup.get("receipt_scoped") is not True
+            or not test_receipts
+            or not test_receipts.issubset(task_receipts)
+            or any(type(counts.get(k)) is not int or counts[k] != 0 for k in ("failed", "errors"))
+        ):
+            return False
+        self._seal_engine_gate(claim, gate, carry=False)
+        self._record_gate_facts("test", gate)
+        record = machine.close_attempt(gate)
+        route = self.transition_policy.decide(record, state=state, budgets=self._repair_budgets())
+        self._apply_phase_decision(record, route)
+        return True
+
+    def _no_tool_continuation(self) -> tuple[str, bool]:
+        """One correction per semantic state; text alone never proves completion.
+
+        Job settlement precedes model dispatch in the loop. Only evidence,
+        phase attempts and repair state re-arm this correction, never extra
+        prose, audit sequence numbers or window compaction.
+        """
+        machine = self.phase_machine
+        state = self.run_evidence_state
+        repair = getattr(self, "_pending_repair_context", None)
+        orchestrator = getattr(self, "orchestrator", None)
+        jobs = read_obligations(orchestrator) if orchestrator is not None else None
+        key = canonical_sha256(
+            {
+                "attempt": machine.current_attempt_id,
+                "sealed": state.sealed,
+                "finalized_at": state.finalized_at,
+                "facts": [fact.model_dump(mode="json") for fact in state.facts],
+                "receipts": [
+                    (
+                        obs.execution_id,
+                        obs.result.metadata.get("receipt_id"),
+                        obs.result.invocation_status.value,
+                        obs.result.operation_outcome.value,
+                    )
+                    for obs in state.tool_observations
+                    if obs.result.metadata.get("receipt_id")
+                ],
+                "jobs": [
+                    {k: job.get(k) for k in ("job_id", "state", "settlement_state", "receipt_id")}
+                    for job in (jobs or [])
+                ],
+                "repair": repair.model_dump(mode="json") if repair is not None else None,
+            }
+        )
+        corrected = self._no_tool_corrected_states
+        if key in corrected:
+            # A protocol failure may not bypass an outstanding test floor.
+            required = self._missing_required_test_attempt() if not state.sealed else None
+            if required is not None:
+                floor_key = (machine.current_attempt_id, required.action_text())
+                if floor_key not in self._no_tool_floor_attempts:
+                    self._no_tool_floor_attempts.add(floor_key)
+                    self._force_required_test_attempt(required, trigger="no_tool_progress")
+                    return (
+                        "No tool was called. The harness attempted the required test-floor "
+                        "action; use its actual result to continue or close the phase honestly.",
+                        False,
+                    )
+            return (
+                "No tool progress after the delivered protocol correction; stopping honestly.",
+                True,
+            )
+        corrected.add(key)
+        if state.sealed:
+            return (
+                "No tool was called. Evidence is sealed. Use report(action='generate', "
+                "status=...) to render the sealed result; file reads/writes and builds are closed. "
+                "The controller verifies report delivery and closes the report phase.",
+                False,
+            )
+        return (
+            f"No tool was called. The current phase is {machine.current_phase}. "
+            "Use an available tool to make progress, or phase(action='done', outcome=..., "
+            "key_results=...) to request an evidence-checked close. Prose does not close a phase.",
+            False,
+        )
 
     def _compact_window_if_needed(self, phase_mode: bool) -> tuple[Optional[str], int]:
         """ATTEMPT-LEDGER COMPACTION (phase mode): old steps collapse to one
@@ -4692,6 +5092,10 @@ class ReActEngine:
         pending = getattr(self, "_pending_repair_context", None)
         repair_submission = call.repair_intent_submission
         tool_name = str(call.name or "").strip().lower()
+        # The program is a container of actions, not a repair action. Children
+        # still enter this exact boundary with their own repair_intent.
+        if tool_name == "code" and repair_submission is None:
+            pending = None
         submission: dict[str, Any] = {
             "domain_id": self._action_domain_id(params),
             "tool": tool_name,
@@ -4816,6 +5220,8 @@ class ReActEngine:
         """
 
         pending = getattr(self, "_pending_repair_context", None)
+        if call.name == "code" and intent.repair_context_id is None and intent.source == "model":
+            return  # wrapper only; every child is validated independently
         terminal_claim = str(call.name or "").strip().lower() == "phase" and str(
             params.get("action") or ""
         ).strip().lower() in {"done", "blocked"}
@@ -5772,7 +6178,7 @@ class ReActEngine:
     ) -> tuple[ToolSemanticAffordance, ...]:
         """Project-action capabilities, without params, examples, or ordering."""
 
-        excluded = {"advisor", "manage_context", "phase", "report"}
+        excluded = {"advisor", "manage_context", "phase", "report", "code"}
         affordances: list[ToolSemanticAffordance] = []
         for name, tool in sorted(getattr(self, "tools", {}).items()):
             normalized = str(name or "").strip().lower()
@@ -6686,11 +7092,10 @@ class ReActEngine:
         written FIRST, which is why taking the earliest matching row was wrong:
         it kept the packing and reported it as the advice.
 
-        The answer itself is billed once. A second exact `advisor` row on one
-        iteration is the ledger disagreeing with itself, and adding it would
-        charge one answer twice, so the first keeps it — the rule the model's
-        own row already follows. And one consult, one turn: an iteration whose
-        bill has been paid to a turn pays nothing to the next.
+        Legacy `advisor` rows retain their first-answer behavior. New bounded
+        review requests use `advisor_review`, one row per provider call, including
+        evidence reads and final advice. Each row is billed once; a later consult
+        in the same actor iteration may add new rows without rebilling old ones.
         """
         if iteration is None:
             return None, None
@@ -6698,12 +7103,10 @@ class ReActEngine:
         if claimed is None:
             claimed = set()
             self._advisor_bills_claimed = claimed
-        if iteration in claimed:
-            return None, None
         records = getattr(getattr(self, "token_tracker", None), "token_records", None) or ()
         tokens_in = tokens_out = None
         answered = False
-        for record in records:
+        for record_index, record in enumerate(records):
             kind = str(record.get("type") or "")
             if not kind.startswith("advisor") or record.get("iteration") != iteration:
                 continue
@@ -6711,15 +7114,19 @@ class ReActEngine:
                 if answered:
                     continue
                 answered = True
+            record_key = (iteration, record_index)
+            if record_key in claimed:
+                continue
             prompt = record.get("prompt_tokens")
             completion = record.get("completion_tokens")
             if isinstance(prompt, int):
                 tokens_in = prompt if tokens_in is None else tokens_in + prompt
             if isinstance(completion, int):
                 tokens_out = completion if tokens_out is None else tokens_out + completion
+            if isinstance(prompt, int) or isinstance(completion, int):
+                claimed.add(record_key)
         if tokens_in is None and tokens_out is None:
             return None, None
-        claimed.add(iteration)
         return tokens_in, tokens_out
 
     @staticmethod
@@ -7071,7 +7478,7 @@ class ReActEngine:
             # controller asked a reviewer a question between two of the model's
             # actions, and a question the model never asked may not disarm the
             # break the model's own repetition armed.
-            outside_ladder=bool((execution.metadata or {}).get("advisor_entry_consult")),
+            outside_ladder=(execution.call.name == "code" or bool((execution.metadata or {}).get("advisor_entry_consult"))),
         )
 
     def _ensure_project_facts(self) -> str:
@@ -7594,7 +8001,7 @@ class ReActEngine:
         contract_id = str(metadata.get("contract_id") or "").strip()
         if contract_id:
             self._last_invocation_contract_id = contract_id
-        excluded = {"advisor", "manage_context", "phase", "report"}
+        excluded = {"advisor", "manage_context", "phase", "report", "code"}
         if execution.call.name in excluded:
             return False
         passed_freeze = result.error_code not in {
@@ -7659,6 +8066,9 @@ class ReActEngine:
         decision: LoopDecision,
         execution: ToolExecution,
     ) -> bool:
+        if getattr(self, "_active_code_program", None):
+            self._code_deferred_phase_close = (decision, execution)
+            return True
         machine = getattr(self, "phase_machine", None)
         state = getattr(self, "run_evidence_state", None)
         if machine is None or state is None or state.sealed or machine.is_complete:
@@ -7736,6 +8146,8 @@ class ReActEngine:
         # Run-scoped so `advisor-entry-<n>` ids stay unique across every phase
         # entry and re-entry of the run.
         self._advisor_entry_counter = 0
+        self._advisor_consulted_problems = set()
+        self._active_advisor_trigger = None
         self._reset_advisor_phase_state()
 
     def _reset_advisor_phase_state(self) -> None:
@@ -7806,11 +8218,13 @@ class ReActEngine:
                 "phase": phase,
                 "advice_chars": int(advice_chars),
                 "outcome": outcome,
+                "trigger": getattr(self, "_active_advisor_trigger", None)
+                or {"reason": "actor_requested"},
             }
         )
         return len(calls)
 
-    def consult_advisor(self) -> ToolResult:
+    def consult_advisor(self, question: str = "", context: str = "") -> ToolResult:
         """Consult a fresh-context reviewer about the current phase (spec §3.2).
 
         Never raises and never returns a blocking result: mode "off", an
@@ -7828,6 +8242,7 @@ class ReActEngine:
         provider_records = []
         self._last_advisor_context = {}
         self._advisor_message_batches = []
+        self._advisor_actor_question = {"question": question, "context": context}
         unavailable_text = self._ADVISOR_UNAVAILABLE_TEXT
         try:
             messages = self._advisor_messages()
@@ -7835,6 +8250,14 @@ class ReActEngine:
             batches = self._advisor_message_batches or [(messages, self._last_advisor_context)]
             replies = []
             for part, (messages, context) in enumerate(batches, 1):
+                if getattr(self.config, "advisor_context_selection", "all") in {"brief", "on-demand"}:
+                    reply, requests = self._consult_advisor_with_evidence(messages, context, model, max_tokens)
+                    provider_records.extend({"part": part, **record} for record in requests)
+                    if requests:
+                        request_ref = requests[-1]["request_ref"]
+                    replies.append((f"Partial review {part}/{len(batches)} (not a global completion judgment):\n"
+                                    if len(batches) > 1 else "") + str(reply or "Unavailable; this part remains unreviewed."))
+                    continue
                 request_ref = self._store_bytes_once(
                     canonical_json(
                         {
@@ -7943,6 +8366,8 @@ class ReActEngine:
         cap skip silently, and any failure inside the consult degrades to no
         consult rather than to an exception. Returns whether a consult pair was
         appended (for tests and callers; the caller never acts on False)."""
+        if getattr(self.config, "advisor_trigger_policy", "phase-entry") in {"problems", "adaptive"}:
+            return self._maybe_consult_advisor_for_problem()
         machine = getattr(self, "phase_machine", None)
         phase = str(getattr(machine, "current_phase", "") or "")
         if phase not in self._ADVISOR_ENTRY_PHASES:
@@ -7955,6 +8380,7 @@ class ReActEngine:
         # be retried on the next call of this seam.
         self._advisor_entry_consult_done = True
         try:
+            self._active_advisor_trigger = {"reason": "phase_entry", "phase": phase}
             self._append_entry_consult_pair()
             return True
         except Exception as exc:
@@ -7963,6 +8389,109 @@ class ReActEngine:
             # not itself depend on engine state being complete.
             logger.warning(f"Advisor phase-entry consult skipped: {exc}")
             return False
+        finally:
+            self._active_advisor_trigger = None
+
+    def _advisor_problem_facts(self) -> dict:
+        """Observed unresolved facts only; this is a consult policy, never a gate."""
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed:
+            return {}
+        facts = {}
+        blockers = [
+            {"category": b.category, "code": b.error_code, "signature": b.failure_signature}
+            for b in state.blockers
+            if b.status == "active"
+        ]
+        if blockers:
+            facts["blockers"] = blockers
+        if state.conflicts:
+            facts["conflicts"] = list(state.conflicts)
+        repair = getattr(self, "_pending_repair_context", None)
+        if repair is not None:
+            facts["repair"] = {
+                "failure": repair.typed_failure_or_capability,
+                "constraints": repair.constraint_set.model_dump(mode="json"),
+                "fingerprints": (
+                    repair.fingerprints.model_dump(mode="json") if repair.fingerprints else None
+                ),
+            }
+        # Reads and phase notes do not resolve an execution failure. A newer
+        # domain action supplies the next observation; no command is inferred
+        # from unstructured advice, and old failures are not permanent triggers.
+        for observation in reversed(state.tool_observations):
+            result, tool = observation.result, observation.tool_name
+            if tool not in self._BUILD_EVIDENCE_TOOLS | {"project"} and not (
+                tool == "bash" and result.metadata.get("receipt_id")
+            ):
+                continue
+            if tool == "project" and observation.params.get("action") in {"analyze", "inspect"}:
+                continue
+            if not result.succeeded and result.invocation_status.value != "pending":
+                facts["latest_domain_failure"] = {
+                    "tool": tool,
+                    "params": dict(observation.params),
+                    "error_code": result.error_code,
+                    "failure_signature": result.failure_signature or result.error,
+                    "outcome": result.operation_outcome.value,
+                }
+            break
+        if facts:
+            # A changed JVM/dependency/configuration can make the same failure
+            # a new question. Use semantic fact values, not event IDs, timestamps
+            # or monotonically increasing epochs from repeated observations.
+            facts["current_constraints"] = {
+                fact.key: fact.canonical_value
+                for fact in state.facts
+                if fact.status.value == "verified"
+                and fact.scope
+                in {
+                    StateScope.ENVIRONMENT,
+                    StateScope.DEPENDENCIES,
+                    StateScope.PROJECT_ANALYSIS,
+                }
+            }
+        return facts
+
+    def _maybe_consult_advisor_for_problem(self) -> bool:
+        if not self._advisor_enabled() or self._advisor_cap_exhausted():
+            return False
+        phase = str(getattr(getattr(self, "phase_machine", None), "current_phase", ""))
+        if phase not in self._ADVISOR_ENTRY_PHASES:
+            return False
+        adaptive = getattr(self.config, "advisor_trigger_policy", "phase-entry") == "adaptive"
+        state = getattr(self, "run_evidence_state", None)
+        if adaptive and not (getattr(self, "_advisor_redirect_armed", False) or getattr(state, "conflicts", ())):
+            return False  # One ordinary failure or a phase change is not a struggle signal.
+        try:
+            facts = self._advisor_problem_facts()
+            if not facts:
+                return False
+            fingerprint = canonical_sha256({"facts": facts, **({} if adaptive else {"phase": phase})})
+        except Exception as exc:
+            logger.warning(f"Advisor trigger facts unavailable: {exc}")
+            return False
+        consulted = getattr(self, "_advisor_consulted_problems", None)
+        if consulted is None:
+            consulted = self._advisor_consulted_problems = set()
+        if fingerprint in consulted:
+            return False
+        # Latch even provider failures so identical input cannot cause a loop.
+        consulted.add(fingerprint)
+        try:
+            self._active_advisor_trigger = {
+                "reason": "unresolved_problem",
+                "phase": phase,
+                "fingerprint": fingerprint,
+                "facts": facts,
+            }
+            self._append_entry_consult_pair()
+            return True
+        except Exception as exc:
+            logger.warning(f"Advisor problem consult unavailable: {exc}")
+            return False
+        finally:
+            self._active_advisor_trigger = None
 
     def _append_entry_consult_pair(self) -> None:
         """The harness authors one advisor call, forced-attempt style.
@@ -7979,12 +8508,25 @@ class ReActEngine:
         author instead of the model. It is a controller move, so it seals a
         controller turn, in the same sequence as every other turn."""
         turn_started = self._turn_stamp()
+        is_problem = (getattr(self, "_active_advisor_trigger", None) or {}).get(
+            "reason"
+        ) == "unresolved_problem"
+        action_text = (
+            "HARNESS CONSULT: unresolved observed problem"
+            if is_problem
+            else self._ADVISOR_ENTRY_ACTION_TEXT
+        )
+        native_text = (
+            "[harness] consulting the advisor about an unresolved observed problem"
+            if is_problem
+            else self._ADVISOR_ENTRY_NATIVE_TEXT
+        )
         result = self.consult_advisor()
         call = ToolCall(
             name="advisor",
             raw_params={},
             validated_params={},
-            raw_action_text=self._ADVISOR_ENTRY_ACTION_TEXT,
+            raw_action_text=action_text,
             source_step_index=getattr(self, "current_iteration", 0),
             model_used="harness",
         )
@@ -8004,14 +8546,14 @@ class ReActEngine:
         self.steps.append(
             ReActStep(
                 step_type=StepType.ACTION,
-                content=self._ADVISOR_ENTRY_ACTION_TEXT,
+                content=action_text,
                 tool_name="advisor",
                 tool_params={},
                 tool_result=recorded,
                 timestamp=self._get_timestamp(),
                 model_used="harness",
                 tool_call_id=entry_call_id,
-                native_text=self._ADVISOR_ENTRY_NATIVE_TEXT,
+                native_text=native_text,
             )
         )
         # The ACTION step is appended first on purpose: the envelope keys off
@@ -8060,12 +8602,15 @@ class ReActEngine:
 
     def _advisor_messages(self) -> List[Dict[str, str]]:
         """Share executor instructions and facts, bounded by the advisor model."""
+        if getattr(self.config, "advisor_context_selection", "all") in {"brief", "on-demand"}:
+            return self._advisor_review_messages()
         from dataclasses import asdict, replace
 
         from .advisor_context import (
             AdvisorContextUnavailable,
             AdvisorSection,
             pack_advisor_contexts,
+            select_advisor_sections,
         )
 
         base = getattr(self, "_executor_base_system_prompt", "")
@@ -8079,6 +8624,9 @@ class ReActEngine:
             AdvisorSection("ORIGINAL TASK AND CONSTRAINTS", task_text, priority=5, policy="keep"),
             AdvisorSection("CURRENT EVIDENCE DIGEST", digest, priority=10, policy="keep"),
         ]
+        note = getattr(self, "_advisor_actor_question", {})
+        if getattr(self.config, "advisor_actor_note", True) and any(note.values()):
+            required.append(AdvisorSection("ACTOR QUESTION AND HYPOTHESIS — UNVERIFIED", canonical_json(note), priority=20, policy="excerpt"))
         if getattr(getattr(self, "phase_machine", None), "current_phase", None) in {
             "build",
             "test",
@@ -8166,6 +8714,73 @@ class ReActEngine:
             )
             for i, schema in enumerate(schemas)
         )
+        selection_audit = []
+        selection_source_ref = None
+        if getattr(self.config, "advisor_context_selection", "all") == "relevant":
+            # Retain the raw sources once; selected views never replace evidence.
+            selection_source_ref = self._store_bytes_once(
+                canonical_json({"sections": [asdict(s) for s in optional]}),
+                label="advisor_selection_source",
+            )
+            # The advisor cannot call executor tools. Give it the operation
+            # contract without replaying the actor's full system and schemas.
+            excluded = [
+                s
+                for s in optional
+                if s.name == "QUOTED EXECUTOR FRAMEWORK"
+                or s.name.startswith("EXECUTOR TOOL SCHEMA ")
+                or s.name.endswith(" FULL")
+            ]
+            optional = [s for s in optional if s not in excluded]
+            required.append(
+                AdvisorSection(
+                    "EXECUTOR CAPABILITIES (not callable by advisor)",
+                    canonical_json(
+                        [
+                            {
+                                "name": (schema.get("function") or schema).get("name"),
+                                # Tool purpose and evidence production are part
+                                # of the operation contract, not optional prose.
+                                "description": (schema.get("function") or schema).get(
+                                    "description", ""
+                                ),
+                                "required": (
+                                    (schema.get("function") or schema).get("parameters")
+                                    or schema.get("input_schema")
+                                    or {}
+                                ).get("required", []),
+                                "parameters": {
+                                    name: {k: value[k] for k in ("type", "enum") if k in value}
+                                    for name, value in (
+                                        (schema.get("function") or schema).get("parameters")
+                                        or schema.get("input_schema")
+                                        or {}
+                                    )
+                                    .get("properties", {})
+                                    .items()
+                                },
+                            }
+                            for schema in schemas
+                        ]
+                    ),
+                    priority=30,
+                    policy="keep",
+                )
+            )
+            optional, selection_audit = select_advisor_sections(
+                optional, model=self._advisor_model()
+            )
+            _, excluded_audit = select_advisor_sections(excluded, model=self._advisor_model())
+            selection_audit.extend(
+                {
+                    **item,
+                    "representation": "omitted",
+                    "rendered_chars": 0,
+                    "estimated_selected_tokens": 0,
+                    "reason": "actor-only protocol/schema or duplicate latest exchange; current capabilities and facts retained",
+                }
+                for item in excluded_audit
+            )
         compactor = None
         if getattr(self.config, "advisor_context_compression", "extractive") == "semantic":
             from .advisor_compaction import AdvisorCompactor
@@ -8192,6 +8807,9 @@ class ReActEngine:
         messages, audit = self._advisor_message_batches[0]
         self._last_advisor_context = {
             **audit,
+            "selection_mode": getattr(self.config, "advisor_context_selection", "all"),
+            "selection": selection_audit,
+            "selection_source_ref": selection_source_ref,
             "compression_mode": getattr(self.config, "advisor_context_compression", "extractive"),
             "summary_calls": compactor.calls if compactor else [],
             "review_parts": len(self._advisor_message_batches),
@@ -8203,6 +8821,141 @@ class ReActEngine:
             )
         self._advisor_message_batches[0] = (messages, self._last_advisor_context)
         return messages
+
+    def _advisor_review_messages(self):
+        """Task and observed facts first; archived originals stay behind source IDs."""
+        from .acceptance_task import AcceptanceTask
+        from .advisor_context import AdvisorSection, pack_advisor_contexts
+        from .advisor_review import AdvisorEvidence, EVIDENCE_TOOLS, review_input_size
+        from .attempt_ledger import failure_preview
+
+        sources = [*self._advisor_output_sections(), *self._advisor_history_sections()]
+        observations, failures = [], []
+        state = getattr(self, "run_evidence_state", None)
+        for observation in getattr(state, "tool_observations", ()):
+            if observation.tool_name not in self._BUILD_EVIDENCE_TOOLS and not (
+                observation.tool_name == "bash" and observation.result.metadata.get("receipt_id")
+            ):
+                continue
+            result = observation.result
+            metadata = result.metadata
+            fact = {
+                "execution_id": observation.execution_id, "phase": observation.source_phase,
+                "tool": observation.tool_name, "requested_params": observation.params,
+                "invocation_status": result.invocation_status.value,
+                "operation_outcome": result.operation_outcome.value,
+                "error_code": result.error_code, "output_ref": result.output_ref,
+                "observed": {key: metadata[key] for key in (
+                    "receipt_id", "command", "effective_command", "working_directory", "exit_code",
+                    "report_test_counts", "test_stats_basis", "java_version", "java_home", "maven_version",
+                    "dispatch_probe",
+                ) if key in metadata},
+            }
+            sources.append(AdvisorSection(
+                "EXECUTION RECORD " + observation.execution_id,
+                canonical_json({**fact, "metadata": metadata}), ref=metadata.get("receipt_ref")))
+            observations.append(fact)
+            if not result.succeeded and result.invocation_status.value != "pending":
+                failures.append({"execution_id": observation.execution_id, "output_ref": result.output_ref,
+                                 "excerpt": failure_preview(result.error or result.output or "")})
+        self._advisor_evidence_view = AdvisorEvidence(sources)
+        self._advisor_evidence_source_ref = self._store_bytes_once(
+            canonical_json(self._advisor_evidence_view.sources), label="advisor_source_snapshot")
+        task_text = getattr(self, "_executor_task_prompt", "") or getattr(self, "_executor_base_system_prompt", "")
+        orchestrator = getattr(self, "orchestrator", None) or getattr(getattr(self, "context_manager", None), "orchestrator", None)
+        task, root = getattr(orchestrator, "acceptance_task", None), getattr(orchestrator, "acceptance_task_root", None)
+        required = [AdvisorSection("ORIGINAL TASK", task_text, priority=5, policy="keep")]
+        if isinstance(task, AcceptanceTask) and isinstance(root, str):
+            contract = task.prompt(root)
+            required[0] = AdvisorSection("ORIGINAL TASK", task_text.replace(contract, ""), priority=5, policy="keep")
+            required.insert(0, AdvisorSection("PINNED ACCEPTANCE TASK", contract, priority=0, policy="keep"))
+        required.extend([
+            AdvisorSection("CURRENT EVIDENCE DIGEST (not actor interpretation)", self._advisor_evidence_digest(), priority=10, policy="keep"),
+            AdvisorSection("OBSERVED EXECUTIONS (historical; do not infer missing facts)", canonical_json(observations), priority=10, policy="keep"),
+            AdvisorSection("UNRESOLVED JUDGE / FAILURE FACTS", canonical_json(self._advisor_problem_facts()), priority=10, policy="keep"),
+            AdvisorSection("FAILURE EXCERPTS (incomplete; originals in catalog)", canonical_json(failures), priority=15, policy="excerpt"),
+        ])
+        note = getattr(self, "_advisor_actor_question", {})
+        if getattr(self.config, "advisor_actor_note", True) and any(note.values()):
+            required.append(AdvisorSection("ACTOR QUESTION AND HYPOTHESIS — UNVERIFIED", canonical_json(note), priority=20, policy="excerpt"))
+        catalog = AdvisorSection("ARCHIVED SOURCE CATALOG (use list if excerpted)", canonical_json(self._advisor_evidence_view.catalog()), priority=30, policy="excerpt")
+        # Prompt key: advisor_review_system
+        pack_args = dict(
+            model=self._advisor_model(), system=str(self.prompts.get("advisor_review_system") or ""),
+            required=required, optional=[catalog], max_output_tokens=int(getattr(self.config, "advisor_max_tokens", 2048)),
+            context_window=getattr(self.config, "advisor_context_window", None), summarizer=None,
+        )
+        tools = EVIDENCE_TOOLS if self.config.advisor_context_selection == "on-demand" else []
+        reserve = review_input_size([], tools, self._advisor_model())[0]
+        # The text packer cannot see native schema/framing overhead. Recount
+        # the actual wire view and re-pack/split protected material as needed;
+        # a small model window never silently cancels a large consultation.
+        while True:
+            self._advisor_message_batches = pack_advisor_contexts(**pack_args, reserved_input_tokens=reserve)
+            extra = max(review_input_size(messages, tools, self._advisor_model())[0] - audit["input_token_budget"]
+                        for messages, audit in self._advisor_message_batches)
+            if extra <= 0:
+                break
+            reserve += extra
+        for _, audit in self._advisor_message_batches:
+            audit.update(selection_mode=self.config.advisor_context_selection, compression_mode="extractive",
+                         source_ref=self._advisor_evidence_source_ref, summary_calls=[],
+                         actor_note_included=bool(getattr(self.config, "advisor_actor_note", True) and any(note.values())),
+                         review_parts=len(self._advisor_message_batches))
+        messages, self._last_advisor_context = self._advisor_message_batches[0]
+        return messages
+
+    def _consult_advisor_with_evidence(self, initial, audit, model, max_tokens):
+        from .advisor_review import EVIDENCE_TOOLS, fit_review_messages
+        records, exchanges = [], []
+        rounds = (int(getattr(self.config, "advisor_max_read_rounds", 3))
+                  if self.config.advisor_context_selection == "on-demand" else 0)
+        for round_index in range(rounds + 1):
+            tools = EVIDENCE_TOOLS if round_index < rounds else []
+            messages, view_audit = fit_review_messages(initial, exchanges, tools=tools, model=model,
+                                                       input_budget=audit["input_token_budget"])
+            request_ref = self._store_bytes_once(canonical_json({
+                "model": model, "messages": messages, "tools": tools, "max_tokens": max_tokens,
+                "reasoning_effort": getattr(self.config, "advisor_reasoning_effort", None),
+                "context": {**audit, **view_audit}, "read_round": round_index,
+            }), label="advisor_request")
+            try:
+                turn = self.llm_client.get_advisor_turn(messages, model=model, max_tokens=max_tokens, tools=tools)
+                error = None
+            except Exception as exc:
+                self.agent_logger.warning(f"Advisor read turn unavailable: {type(exc).__name__}")
+                turn, error = None, type(exc).__name__
+            receipt_ref = self._store_bytes_once(canonical_json({
+                "request_ref": request_ref, **(getattr(self.llm_client, "last_advisor_receipt", None) or {}),
+            }), label="advisor_receipt")
+            record = {"request_ref": request_ref, "receipt_ref": receipt_ref,
+                      "has_advice": bool(turn and turn.text and not turn.tool_calls),
+                      "read_round": round_index, "view": view_audit, "reads": []}
+            records.append(record)
+            if error:
+                record["error_type"] = error
+                return "", records  # Preserve receipts for already billed reads.
+            if not turn.tool_calls:
+                return turn.text, records
+            if not tools:
+                return "Advisor reached its evidence-read budget without final advice; unresolved facts remain unknown.", records
+            exchange = [{"role": "assistant", "content": turn.text or "", "tool_calls": [
+                {"id": call.id, "type": "function", "function": {
+                    "name": call.name, "arguments": call.raw_arguments}} for call in turn.tool_calls
+            ]}]
+            # One read per requested turn; unexpected parallel calls get paired
+            # errors rather than arbitrary executor dispatch or unbounded reads.
+            for index, call in enumerate(turn.tool_calls):
+                result = self._advisor_evidence_view.execute(call.name, call.arguments,
+                    max_chars=min(int(getattr(self.config, "advisor_read_max_chars", 12000)),
+                                  max(256, audit["input_token_budget"] // 4))) if index == 0 else {
+                    "error": "Request one evidence read per round", "status": "unavailable"}
+                read_ref = self._store_bytes_once(canonical_json({"call_id": call.id, "name": call.name,
+                    "arguments": call.arguments, "result": result}), label="advisor_read")
+                record["reads"].append({"tool_call_id": call.id, "ref": read_ref})
+                exchange.append({"role": "tool", "tool_call_id": call.id, "content": canonical_json(result)})
+            exchanges.append(exchange)
+        return "", records
 
     def _advisor_history_sections(self):
         """Pair full exchanges and prepare source-bound attempt summaries."""
@@ -8296,20 +9049,67 @@ class ReActEngine:
         from .advisor_context import AdvisorSection
 
         sections = []
-        seen = set()
         state = getattr(self, "run_evidence_state", None)
+        grouped = {}
         for observation in reversed(tuple(getattr(state, "tool_observations", ()) or ())):
             result = observation.result
             ref = getattr(result, "output_ref", None)
-            if observation.tool_name == "advisor" or not is_output_storage_ref(ref) or ref in seen:
+            if observation.tool_name == "advisor" or not is_output_storage_ref(ref):
                 continue
-            seen.add(ref)
+            grouped.setdefault(ref, []).append(observation)
+        for ref, observations in grouped.items():
+            producers = {}
+            for observation in observations:
+                result = observation.result
+                if result.metadata.get("source_ref") == ref or (
+                    observation.tool_name in {"search", "output_search"}
+                    and (
+                        observation.params.get("target") == ref
+                        or observation.params.get("ref_id") == ref
+                    )
+                ):
+                    continue  # Reading an output is not producing that execution.
+                identity = (
+                    observation.execution_id,
+                    observation.tool_name,
+                    result.operation_outcome.value,
+                    result.invocation_status.value,
+                    canonical_sha256([result.raw_output, result.output, result.error]),
+                )
+                producers[identity] = observation
+            if len(producers) != 1:
+                status = "conflict" if producers else "unknown"
+                sections.append(
+                    AdvisorSection(
+                        f"RECORDED TOOL OUTPUT {ref}",
+                        canonical_json(
+                            {
+                                "output_ref": ref,
+                                "producer_status": status,
+                                "operation_outcome": "unknown",
+                                "producer_execution_ids": sorted(
+                                    {p.execution_id for p in producers.values()}
+                                ),
+                            }
+                        )
+                        + "\nProducer identity is unverified. Reader success does not establish "
+                        "execution success; inspect the original reference and its lineage.",
+                        ref=ref,
+                        priority=30,
+                        policy="excerpt",
+                    )
+                )
+                continue
+            observation = next(iter(producers.values()))
+            result = observation.result
             output = canonical_full_output_source(
                 raw_output=result.raw_output, output=result.output, error=result.error
             )
             header = canonical_json(
                 {
                     "tool": observation.tool_name,
+                    "producer_status": "known",
+                    "producer_execution_id": observation.execution_id,
                     "params": observation.params,
                     "phase": observation.source_phase,
                     "output_ref": ref,
@@ -8319,6 +9119,42 @@ class ReActEngine:
                     "error_code": result.error_code,
                 }
             )
+            summary = None
+            if getattr(
+                getattr(self, "config", None), "advisor_context_selection", "all"
+            ) == "relevant" and (
+                observation.tool_name in self._BUILD_EVIDENCE_TOOLS
+                or (
+                    observation.tool_name == "bash"
+                    and result.metadata.get("receipt_id")
+                    and result.metadata.get("system") in {"maven", "gradle"}
+                )
+            ):
+                from .advisor_context import build_log_advisor_summary
+
+                facts = {
+                    key: result.metadata[key]
+                    for key in (
+                        "receipt_id",
+                        "receipt_ref",
+                        "command",
+                        "effective_command",
+                        "exit_code",
+                        "working_directory",
+                        "dispatch_probe",
+                        "report_test_counts",
+                        "test_stats_basis",
+                        "java_version",
+                        "java_home",
+                        "maven_version",
+                    )
+                    if key in result.metadata
+                }
+                if result.test_stats is not None:
+                    facts["test_stats"] = result.test_stats.model_dump(mode="json")
+                summary = build_log_advisor_summary(
+                    header, output, succeeded=result.succeeded, facts=facts
+                )
             sections.append(
                 AdvisorSection(
                     f"RECORDED TOOL OUTPUT {ref}",
@@ -8326,6 +9162,7 @@ class ReActEngine:
                     ref=ref,
                     priority=30 if result.operation_outcome.value != "success" else 70,
                     policy="excerpt",
+                    summary=summary,
                 )
             )
         return sections
@@ -8583,6 +9420,14 @@ class ReActEngine:
             except Exception as exc:
                 # A digest gap must not cost the run its advice.
                 self.agent_logger.warning(f"Advisor evidence digest unavailable: {exc}")
+        if getattr(self.config, "phase_context_policy", "legacy") in {"retained", "facts", "relevant"}:
+            # Same evidence renderer as the Actor. Role instructions and read
+            # policy may differ; known runtime/task facts may not be exclusive.
+            parts.extend(self._current_phase_evidence_lines())
+            guidance = str(getattr(self, "_advisor_loop_guidance", "") or "").strip()
+            if guidance and getattr(self, "_advisor_redirect_armed", False):
+                parts.append(guidance)
+            return "\n\n".join(parts)
         # After the handoff on purpose: the current state is what supersedes the
         # superseded failure the projection above may still carry.
         try:
@@ -8688,8 +9533,11 @@ class ReActEngine:
         ablation switch) or the phase cap is exhausted: a redirect the advisor
         can no longer answer would dead-lock the run, and the advisor must
         NEVER block a run."""
-        if not self._advisor_enabled() or self._advisor_cap_exhausted():
+        if (not self._advisor_enabled() or self._advisor_cap_exhausted()
+                or not getattr(self.config, "advisor_actor_access", True)):
             return None
+        if getattr(self.config, "advisor_trigger_policy", "phase-entry") == "adaptive":
+            return None  # Review at the next model boundary; never cancel planned work for advice.
         name = str(call.name or "").strip().lower()
         if name == "advisor":
             return None
@@ -8768,6 +9616,28 @@ class ReActEngine:
         return None
 
     def _execute_action_step(self, step: ReActStep) -> Optional[str]:
+        """The common native/nested action boundary, including the call budget."""
+        previous = getattr(self, "_active_action_step", None)
+        self._active_action_step = step
+        try:
+            if step.tool_name != "code":
+                count = getattr(self, "_logical_tool_calls", 0)
+                if count >= getattr(self.config, "max_logical_tool_calls", 150):
+                    result = ToolResult.completed(output="No action was dispatched.",
+                        operation_outcome=OperationOutcome.SKIPPED,
+                        error="The run's logical tool call budget is exhausted.", error_code="TOOL_CALL_BUDGET_EXHAUSTED")
+                    step.tool_result = result
+                    self._seal_cancelled_call(step, "logical tool call budget exhausted")
+                    return "logical tool call budget exhausted"
+                self._logical_tool_calls = count + 1
+            reason = self._execute_action_step_body(step)
+            if getattr(step, "parent_program_id", None) and reason is None and self._capture_job_barrier_from_result():
+                return "controller job barrier active"
+            return reason
+        finally:
+            self._active_action_step = previous
+
+    def _execute_action_step_body(self, step: ReActStep) -> Optional[str]:
         """Execute one ACTION step that is already appended to `self.steps`.
 
         Called once per tool call by the native dispatcher. Returns the reason the enclosing batch must stop (a phase
@@ -8780,7 +9650,7 @@ class ReActEngine:
         self.agent_logger.info(f"🔧 ACTION: {step.content}")
 
         # Update token tracker with actual tool name for the last action token record
-        if step.tool_name:
+        if step.tool_name and not getattr(step, "parent_program_id", None):
             self.token_tracker.update_last_tool_name(step.tool_name)
 
         # Detailed logging in verbose mode
@@ -8813,6 +9683,7 @@ class ReActEngine:
             )
             step.tool_result = result
             control_envelope_id = str(execution.metadata.get("control_envelope_id") or "") or None
+            step.control_execution_id = control_execution_id
             if execution.validated_params is not None:
                 control_params = execution.validated_params
             elif call.validated_params is not None:
@@ -8836,6 +9707,7 @@ class ReActEngine:
                     control_params,
                     tool_call_id=native_call_id,
                 )
+            step.control_envelope_id = control_envelope_id
             self._emit_control_tool_result(
                 envelope_id=control_envelope_id,
                 execution_id=control_execution_id or new_execution_id(),
@@ -8854,6 +9726,7 @@ class ReActEngine:
             native_call_id,
             execution.observation_text,
             source_tool=call.name,
+            output_page=bool(result.metadata.get("output_page")),
         )
         completion_closed_phase = self._apply_rejected_completion_control(rejected_completion)
         loop_decision = self._apply_tool_execution_loop_effects(execution)
@@ -8908,6 +9781,14 @@ class ReActEngine:
             return "the loop breaker closed this phase"
 
         phase_signal = (result.metadata or {}).get("phase_signal")
+        if step.tool_name == "code":
+            deferred = getattr(self, "_code_deferred_phase_close", None)
+            self._code_deferred_phase_close = None
+            if deferred is not None:
+                self._close_phase_for_loop(*deferred)
+                return "the loop breaker closed this phase after program finalization"
+            if result.metadata.get("code_stop_reason"):
+                return str(result.metadata["code_stop_reason"])
         if phase_signal in {"done", "blocked"}:
             # The engine must apply the accepted terminal transition before
             # any later action can run under a new or closed prerequisite.
@@ -9046,15 +9927,27 @@ class ReActEngine:
         except Exception as e:
             logger.warning(f"Failed to log action to branch history: {e}")
 
+    def _answered_action_step(self):
+        active = getattr(self, "_active_action_step", None)
+        if active is not None:
+            return active
+        steps = getattr(self, "steps", None) or ()
+        latest = next((s for s in reversed(steps) if getattr(s, "step_type", None) is StepType.ACTION), None)
+        if latest is None or not getattr(latest, "parent_program_id", None):
+            return latest
+        for observation in reversed(steps):
+            if getattr(observation, "step_type", None) is StepType.OBSERVATION and getattr(observation, "tool_call_id", None):
+                for action in reversed(steps):
+                    if getattr(action, "step_type", None) is StepType.ACTION and getattr(action, "tool_call_id", None) == observation.tool_call_id:
+                        return action
+        return latest
+
     def _answered_action_result(self):
         """The tool result of the ACTION step this observation answers.
 
         The published-on-the-engine seam `_observation_source_tool` uses, so no
         caller has to thread a result through the observation path."""
-        for step in reversed(getattr(self, "steps", None) or ()):
-            if getattr(step, "step_type", None) is StepType.ACTION:
-                return getattr(step, "tool_result", None)
-        return None
+        return getattr(self._answered_action_step(), "tool_result", None)
 
     def _commit_claim_transitions(self, source_tool: Optional[str]) -> None:
         """Never transition claims from authorization citations.
@@ -9218,6 +10111,7 @@ class ReActEngine:
         tool_call_id: Optional[str],
         observation: str,
         source_tool: Optional[str] = None,
+        output_page: bool = False,
     ) -> Optional[ReActStep]:
         """Append an observation through the preserved enrichment path, stamped
         with the tool_call it answers (None for the legacy protocol).
@@ -9244,6 +10138,9 @@ class ReActEngine:
             self._observation_source_tool = previous_source_tool
         if step is not None and tool_call_id:
             step.tool_call_id = tool_call_id
+        if step is not None:
+            step.output_page = output_page
+            step.parent_program_id = getattr(getattr(self, "_active_action_step", None), "parent_program_id", None)
         return step
 
     def _seal_cancelled_call(self, step: ReActStep, reason: str) -> None:
@@ -9882,6 +10779,23 @@ class ReActEngine:
         self.agent_logger.info(f"{prefix}: {guidance_message[:100]}...")
         logger.info(f"{prefix} added with priority {priority}")
 
+    def _create_model_request_ledger(self):
+        """Bind prospective accounting to the existing host run and session."""
+        from sag.config.logger import get_session_logger
+        from .model_request_ledger import ModelRequestLedger
+
+        session = get_session_logger()
+        run_id = getattr(getattr(self, "run_evidence_state", None), "run_id", None)
+        if session is None or not run_id:
+            return None
+        try:
+            return ModelRequestLedger(session.session_log_dir, run_id)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Model request ledger initialization unavailable: {}", type(exc).__name__
+            )
+            return None
+
     def _export_token_usage_csv(self):
         """Export token usage to CSV file when ReAct loop completes."""
         try:
@@ -9912,3 +10826,12 @@ class ReActEngine:
 
         except Exception as e:
             logger.warning(f"Failed to export token usage CSV: {e}")
+        finally:
+            ledger = getattr(self, "model_request_ledger", None)
+            if ledger is not None:
+                try:
+                    ledger.close()
+                except Exception as exc:
+                    logger.warning(
+                        "Model request ledger closure unavailable: {}", type(exc).__name__
+                    )

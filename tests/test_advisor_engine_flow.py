@@ -481,3 +481,30 @@ def test_advisor_mode_off_removes_every_redirect_and_the_run_still_completes(tmp
     assert engine.tools["build"].calls == ["compile", "compile"]
     assert termination.termination is RunTerminationStatus.COMPLETED
     assert engine.phase_machine.is_complete
+
+
+def test_problem_policy_reaches_provider_only_after_observed_failure(tmp_path):
+    engine = _engine(tmp_path)
+    engine.config.advisor_trigger_policy = "problems"
+    termination = engine.run_setup_loop("set up the project", max_iterations=20)
+    all_calls = engine.advisor_telemetry["calls"]
+    calls = [c for c in all_calls if c["trigger"]["reason"] == "unresolved_problem"]
+    assert calls and engine.llm_client.advisor_calls
+    assert all(c["trigger"]["reason"] != "phase_entry" for c in all_calls)
+    assert any(c["trigger"]["reason"] == "actor_requested" for c in all_calls)
+    assert all(c["trigger"]["facts"] for c in calls)
+    assert len({c["trigger"]["fingerprint"] for c in calls}) == len(calls)
+    assert engine.tools["build"].calls == ["compile", "compile"]
+    assert termination.termination is RunTerminationStatus.COMPLETED
+
+
+def test_automatic_only_advisor_never_redirects_an_actor_call(tmp_path):
+    engine = _engine(tmp_path)
+    engine.config.advisor_actor_access = False
+    engine._advisor_redirect_armed = True
+    rules = _redirect_spy(engine)
+    result = engine.run_setup_loop("set up the project", max_iterations=20)
+    assert result.termination is RunTerminationStatus.COMPLETED
+    assert rules == []
+    calls = engine.advisor_telemetry["calls"]
+    assert any(c["trigger"]["reason"] == "phase_entry" for c in calls)

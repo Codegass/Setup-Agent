@@ -26,10 +26,11 @@ Rendering rules (Plan 2 Task 2; each is covered by ``tests/test_native_messages.
    engine can interleave guidance between an ACTION step and its
    OBSERVATION, so the renderer guarantees the invariant rather than
    trusting the dispatcher to.
-7. Clamping is tail-preserving: observation content over 5000 chars renders
+7. Unpaged clamping is tail-preserving: observation content over 5000 chars renders
    as the first 2000 chars, an omission marker, and the LAST 3000 chars. The
    tail is where the real failure lives, so head-only truncation is the
-   exact bug this replaces.
+   exact bug this replaces. Tool-owned pages retain their complete bounded
+   payload; their continuation is valid only if all page text is delivered.
 8. Legacy OBSERVATION steps without a ``tool_call_id`` become
    ``{"role": "user", "content": "[observation] " + <clamped>}``.
 """
@@ -78,6 +79,8 @@ def render_messages(system_prompt: str, steps: Iterable[Any]) -> List[Dict[str, 
 
     for step in steps:
         step_type = getattr(step, "step_type", None)
+        if getattr(step, "parent_program_id", None) and step_type in {StepType.ACTION, StepType.OBSERVATION}:
+            continue
 
         if step_type == StepType.ACTION:
             call_id = getattr(step, "tool_call_id", None)
@@ -112,7 +115,8 @@ def render_messages(system_prompt: str, steps: Iterable[Any]) -> List[Dict[str, 
 
         if step_type == StepType.OBSERVATION:
             call_id = getattr(step, "tool_call_id", None)
-            clamped = _clamp(getattr(step, "content", ""))
+            content = getattr(step, "content", "") or ""
+            clamped = content if getattr(step, "output_page", False) else _clamp(content)
             if call_id:
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": clamped})
             else:

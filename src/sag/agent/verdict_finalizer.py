@@ -1909,6 +1909,40 @@ class VerdictFinalizer:
         self._snapshots: dict[int, RunVerdictSnapshot] = {}
         self._expected_snapshots: dict[int, RunVerdictSnapshot] = {}
 
+    def _export_requirements_analysis(self, state, snapshot) -> None:
+        """Publish an additive offline sidecar, never alter the sealed verdict."""
+        spec = getattr(self.orchestrator, "benchmark_requirements", None)
+        protocol = getattr(self.orchestrator, "benchmark_evaluation_protocol", None)
+        if spec is None or protocol is None or self.acceptance_task is None:
+            return
+        recorder = getattr(self.orchestrator, "worktree_evidence_recorder", None)
+        try:
+            if recorder is None:
+                raise ValueError("No host session recorder for requirements analysis")
+            from sag.benchmark.sag_adapter import export_sag_requirements
+
+            root = getattr(self.orchestrator, "acceptance_task_root", None)
+            self.orchestrator.benchmark_analysis = export_sag_requirements(
+                self.orchestrator, state, validator=self.validator,
+                project_root=root or f"/workspace/{self.project_name}",
+                task=self.acceptance_task, completion=snapshot.task_completion,
+                spec=spec, protocol=protocol, output_storage=self.output_storage,
+                session_dir=recorder.directory.parent,
+            )
+        except Exception as exc:
+            # Missing analysis cannot upgrade the original protocol's verdict.
+            # Preserve the explicit failure beside the session, when available.
+            self.orchestrator.benchmark_analysis = {"status": "unavailable", "error": str(exc)}
+            if recorder is not None:
+                from sag.benchmark.recorder import write_json
+
+                try:
+                    write_json(recorder.directory.parent / "requirements-export-error.json",
+                               {"run_id": state.run_id, "status": "unavailable", "error": str(exc)})
+                except Exception:
+                    pass
+            logger.warning("Requirements sidecar export unavailable: {}", exc)
+
     def _snapshot_for_state(self, state: RunEvidenceState) -> RunVerdictSnapshot:
         cache_key = id(state)
         cached = self._expected_snapshots.get(cache_key)
@@ -2030,6 +2064,7 @@ class VerdictFinalizer:
             raise ValueError("sealed verdict snapshot violates the live schema") from exc
         if self.has_current_snapshot(state):
             self._snapshots[cache_key] = snapshot
+            self._export_requirements_analysis(state, snapshot)
             return snapshot
 
         body = snapshot.model_dump_json()
@@ -2093,4 +2128,5 @@ class VerdictFinalizer:
         if read_live_verdict_snapshot(self.orchestrator, authority=authority) != snapshot:
             raise OSError("published verdict snapshot is not the current live run")
         self._snapshots[cache_key] = snapshot
+        self._export_requirements_analysis(state, snapshot)
         return snapshot

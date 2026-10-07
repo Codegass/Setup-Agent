@@ -936,6 +936,11 @@ def list():
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Fixed ordered task JSON, independent of the agent plan and CI test-count availability.",
 )
+@click.option(
+    "--requirements-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Frozen v2 requirement annotations; requires a fixed ref, task and CI target. Adds an analysis protocol pin, not a replacement verdict.",
+)
 @click.pass_context
 def project(
     ctx,
@@ -948,10 +953,12 @@ def project(
     ci_target_file,
     acceptance_command,
     acceptance_task_file,
+    requirements_file,
 ):
     """Initial setup for a new project from repository URL."""
 
     config = ctx.obj["config"]
+    explicit_ref = project_ref
     acceptance_task = None
     if acceptance_task_file is not None:
         from sag.agent.acceptance_task import load_acceptance_task
@@ -980,6 +987,32 @@ def project(
             ci_target = load_ci_target(ci_target_file, execution_command=acceptance_command)
         except (OSError, ValueError) as exc:
             raise click.ClickException(f"Invalid CI target: {exc}") from exc
+
+    evaluation_protocol = None
+    if requirements_file is not None:
+        from sag.benchmark.requirements import (
+            evaluation_identity, file_digest, load_requirements,
+            requirements_evidence_root, validate_ci_count_metadata,
+        )
+
+        try:
+            if acceptance_task is None or ci_target is None or explicit_ref != acceptance_task.sha:
+                raise ValueError("requirements protocol needs --acceptance-task-file, --ci-target-file and an explicit frozen --ref")
+            if acceptance_command:
+                raise ValueError("requirements protocol uses the ordered task, not --acceptance-command")
+            if ci_target.record.repo != acceptance_task.repo or ci_target.record.sha != acceptance_task.sha:
+                raise ValueError("CI target and task must describe the same repository and revision")
+            requirements_digest = file_digest(requirements_file)
+            requirements = load_requirements(requirements_file, task=acceptance_task)
+            if file_digest(requirements_file) != requirements_digest:
+                raise ValueError("requirements bytes changed during validation")
+            if requirements["annotation_completeness"]["status"] != "complete":
+                raise ValueError("requirements annotation still needs review; complete metadata before a formal run")
+            validate_ci_count_metadata(requirements, base=requirements_evidence_root(requirements_file), required=True)
+            evaluation_protocol = evaluation_identity(requirements)
+            evaluation_protocol["requirements_file_sha256"] = requirements_digest
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"Invalid requirements protocol: {exc}") from exc
 
     try:
         # ALWAYS extract project_name from URL - this is the actual directory name
@@ -1040,6 +1073,9 @@ def project(
                 project_ref=project_ref,
                 **({"ci_target": ci_target} if ci_target is not None else {}),
                 **({"acceptance_task": acceptance_task} if acceptance_task is not None else {}),
+                **({"evaluation_protocol": evaluation_protocol} if evaluation_protocol is not None else {}),
+                **({"requirements_definition": requirements} if evaluation_protocol is not None else {}),
+                **({"requirements_source_root": requirements_evidence_root(requirements_file)} if evaluation_protocol is not None else {}),
                 pre_finalize_evidence_callback=(
                     (
                         lambda: _run_coverage_evidence_pass(

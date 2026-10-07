@@ -68,6 +68,37 @@ def test_initial_prompt_explains_evidence_status_rules():
     assert "read evidence refs or raw output refs" in prompt
 
 
+def test_compact_setup_prompt_removes_repetition_and_preserves_operational_contract():
+    builder = make_builder()
+    kwargs = {"repository_url": "https://example.test/repo.git", "repository_ref": "abc123"}
+    full = builder.build_initial_system_prompt(**kwargs)
+    compact = builder.build_initial_system_prompt(**kwargs, compact_setup_prompt=True)
+    assert len(compact) < len(full)
+    for required in (
+        "Repository ref: abc123",
+        "CURRENT phase",
+        "BUILD SUCCESS cannot override validator findings",
+        "partial, conflict, or unknown",
+        "evidence refs or raw output refs",
+        "raw shell",
+        "Do not add skips",
+        "actual receipt and reports",
+        "unresolved requirements",
+        "native toolchains",
+        "search",
+        "env",
+        "report",
+        "phase(action=",
+    ):
+        assert required in compact
+    assert compact.count("Repository URL: https://example.test/repo.git") == 1
+    assert builder.build_initial_system_prompt(
+        **kwargs, workflow_mode="run_task"
+    ) == builder.build_initial_system_prompt(
+        **kwargs, workflow_mode="run_task", compact_setup_prompt=True
+    )
+
+
 def test_initial_prompt_includes_repository_ref_when_present():
     prompt = make_builder().build_initial_system_prompt(
         repository_url="https://example.test/repo.git",
@@ -75,6 +106,17 @@ def test_initial_prompt_includes_repository_ref_when_present():
     )
 
     assert "Repository ref: rel/commons-cli-1.11.0" in prompt
+
+
+def test_compact_setup_retains_meaningful_context_values():
+    builder = make_builder()
+    prompt = builder.build_initial_system_prompt(
+        repository_url="https://example.test/repo.git", compact_setup_prompt=True
+    )
+    assert "Goal: Set up the repository" in prompt
+    assert "Progress: 0/1" in prompt
+    assert "Next Task: task_1" in prompt
+    assert "Context ID:" not in prompt
 
 
 def test_initial_prompt_omits_repository_ref_when_absent():

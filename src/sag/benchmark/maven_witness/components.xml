@@ -1,0 +1,5 @@
+<component-set><components><component>
+  <role>org.apache.maven.eventspy.EventSpy</role>
+  <role-hint>benchmark-witness-prototype</role-hint>
+  <implementation>benchmark.MavenWitness</implementation>
+</component></components></component-set>

@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 import uuid
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, List, Mapping, Optional
@@ -112,6 +113,15 @@ class SetupAgent:
         self._run_pin_host_path = None
         self._run_pin_mirror = None
         self._observed_target_repo_sha = None
+        self._setup_evaluation_protocol = None
+        if getattr(self, "orchestrator", None) is not None:
+            self.orchestrator.worktree_evidence_recorder = None
+            self.orchestrator.requirement_observer = None
+            self.orchestrator.benchmark_requirements = None
+            self.orchestrator.benchmark_evaluation_protocol = None
+            self.orchestrator.benchmark_analysis = None
+            self.orchestrator.benchmark_source_root = None
+            self.orchestrator.benchmark_sources = None
         # Tools and legacy summaries create these lazily. Their previous values
         # must not survive when startup stops before tool assembly.
         for name in (
@@ -175,10 +185,18 @@ class SetupAgent:
         if workflow_mode != "setup":
             self._setup_ci_target = None
             self._setup_acceptance_task = None
+            self._setup_evaluation_protocol = None
             if getattr(self, "orchestrator", None) is not None:
                 self.orchestrator.acceptance_task = None
                 self.orchestrator.acceptance_task_root = None
                 self.orchestrator.acceptance_task_repository = None
+                self.orchestrator.worktree_evidence_recorder = None
+                self.orchestrator.benchmark_requirements = None
+                self.orchestrator.benchmark_evaluation_protocol = None
+                self.orchestrator.benchmark_analysis = None
+                self.orchestrator.benchmark_source_root = None
+                self.orchestrator.benchmark_sources = None
+                self.orchestrator.requirement_observer = None
             self.phase_machine = None
             self.context_journal = None
             self.run_evidence_state = None
@@ -233,6 +251,10 @@ class SetupAgent:
         # The advisor tool is a client stub until the engine that owns the
         # consult exists; bind it before the first iteration can call it.
         self._bind_advisor_consult()
+        for tool in self.tools:
+            if tool.name == "code":
+                from sag.agent.code_program import execute_program
+                tool.execute_program = lambda program: execute_program(self.react_engine, program)
         self._initialize_run_pin_template()
 
         self.agent_logger.info("Context manager, tools, and ReAct engine initialized")
@@ -407,6 +429,9 @@ class SetupAgent:
                 "sha256": task.sha256,
                 "definition": task.model_dump(mode="json"),
             }
+        protocol = getattr(self, "_setup_evaluation_protocol", None)
+        if protocol is not None:
+            frozen_config["evaluation_protocol"] = deepcopy(protocol)
         self._run_pin_template = {
             "run_id": self.run_id,
             "container_image_digest": image_digest,
@@ -540,6 +565,9 @@ class SetupAgent:
         # None); the collector's current-run validation requires the real SHA.
         self._observed_target_repo_sha = target_repo_sha
         self._write_run_pin(target_repo_sha=target_repo_sha)
+        from sag.agent.worktree_evidence import record_worktree_boundary
+
+        record_worktree_boundary(self.orchestrator, "task_start")
 
     def _finalize_run_pin(self) -> None:
         """Rewrite the pin once the loop is done.
@@ -688,11 +716,13 @@ class SetupAgent:
                 command_tracker=self.command_tracker,
             ),
             report_tool,
-            # ALWAYS registered, in every mode: `advisor_mode="off"` is answered
-            # by the engine's consult, so the ablation switch changes behavior
-            # without changing the tool surface the model sees (spec §3.7.6).
-            AdvisorTool(),
         ]
+        if (str(getattr(self.config, "advisor_mode", "same-model") or "off").strip() != "off"
+                and getattr(self.config, "advisor_actor_access", True)):
+            tools.append(AdvisorTool())
+        if getattr(self.config, "code_mode", False):
+            from sag.tools.code_tool import CodeTool
+            tools.append(CodeTool())
 
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
         return tools
@@ -792,6 +822,9 @@ class SetupAgent:
         pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None,
         ci_target: PinnedCITarget | None = None,
         acceptance_task: AcceptanceTask | None = None,
+        evaluation_protocol: dict | None = None,
+        requirements_definition: dict | None = None,
+        requirements_source_root: str | Path | None = None,
     ) -> RunTermination:
         """Setup a project from scratch.
 
@@ -848,9 +881,14 @@ class SetupAgent:
             self.run_evidence_state = RunEvidenceState(run_id=run_id)
             self._setup_ci_target = ci_target
             self._setup_acceptance_task = acceptance_task
+            self._setup_evaluation_protocol = deepcopy(evaluation_protocol)
             self.orchestrator.acceptance_task = acceptance_task
             self.orchestrator.acceptance_task_root = f"/workspace/{project_name}"
             self.orchestrator.acceptance_task_repository = project_url
+            self.orchestrator.benchmark_requirements = deepcopy(requirements_definition)
+            self.orchestrator.benchmark_evaluation_protocol = deepcopy(evaluation_protocol)
+            self.orchestrator.benchmark_source_root = None
+            self.orchestrator.benchmark_sources = None
             if acceptance_task is not None:
                 goal += "\n\n" + acceptance_task.prompt(f"/workspace/{project_name}")
             self.verdict_finalizer = VerdictFinalizer(
@@ -865,6 +903,52 @@ class SetupAgent:
             self.project_name = project_name
 
             self._initialize_context_and_tools(workflow_mode="setup")
+
+            # The clone callback records the first checkout before agent work.
+            # Store snapshots on the host: recorder files must not affect RAT
+            # or any other source-tree check in the project being measured.
+            from sag.agent.worktree_evidence import WorktreeEvidenceRecorder
+
+            session_logger = get_session_logger()
+            self.orchestrator.worktree_evidence_recorder = None
+            self.orchestrator.requirement_observer = None
+            if session_logger is not None:
+                if requirements_definition is not None and requirements_source_root is not None:
+                    from sag.benchmark.ci_sources import archive_sources
+                    from sag.benchmark.requirements import canonical_digest, evaluation_identity
+                    from sag.benchmark.recorder import reference, write_json
+
+                    source_archive = Path(session_logger.session_log_dir) / "benchmark-inputs"
+                    archive_sources(requirements_definition, requirements_source_root, source_archive)
+                    write_json(source_archive / "manifest.json", {
+                        "schema_version": 1,
+                        "evaluation_identity": evaluation_identity(requirements_definition),
+                        "requirements_digest": canonical_digest(requirements_definition),
+                    })
+                    self.orchestrator.benchmark_source_root = source_archive
+                    self.orchestrator.benchmark_sources = reference(
+                        Path(session_logger.session_log_dir), source_archive / "manifest.json"
+                    )
+                self.orchestrator.worktree_evidence_recorder = WorktreeEvidenceRecorder(
+                    session_logger.session_log_dir,
+                    run_id=run_id,
+                    project_root=f"/workspace/{project_name}",
+                    execute=self.orchestrator.execute_control_command,
+                    task_definition=(
+                        acceptance_task.model_dump(mode="json") if acceptance_task else None
+                    ),
+                )
+                if requirements_definition is not None and acceptance_task is not None:
+                    from sag.benchmark.sag_observer import SAGRequirementObserver
+
+                    self.orchestrator.requirement_observer = SAGRequirementObserver(
+                        session_logger.session_log_dir,
+                        run_id=run_id,
+                        project_root=f"/workspace/{project_name}",
+                        task_definition=acceptance_task.model_dump(mode="json"),
+                        requirements=requirements_definition,
+                        execute=self.orchestrator.execute_control_command,
+                    )
 
             # Step 1.6: Set repository URL for ReAct engine
             self.react_engine.set_repository_url(project_url, repository_ref=project_ref)
@@ -1243,48 +1327,9 @@ Do not generate a final setup report unless the TASK explicitly asks for one.
     ) -> RunTermination:
         """Run the unified project setup process."""
 
-        # Create comprehensive setup prompt with intelligent planning approach
-        ref_instruction = ""
-        if project_ref:
-            ref_instruction = f"""
-
-Repository version handle: {project_ref}
-The checkout evidence must resolve exactly this ref. A default-branch checkout is not an
-acceptable substitute when this ref cannot be resolved.
-"""
-
-        setup_prompt = f"""
-I need to setup the project '{project_name}' from the repository: {project_url}
-{ref_instruction}
-
-My goal: {goal}
-
-PHASED SETUP RUN — the engine drives a fixed phase plan:
-provision → analyze → build → test → report.
-I never reorder or skip phases; the engine routes from prerequisites. When a terminal claim is
-rejected, the judge gives me facts and constraints; I choose the next ordinary tool action.
-
-How I work:
-1. Read the current phase facts, coordinates, constraints, and unresolved evidence; then choose
-   one ordinary action from the available tool schemas. Tool results determine the next choice.
-   In Analyze, inspect the broad document inventory and project-specific files yourself; harness
-   claims are hints. Submit a model-authored execution_plan before Analyze can enter Build.
-2. When the phase objective is met, claim it with
-   phase(action='done', outcome='success|partial|failed|unknown', key_results=...,
-   evidence=[refs], execution_plan={{...}} for Analyze) — the claim is checked against physical
-   evidence and the Analyze plan is sealed before routing.
-3. If the phase truly cannot finish here, record it honestly with
-   phase(action='blocked', outcome='failed|partial|unknown', reason=..., evidence=[refs]) —
-   validator evidence controls the recorded outcome and engine routing.
-4. If a terminal claim is rejected with a RepairContext, revise my hypothesis and issue one
-   ordinary project action using the repair_intent fields exposed on admissible tool schemas.
-   The harness supplies facts and policy bounds, never the project command.
-5. phase(action='note', text=...) records working notes worth keeping.
-
-The final phase closes only after a durable report artifact reflects the sealed evidence.
-The repository URL is already provided: {project_url}
-START by working toward the current phase objective shown in my context.
-"""
+        # Coordinates are set on the engine before this call. The prompt builder
+        # owns the setup protocol; this kickoff carries the user goal unchanged.
+        setup_prompt = f"Project: {project_name}\n\nTask:\n{goal}\n"
 
         self.console.print("[dim]🚀 Starting intelligent project setup process...[/dim]")
 
@@ -1329,6 +1374,9 @@ START by working toward the current phase objective shown in my context.
         finalizer = getattr(self, "verdict_finalizer", None)
         if finalizer is None:
             raise RuntimeError("pre-engine setup closure requires a verdict finalizer")
+        from sag.agent.worktree_evidence import record_worktree_boundary
+
+        record_worktree_boundary(self.orchestrator, "evidence_close")
         finalizer.finalize(
             state,
             EvidenceCloseReason.CANCELLED if cancelled else EvidenceCloseReason.ABORTED,

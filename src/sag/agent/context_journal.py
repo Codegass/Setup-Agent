@@ -23,7 +23,10 @@ class ContextJournal:
     def record(self, phase: str, iteration: int, segments: Dict[str, Any],
                delta: Dict[str, Any], total_chars: int,
                intro_text: Optional[str] = None, ledger_text: Optional[str] = None,
-               step_span: Optional[int] = None) -> None:
+               step_span: Optional[int] = None,
+               handoff_audit: Optional[Dict[str, Any]] = None,
+               window_id: Optional[str] = None,
+               request_binding: Optional[Dict[str, Any]] = None) -> None:
         try:
             payload = {
                 "iteration": iteration, "phase": phase,
@@ -38,6 +41,12 @@ class ContextJournal:
                 payload["ledger_text"] = ledger_text
             if step_span is not None:
                 payload["step_span"] = step_span
+            if handoff_audit is not None:
+                payload["handoff_audit"] = handoff_audit
+            if window_id is not None:
+                payload["window_id"] = window_id
+            if request_binding is not None:
+                payload.update(request_binding)
             line = json.dumps(payload)
             prefix = "" if self._dir_ready else f"mkdir -p {JOURNAL_DIR} && "
             path = f"{JOURNAL_DIR}/phase_{phase}.journal.jsonl"

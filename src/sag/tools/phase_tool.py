@@ -82,6 +82,10 @@ class PhaseTool(BaseTool):
         self._execution_plan_output_storage = None
         self._analysis_facts_recovery: Optional[Callable[[], Optional[str]]] = None
         self._analysis_facts_recovery_attempted = False
+        self._report_delivery_provider = None
+
+    def bind_report_delivery(self, provider: Callable[[], Any]) -> None:
+        self._report_delivery_provider = provider
 
     def bind_analysis_facts_recovery(
         self,
@@ -122,7 +126,7 @@ class PhaseTool(BaseTool):
             source_attempt_id=attempt_id,
         )
 
-    def _grade(self, claim: PhaseClaim, phase: str, *, sealed: bool):
+    def grade_claim(self, claim: PhaseClaim, phase: str, *, sealed: bool):
         """One initial grade plus at most one controller-owned survey regrade.
 
         The gate settles the job ledger before it grades (spec §3.2 trigger 2),
@@ -130,6 +134,11 @@ class PhaseTool(BaseTool):
         report phase can still make a claim, and settling for it would write a
         receipt the sealed verdict cannot state.
         """
+        report_kwargs = (
+            {"report_delivery": self._report_delivery_provider()}
+            if phase == "report" and self._report_delivery_provider is not None
+            else {}
+        )
         gate = self.gate_fn(
             phase,
             claim,
@@ -138,6 +147,7 @@ class PhaseTool(BaseTool):
             self.project_name,
             sealed=sealed,
             disclosed_job_ids=disclosed_live_job_ids(self.run_evidence_state),
+            **report_kwargs,
         )
         gate = gate if gate.claim is not None else gate.with_claim(claim)
         if (
@@ -553,7 +563,7 @@ class PhaseTool(BaseTool):
             # The grade performs typed reconciliation and returns before any
             # physical project inspection when a job is running, settlement is
             # pending, or a settled receipt has lost its identity witness.
-            gate = self._grade(claim, phase, sealed=sealed)
+            gate = self.grade_claim(claim, phase, sealed=sealed)
             if not gate.accepted and gate.control_disposition in {
                 GateControlDisposition.WAIT_REQUIRED,
                 GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
@@ -661,7 +671,7 @@ class PhaseTool(BaseTool):
             )
 
         if gate is None:
-            gate = self._grade(claim, phase, sealed=sealed)
+            gate = self.grade_claim(claim, phase, sealed=sealed)
 
         # A blocked record cannot carry the otherwise-valid pessimistic
         # ``blocked + success`` combination from the generic claim matrix. The

@@ -456,7 +456,8 @@ def test_record_invocation_atomically_embeds_the_exact_row_envelope(monkeypatch)
         requirements={"build_domains": [{"root": "/workspace/proj", "system": "maven"}]},
     )
 
-    assert metadata == {"receipt_id": "inv-maven-test-0011"}
+    assert metadata["receipt_id"] == "inv-maven-test-0011"
+    assert metadata["receipt_view_status"] == "available"
     (receipt,) = receipts_written(execute.commands)
     envelope = receipt["testcase_execution_rows"]
     assert envelope["status"] == "complete"

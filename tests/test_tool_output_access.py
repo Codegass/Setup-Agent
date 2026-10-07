@@ -11,6 +11,8 @@ from test_tool_orchestration_parameters import _orchestrator
 
 from sag.agent.output_storage import OutputStorageManager, attach_durable_output_ref
 from sag.agent.react_engine import ReActEngine
+from sag.agent.native_messages import render_messages
+from sag.agent.react_types import ReActStep, StepType
 from sag.agent.tool_orchestration import ToolCall, ToolExecution, format_tool_result
 from sag.tools.base import (
     ActualToolExecution,
@@ -87,6 +89,52 @@ def test_search_stores_full_matches_before_the_model_preview(tmp_path):
     assert found.metadata["total_matches"] == 1
     page = reader.safe_execute(target=result.output_ref, column_offset=22_995, max_chars=60)
     assert "MIDDLE_SENTINEL" in page.output
+
+
+@pytest.mark.parametrize("use_ref", [False, True])
+def test_search_pages_actual_long_line_hits_in_provider_messages(tmp_path, use_ref):
+    text = json.dumps({"cases": [
+        {"padding": "汉🙂" * 4000, "outcome": "skipped", "test_name": "testNET446"},
+        {"padding": "汉🙂" * 4000, "outcome": "skipped", "test_name": "testNet710"},
+    ]}, ensure_ascii=False)
+    path = tmp_path / "receipt.json"
+    path.write_text(text)
+    storage = OutputStorageManager(tmp_path / "outputs")
+    ref = storage.store_output("test", "bash", text)
+    tool = SearchTool(ShellTransport(tmp_path), output_search=OutputSearchTool(contexts_dir=storage.storage_dir))
+    args = {"target": ref if use_ref else f"file:{path}", "pattern": '"outcome": "skipped"', "max_chars": 2200}
+    pages, cursors = [], set()
+    for i in range(5):
+        with bind_tool_result_output_storage(storage, tool_name="search"):
+            result = tool.safe_execute(**args)
+        assert result.succeeded, result.error
+        action = ReActStep(step_type=StepType.ACTION, content="search", tool_name="search",
+                           tool_params=args, timestamp="ts", tool_call_id=f"call_{i}")
+        observation = ReActStep(step_type=StepType.OBSERVATION, content=format_tool_result("search", result),
+                                timestamp="ts", tool_call_id=f"call_{i}", output_page=result.metadata.get("output_page", False))
+        payload = render_messages("SYS", [action, observation])[-1]["content"]
+        pages.append(payload)
+        if "Next search: " not in payload:
+            break
+        encoded = payload.split("Next search: ", 1)[1].splitlines()[0]
+        args = json.loads(encoded)
+        cursor = args["offset"], args["column_offset"]
+        assert cursor not in cursors
+        cursors.add(cursor)
+    else:
+        pytest.fail("search cursor did not finish")
+    assert all(name in "\n".join(pages) for name in ("testNET446", "testNet710"))
+    assert all(len(page) < 5000 for page in pages)
+    assert "汉🙂" * 4000 not in "\n".join(pages)
+
+
+def test_file_search_keeps_posix_ere_and_ignore_case_for_long_line(tmp_path):
+    path = tmp_path / "output.txt"
+    path.write_text("x" * 12000 + "ERROR42" + "y" * 12000)
+    result = SearchTool(ShellTransport(tmp_path)).safe_execute(
+        target=f"file:{path}", pattern="error[[:digit:]]+", ignore_case=True)
+    assert result.succeeded and "ERROR42" in result.output
+    assert result.metadata["match_locations"][0]["column_offset"] == 12000
 
 
 @pytest.mark.parametrize(
@@ -320,6 +368,60 @@ def test_pagination_reaches_the_model_through_the_real_tool_orchestrator(tmp_pat
     assert second.result.succeeded
     assert "CRITICAL_END" in second.observation_text
     assert "Source output ref:" in second.observation_text
+
+
+@pytest.mark.parametrize("use_ref", [False, True])
+def test_model_visible_pages_reassemble_without_skipping_the_middle(tmp_path, use_ref):
+    text = "first\r\n" + "汉🙂0123456789" * 4000 + "\r\nlast"
+    path = tmp_path / "receipt.json"
+    path.write_bytes(text.encode())
+    storage = OutputStorageManager(tmp_path / "outputs")
+    ref = storage.store_output("test", "bash", text)
+    tools = {
+        "file_io": FileIOTool(ShellTransport(tmp_path)),
+        "search": SearchTool(None, output_search=OutputSearchTool(contexts_dir=storage.storage_dir)),
+    }
+    controller, _, _, _ = _orchestrator(tools=tools, output_storage=storage)
+    name = "search" if use_ref else "file_io"
+    args = {"target": ref} if use_ref else {"action": "read", "path": str(path)}
+    args["max_chars"] = 20_000
+    observed = []
+    for index in range(10):
+        execution = controller.execute(ToolCall(name=name, raw_params=args))
+        assert execution.result.succeeded
+        action = ReActStep(step_type=StepType.ACTION, content=name, tool_name=name,
+                           tool_params=args, timestamp="ts", tool_call_id=f"call_{index}")
+        engine = ReActEngine.__new__(ReActEngine)
+        engine._ensure_observed_receipt_assessed = lambda *_: None
+        engine._commit_claim_transitions = lambda *_: None
+        engine._pending_settlement_notices = lambda: []
+        engine._add_observation_step = lambda value: ReActStep(
+            step_type=StepType.OBSERVATION, content=value, timestamp="ts")
+        observation = engine._append_native_observation(
+            action.tool_call_id, execution.observation_text, source_tool=name,
+            output_page=execution.result.metadata.get("output_page", False))
+        payload = render_messages("SYS", [action, observation])[-1]["content"]
+        # Verify the actual text the provider gets, not raw_output alone.
+        page_text = read_text_page(StringIO(text),
+            start_line=args.get("start_line", 0),
+            column_offset=args.get("column_offset", 0), max_chars=args["max_chars"])["text"]
+        assert page_text in payload
+        observed.append(page_text)
+        if execution.result.metadata["next"] is None:
+            break
+        import re
+        encoded = re.search(r"Next read: (\{[^\n]+\})", payload).group(1)
+        args = json.loads(encoded)
+    assert "".join(observed) == text
+
+
+def test_page_text_cannot_request_a_renderer_bypass_by_itself():
+    action = ReActStep(step_type=StepType.ACTION, content="bash", tool_name="bash",
+                       timestamp="ts", tool_call_id="a")
+    observation = ReActStep(step_type=StepType.OBSERVATION,
+        content='output_page=true\nNext read: {}\n' + 'x' * 20_000,
+        timestamp="ts", tool_call_id="a")
+    assert len(render_messages("SYS", [action, observation])[-1]["content"]) < 5200
 
 
 def test_a_failed_long_command_keeps_its_status_and_complete_diagnostics(tmp_path):

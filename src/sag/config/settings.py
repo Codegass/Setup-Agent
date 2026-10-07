@@ -68,9 +68,17 @@ class Config(BaseModel):
     # Docker configuration
     docker_base_image: str = Field(default="ubuntu:24.04")
     workspace_path: str = Field(default="/workspace")
+    # Opt-in per-container limits. None retains Docker's existing defaults.
+    docker_memory_limit_bytes: Optional[int] = Field(default=None, gt=0, strict=True)
+    # Docker represents a CPU quota in billionths of a core.
+    docker_cpu_limit: Optional[float] = Field(
+        default=None, ge=1e-9, allow_inf_nan=False, strict=True
+    )
 
     # Agent configuration
     max_iterations: int = Field(default=50)
+    code_mode: bool = False
+    max_logical_tool_calls: int = Field(default=150, ge=1)
     context_switch_threshold: int = Field(default=20)
     # Experimental scheduler heartbeat: require a fresh reasoning turn after
     # this many actor calls without one.  This is a tunable guard, not part of
@@ -103,6 +111,8 @@ class Config(BaseModel):
     # Plan-2 behavior. "same-model" consults the action model with a fresh
     # context; any other value is used verbatim as a litellm model name.
     advisor_mode: str = Field(default="same-model")
+    # Allow automatic phase-entry reviews without exposing a consult tool.
+    advisor_actor_access: bool = True
     # None preserves the provider default used by existing advisor runs.
     advisor_reasoning_effort: Optional[Literal["none", "low", "medium", "high", "xhigh", "max"]] = (
         Field(default=None)
@@ -115,6 +125,20 @@ class Config(BaseModel):
     # Compare extractive and on-demand semantic compression without changing
     # advisor model, triggers, task acceptance, or execution policy.
     advisor_context_compression: Literal["extractive", "semantic"] = "extractive"
+    # Candidate selection is independent of capacity compression and triggers.
+    # Keep the correctness baseline unchanged until the paired ablation closes.
+    advisor_context_selection: Literal["all", "relevant", "brief", "on-demand"] = "all"
+    advisor_trigger_policy: Literal["phase-entry", "problems", "adaptive"] = "phase-entry"
+    advisor_actor_note: bool = True
+    # Resource limits, not success criteria. The final round must return advice.
+    advisor_max_read_rounds: int = Field(default=3, ge=0, le=16)
+    advisor_read_max_chars: int = Field(default=12000, ge=256, le=100000)
+    compact_setup_prompt: bool = False
+    reuse_verified_test_phase: bool = False
+    export_runtime_handoff: bool = False
+    # Opt-in M1 candidate. Keep the legacy interface for a one-factor ablation.
+    phase_context_policy: Literal["legacy", "retained", "facts", "relevant"] = "legacy"
+    phase_handoff_char_budget: int = Field(default=6000, ge=1024)
     advisor_summary_context_window: Optional[int] = Field(default=None, ge=1024)
     # Consults allowed per phase; once exhausted the advisor answers "proceed
     # with your best judgment" and the guarantees go inert (never a dead-lock).
@@ -167,7 +191,19 @@ class Config(BaseModel):
             log_retention=os.getenv("SAG_LOG_RETENTION", "30 days"),
             docker_base_image=os.getenv("SAG_DOCKER_BASE_IMAGE", "ubuntu:24.04"),
             workspace_path=os.getenv("SAG_WORKSPACE_PATH", "/workspace"),
+            docker_memory_limit_bytes=(
+                int(os.environ["SAG_DOCKER_MEMORY_LIMIT_BYTES"])
+                if os.getenv("SAG_DOCKER_MEMORY_LIMIT_BYTES")
+                else None
+            ),
+            docker_cpu_limit=(
+                float(os.environ["SAG_DOCKER_CPU_LIMIT"])
+                if os.getenv("SAG_DOCKER_CPU_LIMIT")
+                else None
+            ),
             max_iterations=int(os.getenv("SAG_MAX_ITERATIONS", "50")),
+            code_mode=os.getenv("SAG_CODE_MODE", "false").lower() == "true",
+            max_logical_tool_calls=int(os.getenv("SAG_MAX_LOGICAL_TOOL_CALLS", "150")),
             context_switch_threshold=int(os.getenv("SAG_CONTEXT_SWITCH_THRESHOLD", "20")),
             reasoning_heartbeat_actions=int(os.getenv("SAG_REASONING_HEARTBEAT_ACTIONS", "5")),
             max_wall_clock_seconds=int(os.getenv("SAG_MAX_WALL_CLOCK_SECONDS", "7200")),
@@ -179,10 +215,22 @@ class Config(BaseModel):
             ),
             dispatch_stall_seconds=int(os.getenv("SAG_DISPATCH_STALL_SECONDS", "600")),
             advisor_mode=os.getenv("SAG_ADVISOR_MODE", "same-model"),
+            advisor_actor_access=os.getenv("SAG_ADVISOR_ACTOR_ACCESS", "true").lower() == "true",
             advisor_reasoning_effort=os.getenv("SAG_ADVISOR_REASONING_EFFORT") or None,
             advisor_max_tokens=int(os.getenv("SAG_ADVISOR_MAX_TOKENS", "2048")),
             advisor_context_window=os.getenv("SAG_ADVISOR_CONTEXT_WINDOW", "65536") or None,
             advisor_context_compression=os.getenv("SAG_ADVISOR_CONTEXT_COMPRESSION", "extractive"),
+            advisor_context_selection=os.getenv("SAG_ADVISOR_CONTEXT_SELECTION", "all"),
+            advisor_trigger_policy=os.getenv("SAG_ADVISOR_TRIGGER_POLICY", "phase-entry"),
+            advisor_actor_note=os.getenv("SAG_ADVISOR_ACTOR_NOTE", "true").lower() == "true",
+            advisor_max_read_rounds=int(os.getenv("SAG_ADVISOR_MAX_READ_ROUNDS", "3")),
+            advisor_read_max_chars=int(os.getenv("SAG_ADVISOR_READ_MAX_CHARS", "12000")),
+            compact_setup_prompt=os.getenv("SAG_COMPACT_SETUP_PROMPT", "false").lower() == "true",
+            export_runtime_handoff=os.getenv("SAG_EXPORT_RUNTIME_HANDOFF", "false").lower() == "true",
+            phase_context_policy=os.getenv("SAG_PHASE_CONTEXT_POLICY", "legacy"),
+            phase_handoff_char_budget=int(os.getenv("SAG_PHASE_HANDOFF_CHAR_BUDGET", "6000")),
+            reuse_verified_test_phase=os.getenv("SAG_REUSE_VERIFIED_TEST_PHASE", "false").lower()
+            == "true",
             advisor_summary_context_window=os.getenv("SAG_ADVISOR_SUMMARY_CONTEXT_WINDOW") or None,
             advisor_phase_cap=int(os.getenv("SAG_ADVISOR_PHASE_CAP", "4")),
             build_coverage_threshold=float(

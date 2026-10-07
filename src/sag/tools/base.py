@@ -1328,20 +1328,22 @@ class BaseTool(ABC):
                     output=result.output, error=result.error
                 )
 
+            # Archive the source, not the presentation. A match-centered search
+            # page may be small even when its underlying matching line is huge.
+            binding = _DURABLE_OUTPUT_BINDING.get()
+            if (binding is not None
+                    and (not result.output_ref or result.metadata.get("source_ref") != result.output_ref)
+                    and max(len(result.raw_output or ""), len(result.output or "")) > self.max_output_length):
+                from sag.agent.output_storage import attach_durable_output_ref
+
+                result = attach_durable_output_ref(
+                    result, binding.storage, task_id=binding.task_id,
+                    tool_name=binding.tool_name, action=kwargs.get("action"),
+                )
+
             # Apply output truncation if needed
             if result.output and not result.metadata.get("output_page"):
                 original_length = len(result.output)
-                binding = _DURABLE_OUTPUT_BINDING.get()
-                if original_length > self.max_output_length and binding is not None:
-                    from sag.agent.output_storage import attach_durable_output_ref
-
-                    result = attach_durable_output_ref(
-                        result,
-                        binding.storage,
-                        task_id=binding.task_id,
-                        tool_name=binding.tool_name,
-                        action=kwargs.get("action"),
-                    )
                 result.output = self._truncate_output(
                     result.output,
                     self.name,

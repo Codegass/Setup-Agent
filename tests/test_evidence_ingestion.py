@@ -27,6 +27,7 @@ from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.react_types import ReActStep, StepType
+from sag.agent.report_delivery import report_delivery_binding
 from sag.agent.tool_orchestration import (
     ToolCall,
     ToolExecution,
@@ -37,9 +38,11 @@ from sag.agent.verdict_finalizer import (
     ReportDeliveryStatus,
     RunTerminationStatus,
     VerdictFinalizer,
+    read_live_verdict_snapshot,
     read_verdict_snapshot,
 )
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome, TestStats
+from sag.config.settings import Config
 from sag.project_fact_sheet import (
     serialize_project_fact_sheet,
     with_project_fact_sheet_identity,
@@ -48,6 +51,7 @@ from sag.tools.base import BaseTool, ToolError, ToolResult, bind_tool_result_out
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.context_tool import ContextTool
 from sag.tools.internal.python_tool import PYTEST_REPORT_DIR, PythonTool
+from sag.utils.container_io import write_container_text_atomic
 
 pytestmark = pytest.mark.usefixtures(
     "exact_build_facade_authority",
@@ -149,7 +153,10 @@ def _engine(tmp_path, *, phase="provision"):
         machine.mark_done(f"{machine.current_phase} complete", [])
 
     orchestrator = FakeVerdictOrchestrator()
+    orchestrator.execute_control_command = orchestrator.execute_command
     engine = ReActEngine.__new__(ReActEngine)
+    engine.config = Config(max_wall_clock_seconds=0, advisor_mode="off")
+    engine.orchestrator = orchestrator
     engine.phase_machine = machine
     engine.run_evidence_state = RunEvidenceState(run_id="session-engine")
     bind_verdict_authority(orchestrator, engine.run_evidence_state.run_id)
@@ -206,6 +213,18 @@ def _green_tests(engine):
                 skipped=0,
             ),
         ),
+    )
+
+
+def _delivered_report(orchestrator):
+    """A report result includes bytes bound to the actual sealed snapshot."""
+    snapshot = read_live_verdict_snapshot(orchestrator)
+    path = "/workspace/setup-report-test.md"
+    content = f"# Recorded setup result: {snapshot.verdict}\n"
+    assert write_container_text_atomic(orchestrator, path, content).persisted
+    return ToolResult.completed_success(
+        output="report written",
+        metadata={"report_delivery": report_delivery_binding(snapshot, path, content)},
     )
 
 
@@ -860,7 +879,7 @@ def test_terminal_test_signal_and_report_in_one_response_refuses_early_render(tm
                 attempted_execution=True,
             )
         report_calls.append(call)
-        result = ToolResult.completed_success(output="report rendered")
+        result = _delivered_report(orchestrator)
         return ToolExecution(
             call=call,
             result=result,
@@ -1237,7 +1256,7 @@ def test_successful_report_marks_delivery_without_changing_verdict(tmp_path):
     engine._record_tool_execution(
         "report",
         {"action": "generate"},
-        ToolResult.completed_success(output="report written"),
+        _delivered_report(orchestrator),
     )
     termination = engine._close_flow(RunTerminationStatus.COMPLETED)
 
@@ -1253,7 +1272,7 @@ def test_normal_report_phase_flow_close_returns_completed_termination(tmp_path):
     engine._record_tool_execution(
         "report",
         {"action": "generate"},
-        ToolResult.completed_success(output="report written"),
+        _delivered_report(orchestrator),
     )
 
     engine._handle_phase_signals([_phase_step(engine, key_results="report delivered")])
@@ -1333,7 +1352,10 @@ def _loop_engine(tmp_path, *, error=None, wall_clock_cap=0):
         # A provider failure is reported as itself: `get_native_turn` raises
         # rather than returning None, so the abort carries the cause.
         (RuntimeError("transport failed"), 3, "LLM response unavailable: transport failed"),
-        (None, 2, "iteration budget exhausted"),
+        # One no-tool turn reaches the iteration cap before the separate
+        # two-turn no-progress guard. Both exits must retain typed closure.
+        (None, 1, "iteration budget exhausted"),
+        (None, 2, "no tool progress after protocol correction"),
     ],
 )
 def test_setup_loop_abort_paths_persist_typed_termination(
@@ -1481,6 +1503,7 @@ def test_pre_engine_exception_seals_without_fabricating_phase_evidence():
     orchestrator = FakeVerdictOrchestrator()
     agent = object.__new__(SetupAgent)
     agent.run_evidence_state = RunEvidenceState(run_id="pre-engine")
+    agent.orchestrator = orchestrator
     bind_verdict_authority(orchestrator, agent.run_evidence_state.run_id)
     agent.verdict_finalizer = VerdictFinalizer(orchestrator)
     agent.phase_machine = PhaseMachine()
@@ -1503,6 +1526,7 @@ def test_pre_engine_closure_failure_is_surfaced_to_caller():
 
     agent = object.__new__(SetupAgent)
     agent.run_evidence_state = RunEvidenceState(run_id="pre-engine-failure")
+    agent.orchestrator = FakeVerdictOrchestrator()
     agent.verdict_finalizer = FailingFinalizer()
     agent.phase_machine = PhaseMachine()
     agent.react_engine = None

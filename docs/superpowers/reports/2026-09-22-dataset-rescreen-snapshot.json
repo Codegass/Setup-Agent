@@ -1,0 +1,537 @@
+{
+  "schema": "sag-dataset-rescreen-snapshot-audit-v1",
+  "audit_date": "2026-09-22",
+  "source_snapshot": "2026-09-16/17; no live refresh in this audit",
+  "method": "Counts recomputed from dataset projects/reference_tasks and candidate ledger; canonical joins on canonical_task_id; distinct project counts use case-folded repo; source hashes SHA256 of exact bytes. Source archive coverage statuses are the existing audited metadata, not newly remeasured source contents. Quartiles are statistics.quantiles(n=4, method=\"inclusive\").",
+  "source_hashes": {
+    "output/java-benchmark-20260916/dataset.json": "b6313ae09ac73ab3904524f42959d125f6a35db39fb1ca7496d99f45c8dbe74b",
+    "output/java-benchmark-20260916/candidate-ledger.json": "8e449335f8db9a31dc5097b6af027fb6bd6dc0e9d0fffd2321c6bbca61c82a71",
+    "output/java-benchmark-20260916/collection-summary.json": "d41a58eaf183667ede447a9c9f8959336b8a5431b449bee71393e913a8453c77",
+    "output/java-benchmark-20260916/discovery-integrity.json": "7845a8c1e7b97526ca5c46e492ffa1e7e8621d41996ba6f9f5b103d36f341371",
+    "output/java-benchmark-20260916/validation.json": "907ef60d116a89c1222e5f4d6d0f6b36078cc62894f7f4fd232e6332e7b50adb",
+    "output/java-benchmark-20260916/PROTOCOL.md": "ecba2ef6b8da2eb54684e82a991c821859283d93e5f2355a967b43f98c626bb9",
+    "output/java-benchmark-20260916/development-exposure.json": "0d7b34a147c892912d08fcd369c23fec6258dd4956e1274f40f38c44b72e0caa"
+  },
+  "candidates": 315,
+  "distinct_candidates": 315,
+  "project_states": {
+    "target_inapplicable": 116,
+    "static_qualified": 96,
+    "needs_review": 66,
+    "population_excluded": 15,
+    "evidence_unavailable": 22
+  },
+  "canonical_projects": 96,
+  "distinct_canonical_projects": 96,
+  "reference_tasks": 111,
+  "canonical_evidence": {
+    "complete_suite_counts": 78,
+    "complete_case_results": 18
+  },
+  "all_task_evidence": {
+    "complete_suite_counts": 92,
+    "complete_case_results": 19
+  },
+  "any_case_project_count": 19,
+  "additional_case_projects_outside_canonical_case": [
+    "apache/commons-net"
+  ],
+  "canonical_organizations": {
+    "apache": 71,
+    "google": 11,
+    "microsoft": 4,
+    "spring-cloud": 5,
+    "spring-io": 1,
+    "spring-projects": 4
+  },
+  "canonical_tools": {
+    "maven": 88,
+    "gradle": 8
+  },
+  "canonical_source_coverage": {
+    "pending_exact_revision_tree": 15,
+    "java_paths_complete": 74,
+    "java_paths_mismatch": 1,
+    "not_audited": 6
+  },
+  "all_task_source_coverage": {
+    "java_paths_complete": 88,
+    "pending_exact_revision_tree": 16,
+    "java_paths_mismatch": 1,
+    "not_audited": 6
+  },
+  "development_exposure": {
+    "not_identified_in_checked_manifests_not_a_training_nonexposure_claim": 81,
+    "mentioned_in_previous_SAG_run_or_benchmark_manifests": 15
+  },
+  "reference_replay_count": 0,
+  "canonical_size": {
+    "java_files": {
+      "n": 96,
+      "min": 2,
+      "median": 643.0,
+      "max": 9725,
+      "quartiles_linear_inclusive": [
+        218.0,
+        643.0,
+        2079.75
+      ]
+    },
+    "java_physical_lines": {
+      "n": 96,
+      "min": 33,
+      "median": 103183.5,
+      "max": 2018915,
+      "quartiles_linear_inclusive": [
+        46913.75,
+        103183.5,
+        366080.75
+      ]
+    },
+    "module_count": {
+      "n": 96,
+      "min": 1,
+      "median": 9.0,
+      "max": 438,
+      "quartiles_linear_inclusive": [
+        2.0,
+        9.0,
+        23.0
+      ]
+    }
+  },
+  "pilot_candidates_not_admitted_or_scheduled": [
+    {
+      "repo": "apache/commons-dbutils",
+      "canonical_task_id": "2f1ae1ca232dd52a258f",
+      "canonical_sha": "e1e2d9edfab8f237aab9e733c6d61e23b35d2079",
+      "canonical_ci_url": "https://ci-builds.apache.org/job/Commons/job/commons-dbutils/455/",
+      "canonical_evidence_level": "complete_case_results",
+      "canonical_tool": "maven",
+      "source_size": {
+        "java_files": 96,
+        "java_physical_lines": 16584,
+        "java_source_bytes": 559852
+      },
+      "module_count": 1,
+      "build_test_endpoint": "test",
+      "development_exposure": "mentioned_in_previous_SAG_run_or_benchmark_manifests",
+      "selected_job_elapsed_seconds": 133.661,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/apache/commons-dbutils/e1e2d9edfab8f237aab9e733c6d61e23b35d2079.json",
+        "tracked_java_files": 96,
+        "archived_java_files": 96
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "scope": "selected Jenkins cell",
+          "counts": {
+            "reported_total": 523,
+            "passed": 523,
+            "failed_or_error": 0,
+            "failures": null,
+            "errors": null,
+            "skipped": 0
+          }
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    },
+    {
+      "repo": "apache/commons-csv",
+      "canonical_task_id": "4ff17df30f0451053d38",
+      "canonical_sha": "bb0f0fbb0f84de5cf5a0c73a9fa7051fb5135650",
+      "canonical_ci_url": "https://github.com/apache/commons-csv/actions/runs/34127742937/job/101760303656",
+      "canonical_evidence_level": "complete_suite_counts",
+      "canonical_tool": "maven",
+      "source_size": {
+        "java_files": 56,
+        "java_physical_lines": 18007,
+        "java_source_bytes": 718769
+      },
+      "module_count": 1,
+      "build_test_endpoint": "verify",
+      "development_exposure": "mentioned_in_previous_SAG_run_or_benchmark_manifests",
+      "selected_job_elapsed_seconds": 63.0,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/apache/commons-csv/bb0f0fbb0f84de5cf5a0c73a9fa7051fb5135650.json",
+        "tracked_java_files": 56,
+        "archived_java_files": 56
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "scope": "selected Maven invocation",
+          "counts": {
+            "reported_total": 985,
+            "passed": 974,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 11
+          }
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    },
+    {
+      "repo": "apache/commons-dbcp",
+      "canonical_task_id": "0c038995886f1aa75239",
+      "canonical_sha": "d16b6a36bba2eb70270a709642df8e7792cf2a6e",
+      "canonical_ci_url": "https://github.com/apache/commons-dbcp/actions/runs/34128109690/job/101761476411",
+      "canonical_evidence_level": "complete_suite_counts",
+      "canonical_tool": "maven",
+      "source_size": {
+        "java_files": 147,
+        "java_physical_lines": 49990,
+        "java_source_bytes": 1767933
+      },
+      "module_count": 1,
+      "build_test_endpoint": "verify",
+      "development_exposure": "mentioned_in_previous_SAG_run_or_benchmark_manifests",
+      "selected_job_elapsed_seconds": 203.0,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/apache/commons-dbcp/d16b6a36bba2eb70270a709642df8e7792cf2a6e.json",
+        "tracked_java_files": 147,
+        "archived_java_files": 147
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "scope": "selected Maven invocation",
+          "counts": {
+            "reported_total": 1605,
+            "passed": 1596,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 9
+          }
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    },
+    {
+      "repo": "google/gson",
+      "canonical_task_id": "e5b9ad5bb459b283401b",
+      "canonical_sha": "854c8255b625cf1e13c701a83ea9ccb4caaa576a",
+      "canonical_ci_url": "https://github.com/google/gson/actions/runs/35144553269/job/104957162384",
+      "canonical_evidence_level": "complete_suite_counts",
+      "canonical_tool": "maven",
+      "source_size": {
+        "java_files": 264,
+        "java_physical_lines": 57118,
+        "java_source_bytes": 2021450
+      },
+      "module_count": 8,
+      "build_test_endpoint": "verify",
+      "development_exposure": "mentioned_in_previous_SAG_run_or_benchmark_manifests",
+      "selected_job_elapsed_seconds": 123.0,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/google/gson/854c8255b625cf1e13c701a83ea9ccb4caaa576a.json",
+        "tracked_java_files": 264,
+        "archived_java_files": 264
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "scope": "selected Maven test invocation",
+          "counts": {
+            "reported_total": 4906,
+            "passed": 4884,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 22
+          }
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    },
+    {
+      "repo": "google/google-java-format",
+      "canonical_task_id": "c16d98e10b7ec7b30d8d",
+      "canonical_sha": "81650924a7e3cb10bc156f822018417642f1fe31",
+      "canonical_ci_url": "https://github.com/google/google-java-format/actions/runs/35103303880/job/104817951667",
+      "canonical_evidence_level": "complete_suite_counts",
+      "canonical_tool": "maven",
+      "source_size": {
+        "java_files": 84,
+        "java_physical_lines": 25218,
+        "java_source_bytes": 816575
+      },
+      "module_count": 3,
+      "build_test_endpoint": "install → test",
+      "development_exposure": "not_identified_in_checked_manifests_not_a_training_nonexposure_claim",
+      "selected_job_elapsed_seconds": 78.0,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/google/google-java-format/81650924a7e3cb10bc156f822018417642f1fe31.json",
+        "tracked_java_files": 84,
+        "archived_java_files": 84
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "scope": "selected Maven test invocation",
+          "counts": {
+            "reported_total": 1625,
+            "passed": 1625,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          }
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    },
+    {
+      "repo": "apache/calcite-avatica",
+      "canonical_task_id": "fb5c244128011eb99445",
+      "canonical_sha": "199fcb7826fce1f0e12043a8c6c7dcbba167db50",
+      "canonical_ci_url": "https://github.com/apache/calcite-avatica/actions/runs/34932225097/job/104262652914",
+      "canonical_evidence_level": "complete_suite_counts",
+      "canonical_tool": "gradle",
+      "source_size": {
+        "java_files": 316,
+        "java_physical_lines": 67176,
+        "java_source_bytes": 2409791
+      },
+      "module_count": 13,
+      "build_test_endpoint": "build",
+      "development_exposure": "not_identified_in_checked_manifests_not_a_training_nonexposure_claim",
+      "selected_job_elapsed_seconds": 288.0,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/apache/calcite-avatica/199fcb7826fce1f0e12043a8c6c7dcbba167db50.json",
+        "tracked_java_files": 316,
+        "archived_java_files": 316
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "invocation_index": 0,
+          "counts": {
+            "reported_total": 2739,
+            "passed": 2721,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 18
+          },
+          "per_test_task": [
+            {
+              "task": ":core:test",
+              "line": 346,
+              "counts": {
+                "reported_total": 2344,
+                "passed": 2344,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0
+              }
+            },
+            {
+              "task": ":metrics:test",
+              "line": 384,
+              "counts": {
+                "reported_total": 6,
+                "passed": 6,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0
+              }
+            },
+            {
+              "task": ":metrics-dropwizardmetrics:test",
+              "line": 420,
+              "counts": {
+                "reported_total": 13,
+                "passed": 13,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0
+              }
+            },
+            {
+              "task": ":server:test",
+              "line": 547,
+              "counts": {
+                "reported_total": 374,
+                "passed": 356,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 18
+              }
+            },
+            {
+              "task": ":standalone-server:test",
+              "line": 594,
+              "counts": {
+                "reported_total": 1,
+                "passed": 1,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0
+              }
+            },
+            {
+              "task": ":shaded:avatica:test",
+              "line": 661,
+              "counts": {
+                "reported_total": 1,
+                "passed": 1,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0
+              }
+            }
+          ]
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    },
+    {
+      "repo": "spring-projects/spring-ws",
+      "canonical_task_id": "b557e184669d9d1b57d7",
+      "canonical_sha": "48022929d67b24e93076d1cb3a82ad0c25b242d5",
+      "canonical_ci_url": "https://github.com/spring-projects/spring-ws/actions/runs/35133677068/job/104920586357",
+      "canonical_evidence_level": "complete_case_results",
+      "canonical_tool": "gradle",
+      "source_size": {
+        "java_files": 922,
+        "java_physical_lines": 94577,
+        "java_source_bytes": 3247166
+      },
+      "module_count": 8,
+      "build_test_endpoint": "check",
+      "development_exposure": "not_identified_in_checked_manifests_not_a_training_nonexposure_claim",
+      "selected_job_elapsed_seconds": 93.0,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/spring-projects/spring-ws/48022929d67b24e93076d1cb3a82ad0c25b242d5.json",
+        "tracked_java_files": 922,
+        "archived_java_files": 922
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "invocation_index": 0,
+          "scope": "Same-cell Gradle check: five executed Java test tasks; final case outcomes.",
+          "counts": {
+            "reported_total": 1570,
+            "passed": 1569,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 1
+          }
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    },
+    {
+      "repo": "apache/commons-math",
+      "canonical_task_id": "6339d9e6b6bf6f933521",
+      "canonical_sha": "7bc81e97e91d3a988e4e569e31b77909af884be1",
+      "canonical_ci_url": "https://ci-builds.apache.org/job/Commons/job/commons-math/1458/",
+      "canonical_evidence_level": "complete_case_results",
+      "canonical_tool": "maven",
+      "source_size": {
+        "java_files": 1088,
+        "java_physical_lines": 242983,
+        "java_source_bytes": 9599237
+      },
+      "module_count": 14,
+      "build_test_endpoint": "install",
+      "development_exposure": "not_identified_in_checked_manifests_not_a_training_nonexposure_claim",
+      "selected_job_elapsed_seconds": 898.88,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/apache/commons-math/7bc81e97e91d3a988e4e569e31b77909af884be1.json",
+        "tracked_java_files": 1088,
+        "archived_java_files": 1088
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "scope": "selected Jenkins cell",
+          "counts": {
+            "reported_total": 3768,
+            "passed": 3735,
+            "failed_or_error": 0,
+            "failures": null,
+            "errors": null,
+            "skipped": 33
+          }
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    },
+    {
+      "repo": "apache/poi",
+      "canonical_task_id": "6c25a9caa7e20fffab7f",
+      "canonical_sha": "dca7cda1dc8a64197f7e7e8e7892ba9a0d79c860",
+      "canonical_ci_url": "https://ci-builds.apache.org/job/POI/job/POI-DSL-1.17/1139/",
+      "canonical_evidence_level": "complete_case_results",
+      "canonical_tool": "gradle",
+      "source_size": {
+        "java_files": 3795,
+        "java_physical_lines": 726512,
+        "java_source_bytes": 27412066
+      },
+      "module_count": 10,
+      "build_test_endpoint": "Gradle clean jenkins（详见任务合同）",
+      "development_exposure": "not_identified_in_checked_manifests_not_a_training_nonexposure_claim",
+      "selected_job_elapsed_seconds": 1598.577,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/apache/poi/dca7cda1dc8a64197f7e7e8e7892ba9a0d79c860.json",
+        "tracked_java_files": 3795,
+        "archived_java_files": 3795
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "scope": "selected Jenkins cell",
+          "counts": {
+            "reported_total": 23927,
+            "passed": 23771,
+            "failed_or_error": 0,
+            "failures": null,
+            "errors": null,
+            "skipped": 156
+          }
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    },
+    {
+      "repo": "apache/curator",
+      "canonical_task_id": "8f689a73b7fa5a346d7e",
+      "canonical_sha": "88dee99a85921bd0f20955e1d7efbaf896fc17f3",
+      "canonical_ci_url": "https://github.com/apache/curator/actions/runs/29696829594/job/88218924956",
+      "canonical_evidence_level": "complete_suite_counts",
+      "canonical_tool": "maven",
+      "source_size": {
+        "java_files": 708,
+        "java_physical_lines": 90473,
+        "java_source_bytes": 3505736
+      },
+      "module_count": 13,
+      "build_test_endpoint": "install → verify",
+      "development_exposure": "mentioned_in_previous_SAG_run_or_benchmark_manifests",
+      "selected_job_elapsed_seconds": 3188.0,
+      "source_archive_coverage": {
+        "status": "java_paths_complete",
+        "evidence_file": "source-coverage-audit/apache/curator/88dee99a85921bd0f20955e1d7efbaf896fc17f3.json",
+        "tracked_java_files": 708,
+        "archived_java_files": 708
+      },
+      "reported_test_results_by_invocation": [
+        {
+          "scope": "Official default Java unit-test matrix cell. Build and install all13 default modules, then verify the upstream default9-module target excluding only the four separately defined ZooKeeper-version compatibility modules.",
+          "counts": {
+            "reported_total": 718,
+            "passed": 712,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 6
+          }
+        }
+      ],
+      "reference_replayed_in_agent_container": false
+    }
+  ]
+}

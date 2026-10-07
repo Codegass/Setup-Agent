@@ -836,7 +836,11 @@ def test_an_unreceipted_rollup_states_the_partition_it_came_from(bigtop, monkeyp
         "collection_errors_skipped",
         "receipt_scoped",
         "auxiliary_test_stats",
+        "execution_state",
+        "execution_reason",
     }
+    assert rollup["execution_state"] == "unknown"
+    assert rollup["execution_reason"]
     assert rollup["denominator_basis"] == "none"
     assert rollup["receipt_scoped"] is True
     assert rollup["unique"]["executed"] == 0

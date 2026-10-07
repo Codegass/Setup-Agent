@@ -199,10 +199,16 @@ def test_bound_advisor_tool_delegates_to_the_engine_consult():
     assert result.metadata["advisor"] == "advice"
 
 
-def test_advisor_tool_takes_no_parameters():
+def test_advisor_tool_accepts_optional_question_without_requiring_a_handoff():
     schema = AdvisorTool().get_parameter_schema()
 
-    assert schema == {"type": "object", "properties": {}, "additionalProperties": False}
+    assert not schema.get("required")
+    assert set(schema["properties"]) == {"question", "context"}
+    assert schema["additionalProperties"] is False
+    received = []
+    tool = AdvisorTool(consult_fn=lambda **kwargs: received.append(kwargs))
+    tool.execute(question="Which JVM executed the failing command?", context="I think Java 17 is active.")
+    assert received == [{"question": "Which JVM executed the failing command?", "context": "I think Java 17 is active."}]
 
 
 # --- (b) the ablation switch: mode "off" consults nothing -------------------
@@ -305,6 +311,7 @@ def test_successful_consult_returns_the_advice_and_records_telemetry():
             "phase": "build",
             "advice_chars": len("Install the provider first, then retry."),
             "outcome": "advice",
+            "trigger": {"reason": "actor_requested"},
         }
     ]
     # The consult clears the repeated-action redirect.
@@ -401,14 +408,25 @@ def _registration_agent():
 
 
 def test_the_advisor_is_registered_in_both_workflow_modes():
-    # Mode "off" answers through consult_advisor, so the tool is ALWAYS
-    # registered: the ablation switch must not change the tool surface.
+    # Both workflows can expose enabled, actor-accessible advice.
     for mode in ("setup", "run_task"):
         agent = _registration_agent()
         if mode == "run_task":
             agent.phase_machine = None
         names = {tool.name for tool in agent._initialize_tools(workflow_mode=mode)}
         assert "advisor" in names, f"advisor missing from the {mode} tool surface"
+
+
+@pytest.mark.parametrize("workflow", ["setup", "run_task"])
+@pytest.mark.parametrize("mode,access", [("off", True), ("same-model", False)])
+def test_no_consult_schema_when_off_or_automatic_only(workflow, mode, access):
+    agent = _registration_agent()
+    agent.config.advisor_mode = mode
+    agent.config.advisor_actor_access = access
+    if workflow == "run_task":
+        agent.phase_machine = None
+    tools = agent._initialize_tools(workflow_mode=workflow)
+    assert "advisor" not in {tool.name for tool in tools}
 
 
 def test_the_agent_binds_the_engine_consult_to_the_registered_tool():
@@ -473,6 +491,7 @@ def test_the_run_pin_carries_advisor_telemetry(tmp_path):
                 "phase": "build",
                 "advice_chars": len("Run the failing module alone next."),
                 "outcome": "advice",
+                "trigger": {"reason": "actor_requested"},
             }
         ],
     }

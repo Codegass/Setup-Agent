@@ -57,13 +57,21 @@ Settings are read from environment variables and the repository's `.env` file.
 | `SAG_ADVISOR_MODE` | `same-model` (default), another model name, or `off`. |
 | `SAG_ADVISOR_REASONING_EFFORT` | Independent advisor reasoning setting; blank keeps the provider default. |
 | `SAG_ADVISOR_CONTEXT_WINDOW` | Advisor deployment window, default `65536` tokens. Budgeting also respects known model limits and reserves space for output and safety. |
-| `SAG_ADVISOR_CONTEXT_COMPRESSION` | `extractive` (default) or `semantic`. Semantic compression uses the executing model to summarize background material when needed. |
+| `SAG_ADVISOR_CONTEXT_SELECTION` | `all` (legacy default), `relevant`, `brief`, or `on-demand`. `brief` sends the task and observed facts; `on-demand` also allows bounded searches and paged reads of archived evidence. |
+| `SAG_ADVISOR_TRIGGER_POLICY` | `phase-entry` (legacy default), `problems`, or `adaptive`. `adaptive` leaves routine consultations to the actor and adds a fallback for an existing repeated-no-progress signal or evidence conflict. It does not cancel planned work to demand advice. |
+| `SAG_ADVISOR_CONTEXT_COMPRESSION` | `extractive` (default) or `semantic` for legacy context modes. `brief` and `on-demand` use programmatic excerpts/splits and make no extra summary-model calls. |
+| `SAG_ADVISOR_ACTOR_NOTE` | Include the actor's optional question/hypothesis, default `true`. Machine observations are supplied independently; an actor note never becomes evidence. |
+| `SAG_ADVISOR_MAX_READ_ROUNDS` / `SAG_ADVISOR_READ_MAX_CHARS` | In `on-demand` mode, allow up to `3` evidence reads and `12000` source characters per read, then one final advice response. Every provider request is recorded and charged. |
 | `SAG_ADVISOR_MAX_TOKENS` / `SAG_ADVISOR_PHASE_CAP` | Advisor response limit and consults per phase; defaults `2048` and `4`. |
 | `SAG_MAX_ITERATIONS` | Run iteration limit, default `50`. |
+| `SAG_CODE_MODE` | Experimental opt-in `code` tool, default `false`. Requires a [prepared container runtime](src/sag/code_runtime/README.md); native tools remain available. |
+| `SAG_MAX_LOGICAL_TOOL_CALLS` | Shared limit for native actions and code child calls, default `150`. |
 | `SAG_MAX_WALL_CLOCK_SECONDS` | Whole-run time limit, default `7200` seconds. |
 | `SAG_DISPATCH_SOFT_TIMEOUT_SECONDS` | Time before a long command returns as a background job, default `900` seconds. This is not a command kill timeout. |
 
 Set the advisor window for the deployment you actually use. A blank override uses the local model catalog, with a disclosed fallback for unknown models. `SAG_ADVISOR_SUMMARY_CONTEXT_WINDOW` can separately bound the summarizer's window.
+
+The actor may call `advisor(question, context)` with a short uncertainty and proposed next step; both arguments are optional. In `on-demand` mode the advisor receives a consultation-local catalog with source hashes. It can search literal text, read line ranges and continue long lines. These tools only inspect frozen recorded bytes. Missing live source or environment information must be obtained by the actor. Advice cannot execute commands, change requirements, or certify success; phases and the physical verifier remain authoritative.
 
 ## Execution and architecture
 
@@ -81,7 +89,7 @@ The model chooses tool calls within each phase. The engine handles dispatch, per
 | `build` | Route to Maven, Gradle, or Python using the project survey. Actions include `deps`, `compile`, `test`, `verify`, `package`, `install`, and `native`, subject to backend support. |
 | `bash` / `file_io` | Run container commands and read, write, or edit files. |
 | `search` | Retrieve stored output, search files and background logs, or search the web. |
-| `advisor` | Request guidance from a fresh-context reviewer. The advisor receives task, evidence, history, and tool definitions, but cannot call tools. The engine also consults it on entering a phase. |
+| `advisor` | Request a fresh review with an optional question/hypothesis. Context selection and automatic triggers are configurable; `on-demand` enables archived-evidence reads only. Advice has no execution or verdict authority. |
 | `phase` | Signal that a phase is done, blocked, or worth a note. (`manage_context` serves the same purpose for `sag run` follow-up tasks.) |
 | `report` | Write the phase's deliverable inside the container; the reader's report is produced on the host when the run ends. |
 
@@ -126,7 +134,7 @@ For implementation details, start with:
 | Trajectory, result card, report | [`trajectory/`](src/sag/trajectory/), [`result_card/`](src/sag/result_card/), [`report_document/`](src/sag/report_document/) |
 | Terminal turn stream and result block | [`console/turn_stream.py`](src/sag/console/turn_stream.py), [`console/result_block.py`](src/sag/console/result_block.py) |
 | Fixed tasks and CI comparison | [`acceptance_task.py`](src/sag/agent/acceptance_task.py), [`ci_comparison.py`](src/sag/agent/ci_comparison.py), [`metrics/`](src/sag/metrics/) |
-| Advisor context | [`advisor_context.py`](src/sag/agent/advisor_context.py), [`advisor_compaction.py`](src/sag/agent/advisor_compaction.py) |
+| Advisor context | [`advisor_context.py`](src/sag/agent/advisor_context.py), [`advisor_review.py`](src/sag/agent/advisor_review.py), [`advisor_compaction.py`](src/sag/agent/advisor_compaction.py) |
 | Workbench | [`src/sag/web/`](src/sag/web/), [`webui/`](webui/) |
 
 ## Reading a result
@@ -191,6 +199,12 @@ PYTHONPATH=. uv run python scripts/small_ci_bench.py --help
 Missing CI scope receives no scope score. A missing target, unmatched matrix cell, revision mismatch, or incomplete evidence is shown with a reason; it must not be counted as CI attainment. Missing scope never supplies a fallback `1/1` score. Lifecycle-command parity is disclosed separately from scope attainment.
 
 For model or strategy ablations, keep the project commits, task definitions, CI cells, resource limits, and run budgets fixed. Compare task completion and concrete build/test counts before time and cost. Equal test totals alone do not prove identical test coverage, and changing the evaluator does not constitute a new successful run.
+
+The optional **requirements v2** analysis separates compilation, packaging, installation, tests, documentation and quality checks within a frozen task. Add `--requirements-file requirements.json` together with an explicit full `--ref`, acceptance task and CI target. Reviewed definitions and recorded worktree/runtime evidence are required; draft definitions cannot start a formal campaign. SAG and the portable recorder share the offline scorer. Its sidecar does not replace the existing sealed verdict or reinterpret historical scores. See the [recording and evaluation protocol](docs/benchmark-requirements-v2.md) for commands, intervention records, token-accounting limits and current readiness.
+
+Primary comparisons must use **agent-owned execution evidence**. An external build after the agent exits measures environment readiness and cannot fill missing agent work. The updated campaign runner removes this automatic build and records the evidence location in `primary-evidence.json`. Native tools are retained: baseline hooks and a passive Maven process observer collect evidence without issuing build/test commands. A bounded Commons CLI qualification passed for all three harnesses; Gradle, wrappers and multiple builds within one tool call still need qualification, so formal baseline campaign admission remains blocked. Historical 60-run scores retain their original post-agent acceptance meaning. SAG's phase state machine and physical checks are unchanged. See the [execution-boundary qualification](docs/superpowers/reports/2026-09-26-native-execution-qualification.md).
+
+The [research dataset guide](docs/benchmark-dataset.md) links the versioned Java project registry, its selection rules, and evidence archives. It distinguishes candidate collection, admission as an official CI reference, and readiness for an agent experiment.
 
 ## Inspecting and managing runs
 

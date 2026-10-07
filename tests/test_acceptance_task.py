@@ -545,20 +545,20 @@ def test_task_feedback_precedes_seal_and_accepts_an_honest_partial_claim(tmp_pat
         ),
     )
     tool.bind_execution_plan_evidence(run.storage)
-    green = tool._grade(
+    green = tool.grade_claim(
         PhaseClaim(phase="test", signal="done", claimed_outcome="success"), "test", sealed=False
     )
     assert not green.accepted
     assert green.code == "required_task_incomplete"
     assert green.validated_facts["physical_test_validator_state"] == "green"
     assert green.validated_facts["task_completion"]["steps"][1]["status"] == "missing"
-    partial = tool._grade(
+    partial = tool.grade_claim(
         PhaseClaim(phase="test", signal="done", claimed_outcome="partial"), "test", sealed=False
     )
     assert partial.accepted and partial.validated_outcome is PhaseOutcome.PARTIAL
     assert not run.state.sealed
     retain(run, dispatch(run, "mvn verify", suffix="after-feedback"))
-    assert tool._grade(
+    assert tool.grade_claim(
         PhaseClaim(phase="test", signal="done", claimed_outcome="success"), "test", sealed=False
     ).accepted
 

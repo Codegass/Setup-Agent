@@ -37,20 +37,30 @@ from sag.agent.phase_gates import (
 )
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome, PhaseTermination
 from sag.agent.react_llm import NativeToolCall, NativeTurn
+from sag.agent.report_delivery import report_delivery_binding
 from sag.agent.verdict_finalizer import ReportDeliveryStatus, RunTerminationStatus
+from sag.agent.verdict_finalizer import read_live_verdict_snapshot
 from sag.tools.base import BaseTool, ToolResult
 
 
 class _ReportTool(BaseTool):
     """A report tool that delivers, so delivery status is the loop's answer."""
 
-    def __init__(self):
+    def __init__(self, orchestrator):
         super().__init__("report", "Deliver the run report")
         self.calls = 0
+        self.orchestrator = orchestrator
 
     def execute(self, **kwargs) -> ToolResult:
         self.calls += 1
-        return ToolResult.completed_success(output="report delivered")
+        snapshot = read_live_verdict_snapshot(self.orchestrator)
+        path = "/workspace/setup-report-deadline.md"
+        content = f"# Setup result: {snapshot.verdict}\n"
+        self.orchestrator.files[path] = content
+        return ToolResult.completed_success(
+            output="report delivered",
+            metadata={"report_delivery": report_delivery_binding(snapshot, path, content)},
+        )
 
 
 def _report_turn(index):
@@ -71,7 +81,9 @@ def _report_turn(index):
 def _loop_engine(turns, *, barrier_status, disclose=True):
     """A phase-mode engine whose barrier answers `barrier_status` in `test`."""
     engine = _engine(turns)
-    report_tool = _ReportTool()
+    engine.orchestrator = engine.verdict_finalizer.orchestrator
+    engine.config.advisor_mode = "off"
+    report_tool = _ReportTool(engine.orchestrator)
     engine.tools["report"] = report_tool
     engine._get_tool_orchestrator().tools["report"] = report_tool
     engine.report_tool = report_tool

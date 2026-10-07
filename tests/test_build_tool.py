@@ -112,6 +112,29 @@ def _tool(markers, maven=None, gradle=None):
     )
 
 
+@pytest.mark.parametrize("runner, expected", [("mvn", False), ("./mvnw", True)])
+@pytest.mark.parametrize("entry", ["complete", "source"])
+def test_explicit_maven_runner_family_reaches_backend_unchanged(runner, expected, entry):
+    backend = FakeBackendTool()
+    tool = _tool({"pom.xml"}, maven=backend)
+    command = runner + " test"
+    params = ({"command": command} if entry == "complete" else
+              {"system": "maven", "action": "test", "source_command": command})
+    tool.execute(working_directory="/workspace/project", **params)
+    assert len(backend.calls) == 1
+    assert backend.calls[0]["use_wrapper"] is expected
+    assert backend.calls[0]["_source_argv"] == ["test"]
+
+
+def test_action_only_maven_keeps_automatic_launcher_selection():
+    backend = FakeBackendTool()
+    _tool({"pom.xml"}, maven=backend).execute(
+        system="maven", action="test", working_directory="/workspace/project"
+    )
+    assert len(backend.calls) == 1
+    assert "use_wrapper" not in backend.calls[0]
+
+
 def test_maven_project_routes_compile_to_maven_backend():
     maven = FakeBackendTool()
     tool = _tool({"pom.xml"}, maven=maven)

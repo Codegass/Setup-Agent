@@ -786,7 +786,8 @@ def test_record_invocation_persists_every_v2_fact_it_could_observe():
     )
 
     (receipt,) = receipts_written(execute.commands)
-    assert metadata == {"receipt_id": receipt["receipt_id"]}
+    assert metadata["receipt_id"] == receipt["receipt_id"]
+    assert metadata["receipt_view"]["observed"]["actual_cwd"] == receipt["actual_cwd"]
     assert receipt["schema_version"] == 3
     assert receipt["target_sha"] == SHA
     assert receipt["config_fingerprint"] == "cfg-7"
@@ -890,7 +891,8 @@ def test_record_invocation_still_writes_a_receipt_when_every_probe_is_silent():
     )
 
     (receipt,) = receipts_written(execute.commands)
-    assert metadata == {"receipt_id": receipt["receipt_id"]}
+    assert metadata["receipt_id"] == receipt["receipt_id"]
+    assert metadata["receipt_view"]["observed"]["effective_jdk"] is None
     assert receipt["outcome"] == "failed"
     assert set(receipt) == {
         "schema_version",

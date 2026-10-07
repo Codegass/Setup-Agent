@@ -1091,6 +1091,7 @@ def check_phase_claim(
     sealed: bool = False,
     disclosed_job_ids: Iterable[str] = (),
     expected_analysis_attempt_id: str | None = None,
+    report_delivery: Mapping | None = None,
 ) -> GateResult:
     """Inspect physical evidence and validate one terminal phase claim.
 
@@ -1112,6 +1113,7 @@ def check_phase_claim(
         sealed=sealed,
         disclosed_job_ids=disclosed_job_ids,
         expected_analysis_attempt_id=expected_analysis_attempt_id,
+        report_delivery=report_delivery,
     )
     return validate_phase_claim(
         claim,
@@ -1135,6 +1137,7 @@ def check_phase_done(
     sealed: bool = False,
     disclosed_job_ids: Iterable[str] = (),
     expected_analysis_attempt_id: str | None = None,
+    report_delivery: Mapping | None = None,
 ) -> dict[str, Any]:
     """Read-only compatibility projection for engine nudges during WS3.
 
@@ -1160,6 +1163,7 @@ def check_phase_done(
         sealed=sealed,
         disclosed_job_ids=disclosed_job_ids,
         expected_analysis_attempt_id=expected_analysis_attempt_id,
+        report_delivery=report_delivery,
     )
     state, reason = settled_observation(
         observation.state, observation.reason, observation.validated_facts
@@ -1366,6 +1370,7 @@ def _inspect_phase(
     sealed: bool = False,
     disclosed_job_ids: Iterable[str] = (),
     expected_analysis_attempt_id: str | None = None,
+    report_delivery: Mapping | None = None,
 ) -> _ValidatorObservation:
     jobs = _settle_before_grading(
         orchestrator,
@@ -1392,7 +1397,9 @@ def _inspect_phase(
             blocker_owner=BlockerOwner.HARNESS,
         )
 
-    if phase == "analyze":
+    if phase == "report":
+        observation = _inspect_report(orchestrator, report_delivery)
+    elif phase == "analyze":
         observation = _inspect_phase_evidence(
             phase,
             validator,
@@ -2680,25 +2687,29 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
     )
 
 
-def _inspect_report(orchestrator) -> _ValidatorObservation:
-    if orchestrator is None:
-        raise RuntimeError("no orchestrator available")
-    probe = orchestrator.execute_command(
-        "find /workspace -maxdepth 1 -name 'setup-report-*.md' | head -1",
-        workdir=None,
-        timeout=30,
-    )
-    report_ref = (probe.get("output") or "").strip()
-    if not report_ref:
+def _inspect_report(orchestrator, delivery: Mapping | None = None) -> _ValidatorObservation:
+    from .report_delivery import verify_report_delivery
+
+    if not delivery:
         return _ValidatorObservation(
             ValidatorState.RED,
-            reason="report phase has no setup-report-*.md artifact",
-            suggestions=("A persisted setup-report artifact is required for closure.",),
+            reason="report phase has no current sealed-snapshot delivery",
+            suggestions=("Use report(action='generate', status=...) to render the sealed result.",),
             code="report_missing",
+        )
+    try:
+        verify_report_delivery(orchestrator, delivery)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _ValidatorObservation(
+            ValidatorState.RED,
+            reason=f"report delivery is unverified: {exc}",
+            code="report_delivery_unverified",
+            suggestions=("Regenerate the report from the current sealed snapshot.",),
         )
     return _ValidatorObservation(
         ValidatorState.GREEN,
-        reason="report artifact exists",
-        evidence_refs=(report_ref,),
+        reason="persisted report bytes match the current sealed snapshot",
+        evidence_refs=(delivery["path"],),
+        validated_facts={"report.delivery": dict(delivery)},
         code="report_present",
     )

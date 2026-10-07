@@ -1070,6 +1070,9 @@ def freeze_contract(
             "the dispatch it was frozen for must be refused"
         )
         return None
+    from sag.agent.worktree_evidence import record_contract_worktree
+
+    record_contract_worktree(execute, contract)
     return contract
 
 

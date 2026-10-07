@@ -97,6 +97,7 @@ EXECUTION_FAULT = "execution_fault"
 ASSESSMENT_BUNDLE_COMPLETE = "assessment_bundle_complete"
 ASSESSMENT_OUTPUT_UNAVAILABLE = "assessment_output_unavailable"
 TEST_FAILURE_EXIT = "test_failure_exit"
+TEST_SCOPE_COMPLETED = "test_scope_completed"
 
 PREREQUISITE_EXECUTABLE_MISSING = "prerequisite_executable_missing"
 PREREQUISITE_SERVICE_UNAVAILABLE = "prerequisite_service_unavailable"
@@ -1519,6 +1520,28 @@ def assess_dispatch(
     assessments.extend(prerequisite_assessments(receipt, output, evidence_ref=evidence_ref))
     assessments.extend(execution_faults(receipt, output, evidence_ref=evidence_ref))
     assessments.extend(test_failure_exits(receipt, output))
+    if (bound and isinstance(contract, Mapping)
+            and primary.typed_code not in (CONTRACT_BINDING_UNKNOWN, STALE_FINGERPRINT, DEVIATED_RECEIPT)):
+        # Optional frozen acceptance scope: the boundary observer has already
+        # copied this receipt's reports. Later documentation/quality failures
+        # must not erase independently completed test goals.
+        owner = getattr(execute, "__self__", None)
+        observer = getattr(owner, "requirement_observer", None)
+        complete_scope = getattr(observer, "completed_test_scope", None)
+        if callable(complete_scope):
+            try:
+                proof = complete_scope(contract, receipt, output)
+                if proof is not None:
+                    assessments.append(ReceiptAssessment(
+                        receipt_id=_text(receipt.get("receipt_id")),
+                        typed_code=TEST_SCOPE_COMPLETED,
+                        detail="all frozen test pools passed native completion and fresh report checks",
+                        fingerprints=_pinned_fingerprints(contract, receipt),
+                        scope=proof["sha256"], evidence_ref=proof["path"],
+                        blocker_owner=BlockerOwner.NONE,
+                    ))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                logger.warning("Frozen test-scope completion is unavailable: {}", exc)
     assessments.extend(capability_absences(receipt))
     assessments.extend(dependency_incompatibilities(receipt))
     assessments.extend(java_version_mismatch(receipt, output))

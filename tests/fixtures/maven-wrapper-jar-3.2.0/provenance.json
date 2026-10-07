@@ -1,0 +1,16 @@
+{
+  "source": "Archived official Apache Maven Wrapper 3.2.0 source and artifact; reviewed before the pilot.",
+  "urls": [
+    "https://repo.maven.apache.org/maven2/org/apache/maven/wrapper/maven-wrapper/3.2.0/maven-wrapper-3.2.0.jar",
+    "https://repo.maven.apache.org/maven2/org/apache/maven/wrapper/maven-wrapper/3.2.0/maven-wrapper-3.2.0-sources.jar"
+  ],
+  "files": {
+    "SystemPropertiesHandler.java": "cf3a04f1735d73a448ee8b5c5b3d25ded3ea138cfef66bb594655625114d5ae2",
+    "maven-wrapper.properties": "07bf15f249f969d81c8b4a4014e9234d2eb69c498fa1c04c2e5e65249e531d4b",
+    "MavenWrapperMain.java": "62a3db6fee14b0576de9e45ce2f17b499b2de8c2531b01483fdd448b8d6b2083",
+    "WrapperExecutor.java": "83c5059ce1644f4270179d71b3c0e2e0429fd6d73fd2ecb7a3fe0c1ba82ee4f4",
+    "maven-wrapper-3.2.0.jar": "e63a53cfb9c4d291ebe3c2b0edacb7622bbc480326beaa5a0456e412f52f066a",
+    "BootstrapMainStarter.java": "06c6330999b970cb65244abf2e7105332f4e43e9f698b1d1ac0334bd885971a2",
+    "mvnw": "94793c07cfa412621d5bca972fa04296cd46e32e0e53c7ebe7fc83bd6bbecaf7"
+  }
+}

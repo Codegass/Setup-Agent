@@ -329,18 +329,25 @@ def test_report_recovery_intersects_the_sealed_execution_policy(
 def test_missing_report_can_be_submitted_through_a_real_repair_intent(
     tmp_path, monkeypatch
 ):
-    from test_terminal_claim_convergence import _engine
+    from test_token_overhead_regressions import _report_engine
     from test_tool_orchestration_parameters import _orchestrator
 
     from sag.agent.phase_gates import ValidatorState, validate_phase_claim
-    from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
+    from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
+    from sag.agent.control_events import ControlEventSink
+    from sag.agent.loop_memory import LoopMemory
+    from sag.agent.report_delivery import verify_report_delivery
+    from sag.agent.verdict_finalizer import read_live_verdict_snapshot
+    from sag.runtime.container_io import read_container_text
     from sag.tools.report_tool import ReportTool
 
-    engine = _engine()
-    engine.phase_machine = PhaseMachine(start_phase="report")
-    engine.run_evidence_state.seal(finalized_at="2026-09-14T00:00:00Z")
-    engine.verdict_finalizer = SimpleNamespace(has_current_snapshot=lambda state: True)
-    report = ReportTool()
+    engine, snapshot = _report_engine()
+    engine.orchestrator.execute_control_command = engine.orchestrator.execute_command
+    engine.control_event_sink = ControlEventSink(
+        tmp_path / "control_events.jsonl", run_id=snapshot.run_id
+    )
+    engine.loop_memory = LoopMemory(completion_claim_cap=3)
+    report = ReportTool(docker_orchestrator=engine.orchestrator, workflow_mode="setup")
     engine.tools["report"] = report
     engine._active_native_tool_call_id = "call-report-recovery"
     claim = PhaseClaim(
@@ -357,18 +364,15 @@ def test_missing_report_can_be_submitted_through_a_real_repair_intent(
     engine._pending_repair_context = context
     assert {a.tool for a in context.allowed_tool_affordances} == {"report"}
 
-    # The formatter is outside this policy experiment; write a small artifact
-    # through the real report tool, normalizer, and pre-dispatch repair gate.
-    path = tmp_path / "setup-report-recovered.md"
-
-    def render(*args, **kwargs):
-        path.write_text("# Recorded setup result\n")
-        return path.read_text(), "partial", str(path), {}, {}
-
-    monkeypatch.setattr(report, "_generate_comprehensive_report", render)
-    monkeypatch.setattr(
-        report, "_generate_condensed_log_output", lambda *args: str(path)
-    )
+    # Stub rendering decoration only. Persistence and the exact-byte binding
+    # to the authoritative sealed snapshot must use the real delivery path.
+    content = "# Recorded setup result: partial\n"
+    monkeypatch.setattr(report, "_get_project_info", lambda: {})
+    monkeypatch.setattr(report, "_collect_execution_metrics", lambda: {})
+    monkeypatch.setattr(report, "_assemble_report_metrics_artifact", lambda **kw: {})
+    monkeypatch.setattr(report, "_persist_report_metrics", lambda data: True)
+    monkeypatch.setattr(report, "_generate_console_report", lambda *args: "partial")
+    monkeypatch.setattr(report, "_generate_markdown_report", lambda *args: content)
     call = ToolCall(
         name="report",
         raw_params={"action": "generate", "status": "partial"},
@@ -391,6 +395,11 @@ def test_missing_report_can_be_submitted_through_a_real_repair_intent(
         execution.observation_text
     )
     engine._record_execution_bundle(execution, call)
-    assert path.exists() and engine._report_delivered
+    delivery = execution.result.metadata["report_delivery"]
+    verify_report_delivery(engine.orchestrator, delivery)
+    assert read_container_text(engine.orchestrator, delivery["path"], exact_bytes=True) == content
+    assert engine._report_delivered
+    assert engine._report_delivery == delivery
     assert call.action_intent.repair_context_id == context.repair_context_id
     assert engine.run_evidence_state.model_dump_json() == before
+    assert read_live_verdict_snapshot(engine.orchestrator) == snapshot

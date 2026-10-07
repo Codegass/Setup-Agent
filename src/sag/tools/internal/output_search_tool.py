@@ -114,6 +114,8 @@ class OutputSearchTool(BaseTool):
                     show_line_numbers,
                     offset=offset,
                     ignore_case=ignore_case,
+                    column_offset=column_offset,
+                    max_chars=max_chars,
                 )
             elif action == "list":
                 return self._list_outputs(task_id, tool_name, limit)
@@ -321,6 +323,8 @@ class OutputSearchTool(BaseTool):
         *,
         offset: int = 0,
         ignore_case: bool = False,
+        column_offset: int = 0,
+        max_chars: int = 20_000,
     ) -> ToolResult:
         """Search within a specific output with grep-like functionality."""
         if not ref_id:
@@ -363,7 +367,7 @@ class OutputSearchTool(BaseTool):
         lines = output.split("\n")
         matches = []
         total_matches = 0
-        if offset < 0 or limit < 1 or context_lines < 0:
+        if offset < 0 or limit < 1 or context_lines < 0 or column_offset < 0 or max_chars < 1:
             raise ToolError(
                 "offset/context_lines must be nonnegative and limit positive",
                 category="validation",
@@ -416,6 +420,38 @@ class OutputSearchTool(BaseTool):
                     else:
                         result_lines.append(f"{line_marker} {lines[i]}")
 
+        # Long receipt JSON/XML lines need the matched region, not the line's
+        # unrelated head and tail. Preserve the original source ref and expose
+        # an intra-line cursor; the model can still read arbitrary source pages.
+        if column_offset or any(len(lines[i]) > 2048 for i in matches) or len("\n".join(result_lines)) > min(max_chars, 100_000):
+            from sag.tools.search_snippets import grep_line_page
+
+            preview, continuation, locations = grep_line_page(
+                [f"{i + 1}:{lines[i]}" for i in matches], grep_pattern,
+                ignore_case=ignore_case, offset=offset, column_offset=column_offset,
+                max_chars=max_chars, regex_dialect="python",
+            )
+            if continuation is None and offset + len(matches) < total_matches:
+                continuation = {"offset": offset + len(matches), "column_offset": 0}
+            result_lines = [
+                f"Match excerpts in {ref_id}; {total_matches} matching lines. "
+                "Line context is bounded here; read the source ref for full context.", preview,
+            ]
+            if continuation is not None:
+                import json
+                result_lines.append("Next search: " + json.dumps({
+                    "target": ref_id, "pattern": grep_pattern, "max_results": limit,
+                    "ignore_case": ignore_case, "context_lines": context_lines,
+                    "max_chars": min(max_chars, 100_000), **continuation,
+                }, ensure_ascii=False))
+            return ToolResult.completed_success(
+                output="\n".join(result_lines), raw_output=output, output_ref=ref_id,
+                metadata={"output_page": True, "source_ref": ref_id,
+                          "total_matches": total_matches, "matches_shown": len(locations),
+                          "next": continuation, "match_locations": locations,
+                          "next_offset": continuation["offset"] if continuation else None},
+            )
+
         # Add summary
         next_offset = offset + len(matches)
         if next_offset < total_matches:
@@ -433,6 +469,7 @@ class OutputSearchTool(BaseTool):
                 "source_ref": ref_id,
                 "total_matches": total_matches,
                 "matches_shown": len(matches),
+                "output_page": True,
                 "context_lines": context_lines,
                 "next_offset": next_offset if next_offset < total_matches else None,
             },

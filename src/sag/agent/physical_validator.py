@@ -2473,6 +2473,7 @@ class PhysicalValidator:
             PREREQUISITE_EXECUTABLE_MISSING,
             PREREQUISITE_SERVICE_UNAVAILABLE,
             STALE_FINGERPRINT,
+            TEST_SCOPE_COMPLETED,
             receipt_assessment_bundle_complete,
             test_outcome_diagnostics_complete,
         )
@@ -2601,6 +2602,7 @@ class PhysicalValidator:
             elif count and (
                 (exit_code == 0 and EXPECTATION_MET in codes)
                 or (red and EXPECTATION_UNMET in codes and "test_failure_exit" in codes)
+                or TEST_SCOPE_COMPLETED in codes
             ):
                 completed.append(receipt_id)
             else:
@@ -3307,6 +3309,31 @@ class PhysicalValidator:
         modules_without_tests = []
 
         try:
+            from sag.benchmark.ci_sources import frozen_test_scope
+
+            orchestrator = self.docker_orchestrator
+            scope = frozen_test_scope(
+                getattr(orchestrator, "acceptance_task", None),
+                getattr(orchestrator, "benchmark_requirements", None),
+                getattr(orchestrator, "benchmark_evaluation_protocol", None),
+            )
+            if scope is not None:
+                # A production-only reactor member is not a missing test pool.
+                # Every declared pool still needs reports, including failsafe.
+                observed = {posixpath.normpath(p) for p in report_dirs}
+                for module, directories in scope.items():
+                    for directory in sorted(directories):
+                        path = posixpath.join(project_dir, directory)
+                        if path in observed:
+                            continue
+                        probe = self._execute_command_with_logging(
+                            f"find {shlex.quote(path)} -maxdepth 1 -type f -name '*.xml' -print -quit 2>/dev/null",
+                            f"checking declared test pool {directory}",
+                        )
+                        if not probe.get("success") or not probe.get("output", "").strip():
+                            modules_without_tests.append(module)
+                            break
+                return modules_without_tests
             # Check if root pom.xml has <modules> section
             pom_check_cmd = f"test -f {project_dir}/pom.xml && echo 'EXISTS' || echo 'MISSING'"
             pom_result = self._execute_command_with_logging(
@@ -6184,7 +6211,7 @@ class PhysicalValidator:
             "conflicts": list(dict.fromkeys(conflicts)),
             "evidence_refs": list(report_files) or [project_dir],
         }
-        if execution_summary.get("state") != "unknown":
+        if execution_summary.get("state") is not None:
             result["test_execution_state"] = execution_summary["state"]
             result["test_execution_reason"] = execution_summary.get("reason")
             result["test_execution_receipt_ids"] = list(execution_summary.get("receipt_ids") or ())
@@ -6217,7 +6244,7 @@ class PhysicalValidator:
                 f"⚠️ MISSING TEST REPORTS: {untested_count} modules have no test results: {', '.join(result['modules_without_tests'])}"
             )
             logger.warning(
-                f"📊 Found {result['total_tests']} tests executed, but some modules were skipped"
+                f"Found {result['total_tests']} test records; missing reports do not establish whether a test pool was skipped"
             )
             logger.info(
                 "Observed constraint: module test coverage is incomplete; "

@@ -268,9 +268,10 @@ class ReportTool(BaseTool):
         BaseTool.__init__(
             self,
             name="report",
-            description="Generate comprehensive project setup report and mark task as complete. "
-            "Creates both console output and a Markdown file in /workspace. "
-            "Use this tool when all main tasks are finished to summarize the work done.",
+            description="Generate a persisted setup report from the sealed evidence snapshot. "
+            "Creates console output and a Markdown file in /workspace. "
+            "Reports the verified result, including partial or failed outcomes. "
+            "The controller verifies delivery and closes the report phase.",
         )
         self.docker_orchestrator = docker_orchestrator
         self.execution_history_callback = execution_history_callback
@@ -491,10 +492,8 @@ class ReportTool(BaseTool):
                     result_evidence_status
                 )
 
-                # Mark this as a completion signal for the ReAct engine
                 metadata = {
-                    "task_completed": True,
-                    "completion_signal": True,
+                    "report_generated": True,
                     "status": result_status,
                     "final_flow_status": result_status,
                     "verified_status": verified_status,  # Include the verified status
@@ -503,6 +502,10 @@ class ReportTool(BaseTool):
                     "report_snapshot": report_snapshot,
                     "context_task_completed": completed_context_task,
                 }
+                if self.workflow_mode == "setup":
+                    metadata["report_delivery"] = report_snapshot["report_delivery"]
+                else:
+                    metadata.update(task_completed=True, completion_signal=True)
                 if result_test_stats:
                     metadata["test_stats"] = self._serialize_report_test_stats(result_test_stats)
                 if result_conflicts:
@@ -1266,6 +1269,14 @@ class ReportTool(BaseTool):
 
         if not self._save_markdown_report(markdown_report, timestamp, report_filename):
             raise OSError(f"failed to persist setup report: /workspace/{report_filename}")
+
+        from sag.agent.report_delivery import report_delivery_binding, verify_report_delivery
+
+        delivery = report_delivery_binding(
+            snapshot, report_snapshot["report_path"], markdown_report
+        )
+        verify_report_delivery(self.docker_orchestrator, delivery)
+        report_snapshot["report_delivery"] = delivery
 
         self._persist_report_metrics(report_metrics)
 
@@ -2484,10 +2495,11 @@ class ReportTool(BaseTool):
             project_type = project.get("type", "Unknown")
             build_system = project.get("build_system", "Unknown")
             condensed_lines = [
-                f"🎯 SETUP COMPLETED: {icon} {verdict.upper()}",
+                f"📄 REPORT GENERATED — sealed setup result: {icon} {verdict.upper()}",
                 *list(self._snapshot_rate_lines(snapshot) or ()),
                 f"📂 Project: {project_type} ({build_system})",
                 f"📄 Full report saved to: {snapshot['report_path']}",
+                "The controller verifies delivery and closes the report phase; this tool does not close it.",
             ]
             conflicts = (snapshot.get("evidence_result") or {}).get("conflicts") or []
             if conflicts:
@@ -4966,6 +4978,13 @@ with open(lock_path,"a+b") as lock:
         self, markdown_content: str, timestamp: str, report_filename: str
     ) -> bool:
         """Save markdown report to workspace using here-doc for safe handling."""
+
+        if self.workflow_mode == "setup":
+            from sag.utils.container_io import write_container_text_atomic
+
+            return write_container_text_atomic(
+                self.docker_orchestrator, f"/workspace/{report_filename}", markdown_content
+            ).persisted
 
         try:
             if self.docker_orchestrator:

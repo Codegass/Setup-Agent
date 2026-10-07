@@ -96,6 +96,11 @@ class SnapshotOrchestrator:
             )
 
     def execute_command(self, command, **kwargs):
+        # Setup reports now use the common atomic writer. Fail its initial
+        # temporary-file write as well as the older heredoc paths below.
+        if self.fail_report_writes and command.startswith(": > /workspace/setup-report-"):
+            self.commands.append(command)
+            return {"exit_code": 1, "success": False, "output": "write failed"}
         if "SAG_NAMED_JSON_RECORD_V1" in command or "SAG_JSON_RECORD_V1" in command:
             return self.filesystem(command, **kwargs)
 

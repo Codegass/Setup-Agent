@@ -1,0 +1,67 @@
+{
+  "repository": "https://github.com/earendil-works/pi",
+  "commit": "a276dabe57911253350bffb93cb7d7aff6a73261",
+  "source_files": [
+    {
+      "path": "packages/codemode/src/declarations.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/declarations.ts",
+      "bytes": 13281,
+      "sha256": "60da0130f0c1347c6a53d682adc6e5d62a60ca2c1929ed97840023dd3c310509"
+    },
+    {
+      "path": "packages/codemode/src/identifier.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/identifier.ts",
+      "bytes": 478,
+      "sha256": "c920a297e79186edc61348906950b639e8d67602122f165fb98012fd32be2f11"
+    },
+    {
+      "path": "packages/codemode/src/index.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/index.ts",
+      "bytes": 1029,
+      "sha256": "6d3370dc2f39c791784a7156db69c0021d1034edc97ca6eaeaafd9b24d5c1164"
+    },
+    {
+      "path": "packages/codemode/src/runtime/host.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/runtime/host.ts",
+      "bytes": 12255,
+      "sha256": "b81e1bb07f3cd7e612c5ed03b6d23929acf3738be764c0741b85306d8221c522"
+    },
+    {
+      "path": "packages/codemode/src/runtime/prelude-source.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/runtime/prelude-source.ts",
+      "bytes": 15135,
+      "sha256": "bd544106d5bd36543be4e5fc21128c9cd46b26856fb0b17931250b955f93c24a"
+    },
+    {
+      "path": "packages/codemode/src/runtime/protocol.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/runtime/protocol.ts",
+      "bytes": 2390,
+      "sha256": "b5150df8e6c743f99a94f13cf6f4ae7515768bb9e6305e1a7e4dacd20e4dc6ff"
+    },
+    {
+      "path": "packages/codemode/src/runtime/worker.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/runtime/worker.ts",
+      "bytes": 5170,
+      "sha256": "f2e4854de6c9713390148a7d02b35e753065aca42c759ca14676f90f937f0a8a"
+    },
+    {
+      "path": "packages/codemode/src/source.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/source.ts",
+      "bytes": 4266,
+      "sha256": "7d96d8349c79fd05a5e0a35619b28c98ccae64c28583d3e0c8f1f48352a7420e"
+    },
+    {
+      "path": "packages/codemode/src/types.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/types.ts",
+      "bytes": 5515,
+      "sha256": "a54fd8d97468bedd16cc1aae6d89648581da90bd55f65bb0b116c947893b5920"
+    },
+    {
+      "path": "packages/codemode/src/wasm.ts",
+      "url": "https://raw.githubusercontent.com/earendil-works/pi/a276dabe57911253350bffb93cb7d7aff6a73261/packages/codemode/src/wasm.ts",
+      "bytes": 1283,
+      "sha256": "0785024745568c86611b00a82f2bc8f70fc1559eff7200e64a449ebbeeeebb94"
+    }
+  ],
+  "reason": "The pinned Git commit includes the unreleased output limit absent from npm 1.0.0."
+}

@@ -82,8 +82,12 @@ def test_default_task_templates_use_consolidated_names():
     assert "When cloning, pass ref=" not in source
     assert "project(action='clone'/'provision'/'analyze'/'env')" not in source
     assert "build(action='deps'/'compile'/'test'/'package')" not in source
-    assert "current phase facts, coordinates, constraints, and unresolved evidence" in source
-    assert "durable report artifact reflects the sealed evidence" in source
+    # The kickoff now carries only the user task. Workflow requirements live in
+    # the shared system prompt instead of being repeated in every goal.
+    assert 'setup_prompt = f"Project: {project_name}\\n\\nTask:\\n{goal}\\n"' in source
+    protocol = load_react_engine_prompts().get("initial_system.context_management")
+    assert "always work the CURRENT phase" in protocol
+    assert "durable report artifact reflects the sealed evidence" in protocol
 
 
 class _BranchHistory:

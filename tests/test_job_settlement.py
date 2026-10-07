@@ -1108,7 +1108,7 @@ def test_the_settled_receipt_states_the_pins_the_dispatch_was_decided_on():
 # ---------------------------------------------------------------------------
 
 
-def test_the_notice_is_one_bounded_line():
+def test_the_notice_has_a_bounded_headline_and_receipt_observations():
     """Risk answer (spec §7): settlement must not surprise the model with a
     receipt from nowhere, and must not fabricate a tool result either."""
     orchestrator = _with_obligation(_orchestrator())
@@ -1117,8 +1117,11 @@ def test_the_notice_is_one_bounded_line():
 
     receipt_id = settlement.receipt_id
     expected = f"[settled] job {JOB}: exit 0 — receipt {receipt_id}, 2 report paths claimed"
-    assert settlement.notice() == expected
-    assert "\n" not in settlement.notice()
+    headline, observations = settlement.notice().split("\n", 1)
+    assert headline == expected
+    assert observations == settlement.receipt_observation
+    assert "Receipt observations (reading aid; not a task verdict)" in observations
+    assert receipt_id in observations
 
 
 def test_the_notice_states_the_exclusion_when_there_was_one():
@@ -1128,7 +1131,9 @@ def test_the_notice_states_the_exclusion_when_there_was_one():
 
     (settlement,) = settle_open_obligations(orchestrator)
 
-    assert settlement.notice().endswith("1 already claimed by an intervening receipt)")
+    assert settlement.notice().splitlines()[0].endswith(
+        "1 already claimed by an intervening receipt)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1164,13 +1169,15 @@ def test_the_notice_names_an_evidence_field_the_receipt_had_to_drop():
     notice = settlement.notice()
     assert "module_outcomes" in notice
     assert "receipt module_outcomes is invalid" in notice
-    assert "\n" not in notice
+    assert "receipt module_outcomes is invalid" in notice.splitlines()[0]
+    assert "Recorded module outcomes: None (null means unavailable)" in notice
 
 
-def test_a_settlement_that_carried_everything_says_nothing_extra():
+def test_a_settlement_that_carried_everything_has_no_omission_warning():
     orchestrator = _with_obligation(_orchestrator())
 
     (settlement,) = settle_open_obligations(orchestrator)
 
     assert settlement.evidence_omissions == ()
-    assert settlement.notice().endswith("2 report paths claimed")
+    assert settlement.notice().splitlines()[0].endswith("2 report paths claimed")
+    assert "was observed but not recorded" not in settlement.notice()

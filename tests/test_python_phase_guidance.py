@@ -34,6 +34,7 @@ from sag.agent.phase_machine import PhaseMachine
 from sag.agent.react_engine import (
     KICKOFF_PHASE_OBJECTIVES,
     FACTS_KICKOFF_PHASE_OBJECTIVES,
+    FAILURE_DIAGNOSIS_GUIDANCE,
     PHASE_OBJECTIVES,
     ReActEngine,
 )
@@ -116,7 +117,8 @@ def test_test_intro_carries_pytest_objective():
     intro = _engine_at(3, _python_env())._phase_intro_step().content
     assert "terminal Python runner evidence" in intro
     assert "executed, passed, failed, error, and skipped counts" in intro
-    assert "red tests are project facts to report, not a repair duty" in intro
+    assert "diagnose red tests before choosing a repair or attributing their cause" in intro
+    assert "Missing runtime/build prerequisites remain setup work" in intro
     assert "build(action=" not in intro
     assert "Recommended Tests" not in intro
 
@@ -187,12 +189,12 @@ _MAVEN_TEST_INTRO_SNAPSHOT = (
 
 def test_maven_build_intro_matches_facts_contract():
     intro = _engine_at(2, _MAVEN_ENV)._phase_intro_step().content
-    assert intro == _MAVEN_BUILD_INTRO_SNAPSHOT
+    assert intro == _MAVEN_BUILD_INTRO_SNAPSHOT + "\n\n" + FAILURE_DIAGNOSIS_GUIDANCE
 
 
 def test_maven_test_intro_matches_facts_contract():
     intro = _engine_at(3, _MAVEN_ENV)._phase_intro_step().content
-    assert intro == _MAVEN_TEST_INTRO_SNAPSHOT
+    assert intro == _MAVEN_TEST_INTRO_SNAPSHOT + "\n\n" + FAILURE_DIAGNOSIS_GUIDANCE
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +413,8 @@ def test_live_python_test_intro_carries_pytest_objective():
     intro = _engine_at(3, env)._phase_intro_step().content
     assert "terminal Python runner evidence" in intro
     assert "build(action=" not in intro
-    assert "red tests are project facts to report, not a repair duty" in intro
+    assert "diagnose red tests before choosing a repair or attributing their cause" in intro
+    assert "Missing runtime/build prerequisites remain setup work" in intro
     # pytest runs AT the build root by construction — the split-root call-out
     # (test_root == build_root) must not render a test coordinates line.
     assert "not in the build module" not in intro

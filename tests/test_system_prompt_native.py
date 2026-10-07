@@ -42,11 +42,11 @@ class _CM:
         return None
 
 
-def _prompt(workflow_mode="setup"):
+def _prompt(workflow_mode="setup", *, advisor=True):
     builder = ReActPromptBuilder(
         prompts=load_react_engine_prompts(),
         context_manager=_CM(),
-        tools={},
+        tools={"advisor": object()} if advisor else {},
     )
     return builder.build_initial_system_prompt(
         repository_url="https://example.test/repo.git",
@@ -89,11 +89,18 @@ def test_setup_prompt_keeps_advisor_out_of_terminal_prejudgment():
     receives terminal claims directly (WS3 ownership boundary)."""
     prompt = _prompt("setup")
     assert "advisor()" in prompt
-    assert "records its consultation before substantive work" in prompt
+    assert "configured trigger policy" in prompt
+    assert "budgeted" in prompt and "omissions are disclosed" in prompt
     assert "non-authoritative guidance" in prompt
     assert "terminal claims go directly" in prompt
     assert "independent physical judge" in prompt
     assert "before closing a phase" not in prompt
+
+
+def test_no_consult_instructions_when_tool_is_not_available():
+    prompt = _prompt("setup", advisor=False)
+    assert "advisor()" not in prompt
+    assert "Consult advisor" not in prompt
 
 
 def test_setup_prompt_states_that_tool_calls_are_how_work_happens():

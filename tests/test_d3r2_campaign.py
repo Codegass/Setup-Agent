@@ -148,6 +148,208 @@ def test_candidate_cli_keeps_task_and_ci_inputs_separate():
     )
 
 
+def _formal_project(tmp_path, *, variant="mini-high"):
+    from sag.agent.acceptance_task import load_acceptance_task
+    from sag.benchmark.requirements import POLICY_VERSION
+
+    task_file = tmp_path / "task.json"
+    task_file.write_text(json.dumps({
+        "repo": "apache/demo", "sha": "a" * 40,
+        "steps": [{"id": "test", "runner": "maven", "argv": ["mvn", "test"]}],
+    }))
+    task = load_acceptance_task(task_file)
+    target_file = tmp_path / "ci.json"
+    target_file.write_text(json.dumps({
+        "schema_version": 2, "repo": task.repo, "sha": task.sha,
+        "harvested_at": "2026-09-22T00:00:00Z", "matched_cell": None,
+        "cells": [{"cell_id": "archived-unmatched", "build": "unknown", "grade": "B",
+                   "executed_count": 0, "red_count": 0}],
+    }))
+    requirements_file = tmp_path / "requirements.json"
+    requirements_file.write_text(json.dumps({
+        "schema_version": 2, "policy_version": POLICY_VERSION,
+        "task_sha256": task.sha256,
+        "annotation_completeness": {"status": "complete"},
+        "ci_alignment": {"test_count_semantics": {
+            "schema_version": 1, "status": "unavailable", "reason": "Unmatched smoke fixture"}},
+        "preconditions": [{"id": "worktree_integrity"}, {"id": "runtime_conformance"}],
+        "requirements": [{"id": "test", "step_id": "test", "kind": "test",
+                          "scope": {"status": "resolved", "modules": ["."]},
+                          "validation": {"rule": "junit"}}],
+    }))
+    manifest = {
+        "protocol": campaign.REQUIREMENTS_PROTOCOL,
+        "sources": {variant: {"path": str(tmp_path), "sha": "b" * 40, "files": {}}},
+        "config": {"max_wall_clock_seconds": 1},
+        "docker_image_id": "sha256:" + "f" * 64,
+    }
+    project = dict(
+        run_key="demo", seat="demo", variant=variant, repo=task.repo, sha=task.sha,
+        container="sag-demo", matched_cell=None,
+        acceptance_task_file=str(task_file), acceptance_task_sha256=campaign.digest(task_file),
+        target_file=str(target_file), target_sha256=campaign.digest(target_file),
+        requirements_file=str(requirements_file),
+        requirements_file_sha256=campaign.digest(requirements_file),
+    )
+    return manifest, project, task
+
+
+@pytest.mark.parametrize("variant", ["mini-high", "terra-high", "baseline", "candidate"])
+def test_formal_protocol_passes_all_frozen_inputs_to_every_arm(tmp_path, variant):
+    manifest, project, _task = _formal_project(tmp_path, variant=variant)
+    protocol = campaign.requirements_preflight(manifest, project)
+    assert protocol["requirements_file_sha256"] == project["requirements_file_sha256"]
+    argv = campaign.cli_command(manifest, project)
+    for flag, key in [("--ref", "sha"), ("--acceptance-task-file", "acceptance_task_file"),
+                      ("--ci-target-file", "target_file"), ("--requirements-file", "requirements_file")]:
+        assert argv[argv.index(flag) + 1] == project[key]
+
+
+@pytest.mark.parametrize("missing", ["sha", "acceptance_task_file", "target_file", "requirements_file"])
+def test_formal_configuration_failure_is_retained_without_dispatch(tmp_path, monkeypatch, missing):
+    manifest, project, _task = _formal_project(tmp_path)
+    project.pop(missing)
+    monkeypatch.setattr(campaign, "inspect_container", lambda *_a: pytest.fail("no Docker call"))
+    monkeypatch.setattr(campaign.subprocess, "Popen", lambda *_a, **_k: pytest.fail("no child"))
+    result = campaign.run_one(tmp_path, manifest, project)
+    assert result["status"] == "unavailable"
+    assert result["planned_slot_retained"] and result["dispatched"] is False
+    assert result["authority_ok"] is False
+    assert (tmp_path / "runs/demo/result.json").is_file()
+
+
+@pytest.mark.parametrize("change", ["requirements_bytes", "requirements_task", "annotation", "ci_subject", "pin_identity"])
+def test_formal_preflight_rejects_drift_and_unreviewed_requirements(tmp_path, change):
+    manifest, project, _task = _formal_project(tmp_path)
+    from pathlib import Path
+    if change == "requirements_bytes":
+        path = Path(project["requirements_file"])
+        path.write_text(path.read_text() + "\n")
+    elif change == "pin_identity":
+        project["evaluation_protocol"] = campaign.requirements_preflight(manifest, project)
+        project["evaluation_protocol"]["policy_version"] = "changed"
+    else:
+        key = "target_file" if change == "ci_subject" else "requirements_file"
+        path = Path(project[key])
+        value = json.loads(path.read_text())
+        if change == "ci_subject":
+            value["sha"] = "c" * 40
+        elif change == "requirements_task":
+            value["task_sha256"] = "c" * 64
+        else:
+            value["annotation_completeness"]["status"] = "review_required"
+        path.write_text(json.dumps(value))
+        project["target_sha256" if key == "target_file" else "requirements_file_sha256"] = campaign.digest(path)
+    with pytest.raises(ValueError):
+        campaign.requirements_preflight(manifest, project)
+
+
+@pytest.mark.parametrize("pin_change", [None, "evaluation_protocol", "ci_target"])
+@pytest.mark.parametrize("registered_policy", [False, True])
+def test_formal_run_archives_inputs_checks_pin_and_records_input_coverage(tmp_path, monkeypatch, pin_change, registered_policy):
+    from pathlib import Path
+    from sag.benchmark import campaign_telemetry
+
+    clock = [1000.0]
+    monkeypatch.setattr(campaign.time, "monotonic", lambda: clock[0])
+
+    manifest, project, task = _formal_project(tmp_path)
+    if registered_policy:
+        from test_benchmark_intervention_protocol import policy
+
+        manifest.update(intervention_protocol=policy(), projects=[project],
+                        runner_sha256=campaign.digest(Path(campaign.__file__)))
+    protocol = campaign.requirements_preflight(manifest, project)
+    config = {
+        "acceptance_task": {"sha256": task.sha256, "definition": task.model_dump(mode="json")},
+        "evaluation_protocol": protocol,
+        "ci_target": {"record_sha256": project["target_sha256"], "repo": task.repo,
+                      "sha": task.sha, "matched_cell": None},
+    }
+    if pin_change:
+        config.pop(pin_change)
+    payload = {"run_id": "formal-run", "metrics": {"verdict": "success"}, "pin": {
+        "target_repo_sha": task.sha, "sag_git_sha": "b" * 40,
+        "container_image_digest": manifest["docker_image_id"], "sanitized_config": config,
+    }}
+
+    class FinishedProcess:
+        returncode, pid = 0, 123456789
+
+        def __init__(self, argv, **kwargs):
+            assert kwargs["stdin"] is subprocess.DEVNULL
+            if registered_policy:
+                assert (kwargs["cwd"] / "intervention-ledger/start.json").is_file()
+            for flag, filename in [("--acceptance-task-file", "acceptance-task.json"),
+                                   ("--ci-target-file", "ci-target.json"),
+                                   ("--requirements-file", "requirements.json")]:
+                archived = Path(argv[argv.index(flag) + 1])
+                assert archived == kwargs["cwd"] / filename
+                assert archived.is_file()
+            # A mutable caller path is no longer an input after dispatch.
+            Path(project["requirements_file"]).write_text("changed after dispatch")
+            (kwargs["cwd"] / "logs/session_fake").mkdir(parents=True)
+
+        def poll(self):
+            return self.returncode
+
+    for name in ["verify_source", "runtime_environment", "effective_config"]:
+        monkeypatch.setattr(campaign, name, lambda *_a: {})
+    monkeypatch.setattr(campaign, "inspect_container", lambda *_a: None)
+    monkeypatch.setattr(campaign.subprocess, "Popen", FinishedProcess)
+    def collect_after_process_exit(*_a, **_k):
+        # Collection is outside the process/ledger window, including when it
+        # subsequently rejects the pin. It must not inflate execution cost.
+        clock[0] += 37.0
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(campaign.subprocess, "run", collect_after_process_exit)
+    analysis_calls = []
+
+    def complete_analysis(session, result, *, runner_file, intervention_file):
+        assert result["process_finished_at"]
+        assert result["process_seconds"] >= 0
+        assert intervention_file.is_file()
+        assert session.name == "session_fake"
+        if not result["authority_ok"]:
+            raise ValueError("Run authority unavailable")
+        analysis_calls.append(result["run_id"])
+        return {"status": "unavailable", "known_tokens": 250, "total_tokens": None}
+
+    monkeypatch.setattr(campaign_telemetry, "finalize_campaign_analysis", complete_analysis)
+    result = campaign.run_one(tmp_path, manifest, project)
+    assert result["process_seconds"] == 0.0
+    assert result["authority_ok"] is (pin_change is None)
+    if pin_change:
+        assert pin_change in result["runner_error"]
+    telemetry = json.loads((tmp_path / "runs/demo/intervention-telemetry.json").read_text())
+    assert telemetry["controlled_channel_interventions"] == 0
+    assert telemetry["controlled_channel_coverage"] == "complete"
+    assert telemetry["human_interventions"] == (0 if registered_policy else None)
+    assert telemetry["external_intervention_coverage"] == "unavailable"
+    assert telemetry["runner_sha256"] == campaign.digest(campaign.Path(campaign.__file__))
+    assert telemetry["run_id"] == ("formal-run" if pin_change is None else None)
+    if registered_policy:
+        assert telemetry["input_policy"]["external_channels"] == "prohibited_or_logged"
+        assert telemetry["coverage"] == "complete"
+        assert telemetry["finished_at"] == result["process_finished_at"]
+        assert (tmp_path / "runs/demo/intervention-ledger/close.json").is_file()
+    assert analysis_calls == (["formal-run"] if pin_change is None else [])
+    assert result["requirements_analysis"]["status"] == "unavailable"
+    if pin_change is None:
+        assert result["requirements_analysis"]["known_tokens"] == 250
+
+
+def test_automatic_timeout_is_not_manual_help_and_missing_interval_is_unknown():
+    base = {"run_key": "demo", "outer_timeout": True}
+    observed = campaign.intervention_telemetry(base, process_started=True, process_finished=True)
+    assert observed["events"] == [] and observed["controlled_channel_interventions"] == 0
+    cancelled = campaign.intervention_telemetry(base | {"cancelled": True}, process_started=True, process_finished=True)
+    assert cancelled["controlled_channel_interventions"] == 1
+    missing = campaign.intervention_telemetry(base, process_started=False, process_finished=False)
+    assert missing["controlled_channel_interventions"] is None
+
+
 @pytest.mark.parametrize("task_pin_status", ["valid", "missing", "different"])
 def test_attempt_archives_task_bytes_and_checks_the_actual_run_pin(
     tmp_path, monkeypatch, task_pin_status

@@ -3632,6 +3632,9 @@ def _publish_receipt_result(
         contract_hash=receipt.get("contract_hash"),
     )
     if publication.published:
+        from sag.agent.worktree_evidence import record_receipt_worktree
+
+        record_receipt_worktree(execute, receipt)
         return result
     logger.warning(
         f"invocation receipt {receipt['receipt_id']} reached the container but host "
@@ -3843,8 +3846,20 @@ def record_invocation(
         # system to keep in step. A receipt that named no modules writes
         # nothing at all.
         promote_structure(execute, receipt)
+        from sag.agent.receipt_view import write_receipt_view
+
+        try:
+            view_metadata = write_receipt_view(
+                execute, receipt, source_sha256=persistence.sha256,
+            )
+        except Exception as exc:
+            # This is a reading aid. Failure cannot erase the published raw
+            # receipt or turn its execution status into a different outcome.
+            view_metadata = {"receipt_view_status": "unavailable",
+                             "receipt_view_error": type(exc).__name__}
         return {
             "receipt_id": receipt["receipt_id"],
+            **view_metadata,
             **(
                 {"test_failure_summary": summary}
                 if (summary := receipt_failure_summary(receipt))

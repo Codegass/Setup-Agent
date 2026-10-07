@@ -1210,6 +1210,7 @@ class Settlement:
     contract_id: str = ""
     evidence_omissions: Tuple[Tuple[str, str], ...] = ()
     test_failure_summary: str = ""
+    receipt_observation: str = ""
 
     def notice(self) -> str:
         """The bounded receipt notice and failure facts the next observation carries.
@@ -1234,7 +1235,8 @@ class Settlement:
             # Silence here is what made a receipt with no module list read like
             # a build that named one module.
             line += f"; {field} was observed but not recorded on the receipt ({reason})"
-        return line + ("\n" + self.test_failure_summary if self.test_failure_summary else "")
+        return (line + ("\n" + self.receipt_observation if self.receipt_observation else "")
+                + ("\n" + self.test_failure_summary if self.test_failure_summary else ""))
 
     def event_payload(self) -> Dict[str, Any]:
         return {
@@ -1417,6 +1419,8 @@ def settlement_from_ledger(
     receipt = ledger.get(receipt_id) if ledger is not None else None
     if receipt is None or not _receipt_matches_obligation(receipt, obligation, exit_code):
         return None
+    from .receipt_view import receipt_observation
+
     return Settlement(
         job_id=_text(obligation.get("job_id")),
         receipt_id=receipt_id,
@@ -1426,6 +1430,7 @@ def settlement_from_ledger(
         contract_id=_text(obligation.get("contract_id")),
         evidence_omissions=_receipt_evidence_omissions(receipt),
         test_failure_summary=receipt_failure_summary(receipt),
+        receipt_observation=receipt_observation(receipt),
     )
 
 
@@ -1775,6 +1780,8 @@ def _finalize_settlement(
         evidence_ref=receipt_id,
         output_loader=lambda: _read_complete_log(orchestrator, obligation.get("log_path")),
     )
+    from .receipt_view import receipt_observation
+
     return _SettlementAttempt(
         settlement=Settlement(
             job_id=_text(obligation.get("job_id")),
@@ -1785,6 +1792,7 @@ def _finalize_settlement(
             contract_id=_text(obligation.get("contract_id")),
             evidence_omissions=_receipt_evidence_omissions(receipt),
             test_failure_summary=receipt_failure_summary(receipt),
+            receipt_observation=receipt_observation(receipt),
         )
     )
 

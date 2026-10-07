@@ -840,6 +840,15 @@ def build_ci_comparison(
         return CIComparisonSnapshot(
             **base, status="no_target", reasons=(OFFICIAL_CI_TARGET_NOT_SUPPLIED,)
         )
+    if isinstance(getattr(orchestrator, "benchmark_requirements", None), dict):
+        # Requirements-v2 exports a source-bound comparison with its closed
+        # evidence sidecar. The legacy certificate adapter has neither that
+        # pool scope nor a common module namespace and must not publish 0/3
+        # (or green) from display names versus paths.
+        return CIComparisonSnapshot(
+            **base, status="unavailable",
+            reasons=("REQUIREMENTS_V2_CI_COMPARISON_IN_BENCHMARK_ANALYSIS",),
+        )
     if target.record.matched_cell is None:
         return CIComparisonSnapshot(
             **base, status="no_matched_cell", reasons=(OFFICIAL_CI_CELL_NOT_MATCHED,)
@@ -859,6 +868,11 @@ def build_ci_comparison(
         report_namespaces=namespaces,
     )
     view = view_from_certificate(certificate, repo=repo)
+    # Different, unproven namespaces are not evidence of missing builds.
+    if (set(cell.modules) - set(view.modules)) and (set(view.modules) - set(cell.modules)):
+        return CIComparisonSnapshot(
+            **base, status="unavailable", reasons=("CI_MODULE_MAPPING_UNAVAILABLE",),
+        )
     view_fields = view.model_dump()
     view_fields.update(
         commands=commands,

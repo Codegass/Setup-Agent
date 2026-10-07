@@ -38,6 +38,14 @@ class ReActStep(BaseModel):
     # construction site and consumer is unaffected.
     tool_call_id: Optional[str] = None
     native_text: Optional[str] = None
+    # Tool-owned pagination has already bounded this observation. A second
+    # head/tail cut would make its continuation skip text never delivered.
+    output_page: bool = False
+    # Nested calls keep their canonical evidence but are not separate provider
+    # tool messages. Their parent returns the chosen output and status summary.
+    parent_program_id: Optional[str] = None
+    control_envelope_id: Optional[str] = None
+    control_execution_id: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)

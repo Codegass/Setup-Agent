@@ -10,7 +10,7 @@ from sag.agent.context_manager import BranchContextHistory, ContextManager, Task
 from sag.agent.history_state import (
     HistoryActionState,
     decode_history_action_state,
-    is_advisor_history_entry,
+    is_non_evidence_history_entry,
 )
 from sag.project_fact_sheet import (
     PROJECT_FACT_SHEET_SCHEMA,
@@ -1459,7 +1459,7 @@ IMPORTANT:
             except Exception:
                 branch_history = None
             for entry in getattr(branch_history, "history", []) or []:
-                if is_advisor_history_entry(entry):
+                if is_non_evidence_history_entry(entry):
                     continue
                 if isinstance(entry, dict) and entry.get("type") in ("action", "observation"):
                     texts.append(
@@ -1510,7 +1510,7 @@ IMPORTANT:
         for entry in getattr(branch_history, "history", []) or []:
             if not isinstance(entry, dict):
                 continue
-            if entry.get("type") != "action" or is_advisor_history_entry(entry):
+            if entry.get("type") != "action" or is_non_evidence_history_entry(entry):
                 continue
             tool_name = str(entry.get("tool_name") or "").lower()
             if tool_name in remediation_tools:

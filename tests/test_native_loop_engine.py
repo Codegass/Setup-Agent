@@ -9,6 +9,7 @@ request — an unanswered assistant tool_use is a provider 400 (anatomy map
 risk 5), so the renderer's repair pass must never have anything to do."""
 
 from types import SimpleNamespace
+import json
 
 import pytest
 from test_verdict_finalizer import FakeVerdictOrchestrator, bind_verdict_authority
@@ -316,16 +317,24 @@ def test_native_loop_drives_the_phase_machine_to_completion(pairing_spy):
     assert pairing_spy, "the renderer must have run"
     assert all(before == after for before, after in pairing_spy)
 
-    # One journal line per iteration that did not end the run. The label is the
-    # phase current when the line is written, so a closing iteration is
-    # journaled under the phase it just opened (unchanged from the old loop).
+    # Label the request window, including the terminal request. Phase changes
+    # caused by its response belong to a separate next_phase field.
     assert [record["phase"] for record in engine.context_journal.records] == [
+        "provision",
         "analyze",
         "build",
         "test",
         "report",
     ]
-    assert [record["iteration"] for record in engine.context_journal.records] == [1, 2, 3, 4]
+    assert [record["request_binding"]["next_phase"] for record in engine.context_journal.records] == [
+        "analyze", "build", "test", "report", None,
+    ]
+    import hashlib
+    for record, request in zip(engine.context_journal.records, engine.llm_client.requests):
+        expected = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False,
+                                            separators=(",", ":")).encode()).hexdigest()
+        assert record["window_id"] == expected
+    assert [record["iteration"] for record in engine.context_journal.records] == [1, 2, 3, 4, 5]
     assert all(record["total_chars"] > 0 for record in engine.context_journal.records)
 
 
@@ -359,7 +368,8 @@ def test_every_request_carries_the_system_prompt_and_a_paired_history():
     assert all(sealed_marker not in prompt for prompt in system_prompts[:2])
     assert all(sealed_marker in prompt for prompt in system_prompts[2:])
     assert all("MODEL-AUTHORED IN ANALYZE" in prompt for prompt in system_prompts[2:])
-    assert system_prompts[2] == system_prompts[3] == system_prompts[4]
+    assert system_prompts[2] == system_prompts[3]
+    assert "EVIDENCE SEALED" in system_prompts[4]
 
 
 def test_final_window_renders_without_pairing_repair():

@@ -29,12 +29,19 @@ def history_entry_kind_for_tool(tool_name: Any) -> Optional[str]:
     """
     if str(tool_name or "").strip().lower() == ADVISOR_TOOL_NAME:
         return ADVISOR_HISTORY_ENTRY_KIND
+    if str(tool_name or "").strip().lower() == "code":
+        return "code_program"
     return None
 
 
 def is_advisor_history_entry(entry: Any) -> bool:
     """Whether a persisted history entry is the advisor's own consult record."""
     return isinstance(entry, Mapping) and entry.get("entry_kind") == ADVISOR_HISTORY_ENTRY_KIND
+
+
+def is_non_evidence_history_entry(entry: Any) -> bool:
+    """Reviewer prose and script selections cannot certify a project action."""
+    return isinstance(entry, Mapping) and entry.get("entry_kind") in {ADVISOR_HISTORY_ENTRY_KIND, "code_program"}
 
 
 class HistoryActionState(str, Enum):

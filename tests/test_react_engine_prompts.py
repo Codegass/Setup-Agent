@@ -117,11 +117,11 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
     assert "AVAILABLE TOOLS" in prompt
     assert "dummy: Dummy tool for prompt tests" not in prompt
     assert "Usage: dummy()" not in prompt
-    assert "engine mechanically inventories checkout files and creates a fact sheet" in prompt
+    assert "engine mechanically creates the initial project survey/fact sheet" in prompt
     assert "broad evidence and gap-checking inputs" in prompt
     assert "not a harness-authored project plan" in prompt
     assert "structured execution_plan is optional" in prompt
-    assert "no fixed post-clone action sequence is required" in prompt
+    assert "it is not a fixed post-clone step" in prompt
     assert "Handling Maven POM Parsing Errors" not in prompt
     assert "Handling Multi-Module Maven Test Execution" not in prompt
     assert "HOW YOU ACT" in prompt
@@ -199,7 +199,8 @@ def test_real_setup_tool_bundle_has_no_pre_evidence_routing_or_usage_examples():
     assert [text for text in forbidden if text in prompt] == []
     assert 'command="<complete runner command>"' in prompt
     assert "on-demand diagnostic, not a routine prerequisite" in prompt
-    assert "Valid actions: done, blocked, note" in prompt
+    for action in ("done", "blocked", "note"):
+        assert f'phase(action="{action}"' in prompt
     assert "Project build runner dispatches are recorded only by the build facade" in prompt
 
 

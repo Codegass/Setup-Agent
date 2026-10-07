@@ -636,6 +636,57 @@ class ActiveRepairContextState:
     consumed_context_ids: tuple[str, ...]
 
 
+def _validate_post_close_report_event(event: ControlEvent) -> None:
+    """Allow delivery/control audit after sealing, never new setup evidence.
+
+    The repair projection still checks envelope pairing and gate/transition
+    ordering below. This boundary only identifies the report-only tail; its
+    facts do not participate in the already sealed verdict.
+    """
+    kind, payload = event.kind, event.payload
+    report_tools = {"report", "phase"}
+    allowed = False
+    if kind in {"action_envelope", "tool_result"}:
+        allowed = payload.get("tool") in report_tools
+        if kind == "tool_result":
+            allowed = allowed and payload.get("source_phase") in {"", "report"}
+            allowed = allowed and all(
+                item.get("tool") in report_tools for item in payload.get("actual_executions", ())
+            )
+    elif kind in {"validator_observation", "gate_decision", "gate_outcome_revised"}:
+        allowed = payload.get("phase") == "report" and all(
+            key.startswith("report.") for key in payload.get("validated_facts", {})
+        )
+    elif kind == "phase_transition":
+        allowed = (
+            payload.get("expected_kind") == "flow_close"
+            and payload.get("expected_target") is None
+            and payload.get("repair_request") is None
+        )
+    elif kind == "repair_context_opened":
+        context = payload.get("context", {})
+        allowed = (
+            str(payload.get("source_phase_attempt_id", "")).startswith("report-")
+            and str(context.get("domain_id", "")).startswith("report:")
+            and all(
+                item.get("tool") in report_tools
+                for item in context.get("allowed_tool_affordances", ())
+            )
+        )
+    elif kind == "completion_claim_decision":
+        allowed = str(payload.get("phase_attempt_id", "")).startswith("report-")
+    elif kind == "turn_record":
+        allowed = payload.get("phase") == "report"
+    elif kind in {"refusal_record", "loop_decision"}:
+        # A refused build/file call is audit of non-execution, not a new
+        # action. Its normal typed payload and pairing checks remain in force.
+        allowed = True
+    if not allowed:
+        raise ReplayValidationError(
+            f"only report delivery/control may follow evidence_close: {kind}"
+        )
+
+
 def recover_active_repair_context(
     events: Iterable[ControlEvent | Mapping[str, Any]],
     *,
@@ -664,6 +715,7 @@ def recover_active_repair_context(
     pending_repair_gate_sequence: int | None = None
     pending_phase_gate_sequence: int | None = None
     evidence_closed = False
+    report_closed = False
     publications: dict[tuple[str, str, str], EvidencePublicationPayload] = {}
     evidence_store_binding: EvidenceStoreBoundPayload | None = None
     for expected_sequence, raw_event in enumerate(events, 1):
@@ -683,7 +735,9 @@ def recover_active_repair_context(
             continue
         payload = event.payload
         if evidence_closed and event.kind != "evidence_publication":
-            raise ReplayValidationError("control stream continues after evidence_close")
+            if report_closed:
+                raise ReplayValidationError("control stream continues after report flow_close")
+            _validate_post_close_report_event(event)
         if event.kind == "evidence_store_bound":
             if evidence_store_binding is not None or publications:
                 raise ReplayValidationError(
@@ -913,6 +967,7 @@ def recover_active_repair_context(
                 raise ReplayValidationError("phase transition has no accepted gate decision")
             active = None
             pending_phase_gate_sequence = None
+            report_closed = evidence_closed
             continue
         if event.kind == "evidence_close":
             if active is not None or pending_phase_gate_sequence is not None:

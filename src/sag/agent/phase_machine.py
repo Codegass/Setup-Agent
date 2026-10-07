@@ -439,10 +439,18 @@ class PhaseMachine:
             return "completed"
         return "open"
 
-    def digest_lines(self) -> List[str]:
+    def digest_lines(self, *, include_claims: bool = True) -> List[str]:
         """Compact trunk picture for the phase-start window (GTD digest)."""
         lines = []
         for record in self._records:
+            if not include_claims:
+                # Claims and their complete source live in the retained handoff.
+                # Do not turn a mid-command 200-character prefix into a plan.
+                lines.append(
+                    f"- {record.attempt_id} {record.phase}: "
+                    f"{record.termination.value} [{record.outcome.value}]"
+                )
+                continue
             if record.termination is PhaseTermination.COMPLETED:
                 marker = "✓" if record.outcome is PhaseOutcome.SUCCESS else "•"
                 summary = record.key_results or record.reason

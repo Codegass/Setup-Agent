@@ -462,7 +462,8 @@ def test_the_system_prompt_describes_the_non_authoritative_advisor_boundary():
     guidance = load_react_engine_prompts().get("initial_system.advisor_guidance")
 
     assert "advisor()" in guidance
-    assert "records its consultation before substantive work" in guidance
+    assert "configured trigger policy" in guidance
+    assert "budgeted" in guidance and "omissions are disclosed" in guidance
     assert "non-authoritative guidance" in guidance
     assert "terminal claims go directly" in guidance
     assert "repeated actions are stuck" not in guidance
