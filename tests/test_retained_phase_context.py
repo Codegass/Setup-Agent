@@ -236,5 +236,81 @@ def test_oversized_contract_keeps_full_source_and_never_cuts_command(tmp_path):
     assert len(text) <= 1000
     assert command[:50] not in text
     assert "=== PHASE: BUILD ===" in text
-    assert "omitted lines" in text and ref in text
-    assert engine.output_storage.retrieve_output(ref) == contract
+    assert text.endswith(f"search(target='{ref}') returns only those omitted lines (the lines above are not repeated there).")
+    stored = engine.output_storage.retrieve_output(ref)
+    kept = text.splitlines()[:-1]
+    assert command in stored.splitlines()
+    assert sorted(kept + stored.splitlines()) == sorted(contract.splitlines())
+
+
+class _RecordingStorage:
+    def __init__(self):
+        self.calls = []
+
+    def store_output(self, **kwargs):
+        self.calls.append(kwargs)
+        return "output_test123"
+
+
+def test_bounded_phase_contract_stores_only_the_omitted_lines():
+    from collections import Counter
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = PhaseMachine(start_phase="build")
+    engine.output_storage = _RecordingStorage()
+    head = ["=== PHASE: BUILD ===", "Objective: execute pinned task"]
+    observations = [f"observation {i:02d}: compiled module-{i} with 0 errors and 0 warnings" for i in range(36)]
+    required = ["Required task ci-step-1: mvn -B verify", "Required task ci-step-2: mvn -B test"]
+    lines = head + observations[:18] + required + observations[18:]
+    contract = "\n".join(lines)
+    budget = len(contract) // 2
+
+    text, ref = engine._bounded_phase_contract(contract, budget)
+
+    assert ref == "output_test123"
+    assert len(text) <= budget
+    assert len(engine.output_storage.calls) == 1
+    call = engine.output_storage.calls[0]
+    kept = text.splitlines()[:-1]
+    stored = call["output"].splitlines()
+    omitted_count = len(lines) - len(kept)
+    assert 0 < omitted_count < len(lines)
+    assert text.splitlines()[-1] == (
+        f"{omitted_count} phase-contract lines omitted here; search(target='output_test123') "
+        "returns only those omitted lines (the lines above are not repeated there).")
+    # Stored ref holds exactly the lines not shown, in original order.
+    assert stored == [line for line in lines if line not in kept]
+    assert not set(kept) & set(stored)
+    # Kept + stored reconstructs the complete contract for audit.
+    assert Counter(kept) + Counter(stored) == Counter(contract.splitlines())
+    assert call["metadata"] == {
+        "kind": "omitted_phase_contract_lines",
+        "omitted_lines": omitted_count,
+        "kept_lines": len(kept),
+        "total_lines": len(lines),
+    }
+    assert call["task_id"] == "phase-build" and call["tool_name"] == "phase_intro"
+    # Important lines are kept ahead of plain observations; kept lines keep source order.
+    for line in head + required:
+        assert line in kept
+    assert kept == [line for line in lines if line in kept]
+    assert set(stored) <= set(observations)
+
+
+def test_bounded_phase_contract_stores_nothing_when_every_line_fits():
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = PhaseMachine(start_phase="build")
+    engine.output_storage = _RecordingStorage()
+    contract = "=== PHASE: BUILD ===\nObjective: execute pinned task\nobservation one"
+
+    text, ref = engine._bounded_phase_contract(contract, 10_000)
+
+    assert (text, ref) == (contract, None)
+    assert engine.output_storage.calls == []
+
+
+def test_bounded_phase_contract_rejects_budget_smaller_than_footer():
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = PhaseMachine(start_phase="build")
+    engine.output_storage = _RecordingStorage()
+    with pytest.raises(ValueError):
+        engine._bounded_phase_contract("=== PHASE: BUILD ===\n" + "x" * 500, 40)

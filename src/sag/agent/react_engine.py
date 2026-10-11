@@ -3136,26 +3136,47 @@ class ReActEngine:
             timestamp=self._get_timestamp(),
         )
 
-    def _bounded_phase_contract(self, contract: str, max_chars: int) -> tuple[str, str]:
-        """Keep whole observed lines and an exact source when a contract is large.
+    def _bounded_phase_contract(self, contract: str, max_chars: int) -> tuple[str, Optional[str]]:
+        """Keep whole observed lines and store only the omitted ones when a contract is large.
 
         This is deterministic selection, not a new model summary. It never
-        cuts a command or count in half; the full phase contract stays readable.
+        cuts a command or count in half. The stored ref holds only the lines
+        not shown, so reading it never re-delivers what is already in the
+        window; kept lines plus the ref reconstruct the complete contract.
         """
-        ref = self.output_storage.store_output(
-            task_id=f"phase-{self.phase_machine.current_phase}", tool_name="phase_intro",
-            output=contract, metadata={"kind": "complete_phase_contract"},
-        )
-        footer = f"Phase contract has omitted lines; read the complete observations with search(target='{ref}')."
         candidates = list(enumerate(contract.splitlines()))
+        footer_template = (
+            "{count} phase-contract lines omitted here; search(target='{ref}') returns only "
+            "those omitted lines (the lines above are not repeated there)."
+        )
+        # The ref is only known after storing the omitted lines, so reserve room
+        # for the widest possible count and a store_output-sized ref id.
+        reserved_footer = footer_template.format(count=len(candidates), ref="output_" + "x" * 12)
         important = ("=== PHASE:", "Objective:", "Budget:", "Task ", "Required task", "Runtime observed:", "Receipt source:")
         ordered = sorted(candidates, key=lambda pair: (not pair[1].startswith(important), pair[0]))
         selected = []
-        used = len(footer)
+        used = len(reserved_footer)
         for index, line in ordered:
             if used + len(line) + 1 <= max_chars:
                 selected.append((index, line))
                 used += len(line) + 1
+        if len(reserved_footer) > max_chars:
+            raise ValueError("phase context budget cannot carry its source reference")
+        selected_indexes = {index for index, _ in selected}
+        omitted = [line for index, line in candidates if index not in selected_indexes]
+        if not omitted:
+            return contract, None
+        ref = self.output_storage.store_output(
+            task_id=f"phase-{self.phase_machine.current_phase}", tool_name="phase_intro",
+            output="\n".join(omitted),
+            metadata={
+                "kind": "omitted_phase_contract_lines",
+                "omitted_lines": len(omitted),
+                "kept_lines": len(selected),
+                "total_lines": len(candidates),
+            },
+        )
+        footer = footer_template.format(count=len(omitted), ref=ref)
         text = "\n".join([line for _, line in sorted(selected)] + [footer])
         if len(text) > max_chars:
             raise ValueError("phase context budget cannot carry its source reference")

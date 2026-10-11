@@ -1,12 +1,16 @@
 """File I/O tool for the agent."""
 
+import hashlib
 import inspect
 import json
+import posixpath
 import shlex
 from typing import Any, Dict, Optional
 
 from loguru import logger
 
+from sag.agent.invocation_receipts import RECEIPT_DIR
+from sag.agent.receipt_view import VIEW_DIR, build_receipt_view, render_receipt_view
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.runtime.container_io import _execute_untruncated
 
@@ -23,7 +27,9 @@ class FileIOTool(BaseTool):
             "Read, write, or list files in the container. For reads, start_line is zero-based "
             "and end_line is exclusive. max_chars defaults to 20000 (capped at 100000). "
             "Follow the returned Next read arguments, including column_offset for long lines, "
-            "to continue without losing text.",
+            "to continue without losing text. Reading a receipt under "
+            "/workspace/.setup_agent/invocation_receipts or receipt_views returns its "
+            "compact reading view, not the raw JSON.",
         )
         self.orchestrator = orchestrator
 
@@ -89,6 +95,13 @@ class FileIOTool(BaseTool):
                 retryable=True,
             )
 
+        normalized = posixpath.normpath(path)
+        if normalized.endswith(".json") and posixpath.dirname(normalized) in (
+            RECEIPT_DIR,
+            VIEW_DIR,
+        ):
+            return self._read_receipt_view(path, normalized)
+
         # Page next to the file, before crossing Docker's output transport.
         script = "from __future__ import annotations\nimport json\n" + inspect.getsource(
             read_text_page
@@ -127,6 +140,57 @@ class FileIOTool(BaseTool):
                 **{key: value for key, value in page.items() if key != "text"},
             },
         )
+
+    def _cat(self, path: str) -> Optional[str]:
+        """Whole container file, untruncated; None when it cannot be read."""
+        result = _execute_untruncated(self.orchestrator, "cat -- " + shlex.quote(path))
+        return str(result.get("output") or "") if result.get("success") else None
+
+    def _read_receipt_view(self, path: str, normalized: str) -> ToolResult:
+        """A raw receipt is ~1 MB of machine-checked JSON; show its reading view."""
+        receipt_id = posixpath.basename(normalized)[: -len(".json")]
+        view_path = f"{VIEW_DIR}/{receipt_id}.json"
+        metadata: Dict[str, Any] = {
+            "path": path,
+            "receipt_redirect": True,
+            "view_path": view_path,
+        }
+        text = None
+        body = self._cat(view_path)
+        if body is not None:
+            try:
+                text = render_receipt_view(json.loads(body), path=view_path)
+                metadata["view_source"] = "receipt_views"
+            except (ValueError, TypeError, KeyError, AttributeError):
+                text = None
+        if text is None:
+            raw_path = f"{RECEIPT_DIR}/{receipt_id}.json"
+            raw = self._cat(raw_path)
+            try:
+                if raw is None:
+                    raise ValueError(f"neither {view_path} nor {raw_path} is readable")
+                payload = raw.encode("utf-8")
+                view = build_receipt_view(
+                    json.loads(raw), source_sha256=hashlib.sha256(payload).hexdigest()
+                )
+                text = render_receipt_view(view, path=raw_path)
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                raise ToolError(
+                    message=f"Failed to read receipt {receipt_id}: {exc}",
+                    category="execution",
+                    error_code="READ_FAILED",
+                    suggestions=[
+                        "Check the receipt id in the tool result that produced it",
+                        "Use the tool result's full output ref for the command log",
+                    ],
+                    retryable=True,
+                ) from exc
+            metadata.update(view_source="built_from_raw_receipt", raw_receipt_bytes=len(payload))
+        output = (
+            text + "\nThis path is the verifier's machine-checked receipt; "
+            "its raw JSON is not meant to be read."
+        )
+        return ToolResult.completed_success(output=output, raw_output=output, metadata=metadata)
 
     def _write(self, path: str, content: Optional[str]) -> ToolResult:
         """Write content to a file."""
