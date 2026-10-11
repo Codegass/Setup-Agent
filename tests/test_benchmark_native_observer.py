@@ -584,3 +584,87 @@ def test_successful_retry_retains_failure_but_scores_only_the_final_attempt(fixt
     assert [attempt["exit_code"] for attempt in attempts] == [1, 0]
     assert run["invocations"] == run["all_invocations"][-1:]
     assert evaluate(observer.task, observer.spec, run, observer.base)["status"] == "complete"
+
+
+def test_expected_shell_calls_skip_claude_system_notices_with_string_messages(tmp_path):
+    """A permission denial is a system event whose message is a string; it must not crash
+    the transcript scan, and its denied tool call still counts as an expected call because
+    Claude Code fires the PreToolUse hook before the permission decision."""
+    transcript = tmp_path / "agent.jsonl"
+    transcript.write_text("\n".join([
+        json.dumps({"type": "system", "subtype": "init", "cwd": "/workspace/project"}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call_denied", "name": "Bash", "input": {"command": "rm -rf x"}}]}}),
+        json.dumps({"type": "system", "subtype": "permission_denied", "tool_name": "Bash",
+                    "tool_use_id": "call_denied", "message": "Permission to use Bash has been denied"}),
+        json.dumps({"type": "user", "message": {"role": "user", "content": "plain string content"}}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "I am blocked."}]}}),
+        json.dumps({"type": "result", "subtype": "success", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+    ]) + "\n")
+    assert expected_shell_calls("claude", transcript) == {"call_denied"}
+
+
+def test_launcher_matches_binds_wrapper_distribution_only_to_mvnw_steps():
+    from scripts.benchmark_native_observer import launcher_matches
+
+    dist = "/root/.m2/wrapper/dists/apache-maven-3.9.16/56ba1f9f/bin/mvn"
+    assert launcher_matches("./mvnw", "./mvnw")
+    assert launcher_matches("./mvnw", dist)
+    assert launcher_matches("mvn", dist)  # the wrapper's Maven is still a Maven on an absolute path
+    assert launcher_matches("mvn", "/usr/bin/mvn")
+    assert not launcher_matches("./mvnw", "/usr/bin/mvn")
+    assert not launcher_matches("./mvnw", "/opt/apache-maven-3.9.16/bin/mvn")
+    assert not launcher_matches("./mvnw", "/root/.m2/wrapper/dists/apache-maven-3.9.16/56ba1f9f/mvn")
+    assert not launcher_matches("./mvnw", "/root/.m2/wrapper/dists/x/bin/mvn")
+    assert not launcher_matches("./mvnw", "/root/.m2/wrapper/dists/apache-maven-3.9.16/56ba1f9f/bin/mvnDebug")
+    assert not launcher_matches("mvn", "mvnw")
+    assert not launcher_matches("./gradlew", "/root/.gradle/wrapper/dists/gradle-8.5-bin/abc/gradle-8.5/bin/gradle")
+
+
+def _mvnw_observer(fixture, tmp_path, observed_launcher):
+    observer, root, event, transcript, requests = make_observer(fixture, tmp_path)
+    observer.task = copy.deepcopy(observer.task)
+    step = observer.task["steps"][0]
+    step["argv"] = ["./mvnw", *step["argv"][1:]]
+    observer.observer.task = observer.task
+
+    def execute(command, **kwargs):
+        args = shlex.split(command)
+        request = json.loads(args[-1])
+        if request.get("operation") == "probe":
+            requests.append(request["argv"])
+            result = {"head": observer.task["sha"], "errors": [], "files": [], "configs": [],
+                      "probe_stdout": base64.b64encode(b"Apache Maven 3.9.16\nJava version: 17.0.12\n").decode(),
+                      "probe_stderr": "", "probe_exit_code": 0, "probe_executable": request["argv"][0]}
+            return {"success": True, "exit_code": 0, "output": json.dumps(result)}
+        answer = subprocess.run(args, capture_output=True, text=True)
+        return {"success": answer.returncode == 0, "exit_code": answer.returncode, "output": answer.stdout}
+
+    observer.execute_raw = execute
+    event = copy.deepcopy(event)
+    event["tool_input"] = {"command": "./mvnw " + " ".join(step["argv"][1:])}
+    event["launcher_event"]["launch"]["argv"] = [observed_launcher, *step["argv"][1:]]
+    return observer, root, event, transcript, requests
+
+
+def test_wrapper_distribution_launch_binds_to_the_mvnw_step(fixture, tmp_path):
+    dist = "/root/.m2/wrapper/dists/apache-maven-3.9.16/56ba1f9f/bin/mvn"
+    observer, root, event, transcript, requests = _mvnw_observer(fixture, tmp_path, dist)
+    observer.event(event)
+    observer.event(event["launcher_event"])
+    call = observer.calls["native-1"]
+    assert call["selected_step"] is observer.task["steps"][0]
+    assert call["contract"]["observed_launcher"] == dist
+    assert requests[-1] == [dist, "--version"]
+    assert observer.errors == []
+
+
+def test_system_maven_launch_never_binds_to_a_mvnw_step(fixture, tmp_path):
+    observer, root, event, transcript, requests = _mvnw_observer(fixture, tmp_path, "/usr/bin/mvn")
+    observer.event(event)
+    observer.event(event["launcher_event"])
+    assert observer.calls["native-1"]["selected_step"] is None
+    assert observer.errors == []
+    run = observer.close(transcript)
+    assert run["invocations"] == []

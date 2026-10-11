@@ -104,6 +104,36 @@ def native_result(arm, event):
     }
 
 
+def launcher_matches(expected, observed):
+    """Bind a resolved Maven launcher (as the witness saw it) to a frozen step launcher.
+
+    - a literal step launcher binds only to itself, or for ``mvn`` to an absolute path
+      whose basename is ``mvn`` (a PATH resolution the witness reports resolved);
+    - a ``./mvnw`` step binds only to the Maven Wrapper's own distribution launcher,
+      ``<...>/wrapper/dists/<distribution>/<hash>/bin/mvn``: the wrapper script sources
+      /etc/mavenrc from that binary, so the witness never sees ``./mvnw`` itself. A
+      system or hand-installed Maven never binds to a wrapper step. The runtime probe on
+      the observed launcher still has to report the frozen Maven version.
+    """
+    if observed == expected:
+        return True
+    path = PurePosixPath(observed)
+    if not path.is_absolute() or path.name != "mvn":
+        return False
+    if expected == "mvn":
+        return True
+    if PurePosixPath(expected).name == "mvnw":
+        parts = path.parts
+        return (
+            len(parts) >= 6
+            and parts[-2] == "bin"
+            and "dists" in parts
+            and parts[parts.index("dists") - 1] == "wrapper"
+            and parts.index("dists") == len(parts) - 5
+        )
+    return False
+
+
 def expected_shell_calls(arm, path):
     """Independent native CLI transcript, used to detect silently missing hooks."""
     calls = set()
@@ -113,7 +143,13 @@ def expected_shell_calls(arm, path):
         except ValueError:
             continue
         if arm == "claude":
-            for part in item.get("message", {}).get("content", []):
+            # Claude Code also emits system notices (for example a permission
+            # denial) whose "message" is a plain string, not a message object.
+            message = item.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            for part in content if isinstance(content, list) else []:
                 # TaskOutput is a read-only wait. Native argument validation can
                 # reject it before hooks fire; that cannot hide a build launch.
                 # A successful wait still needs a bound hook to close a job.
@@ -222,14 +258,7 @@ class NativeObserver:
             step
             for step in self.task["steps"]
             if argv
-            and (
-                argv[0] == step["argv"][0]
-                or (
-                    step["argv"][0] == "mvn"
-                    and PurePosixPath(argv[0]).is_absolute()
-                    and PurePosixPath(argv[0]).name == "mvn"
-                )
-            )
+            and launcher_matches(step["argv"][0], argv[0])
             and argv[1:] == step["argv"][1:]
             and launch.get("cwd") == posixpath.normpath(posixpath.join(self.root, step["cwd"]))
         ]
