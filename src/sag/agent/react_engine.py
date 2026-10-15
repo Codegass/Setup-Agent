@@ -4852,7 +4852,7 @@ class ReActEngine:
             phase="report",
             signal="done",
             claimed_outcome=PhaseOutcome.SUCCESS,
-            key_results="The report was persisted from the current sealed snapshot.",
+            key_results="The report was written from the recorded result.",
             evidence_refs=(delivery["path"],),
         )
         gate = check_phase_claim(
