@@ -17,6 +17,7 @@ Two rules bind every section below:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -31,8 +32,16 @@ from sag.result_card.models import RunResultCard
 from sag.result_card.rows import duration_text
 from sag.result_card.run_evidence import read_run_counts, recorded_report
 from sag.tools.report_metrics import format_evidence_accounting_lines
-from sag.trajectory.builder import build_trajectory, control_events_path, resolve_session_dir
-from sag.trajectory.schema import SessionInfo, Trajectory, Turn
+from sag.trajectory.builder import (
+    PhaseNote,
+    build_trajectory,
+    control_events_path,
+    read_gate_decisions,
+    read_phase_notes,
+    read_report_envelopes,
+    resolve_session_dir,
+)
+from sag.trajectory.schema import PhaseInfo, SessionInfo, Trajectory, Turn
 
 #: A run's own artifacts, by the names it writes them under, and the two roots
 #: it writes them at — the same pair `sag result` reads, so a document and the
@@ -89,6 +98,19 @@ _EVIDENCE_NOUNS: dict[str, tuple[str, str]] = {
     "directory": ("workspace directory", "workspace directories"),
     "other": ("other citation", "other citations"),
 }
+
+#: How wide a line of the document's own prose runs. A table row is as wide as
+#: its cells; a paragraph is wrapped at word boundaries, so the raw file reads
+#: the way the rendered one does and no line of it overflows a review pane.
+_PROSE_WIDTH = 160
+
+#: What a line meant as prose must not begin with, because markdown — or the
+#: web tab's reader of it — would take the line for something else: a table
+#: row, a heading, a quote, a fence, an HTML block, a box-drawn table, a bold
+#: label the tab reads as the start of a new statement. A list marker, a rule
+#: and a setext underline are whole words, and are matched as whole words.
+_BLOCK_OPENERS = ("|", "#", ">", "`", "~", "<", "**", "\u2502")
+_LIST_OR_RULE = re.compile(r"[-*+=_]+|\d{1,9}[.)]")
 
 #: How the document is named, and the format the name's timestamp takes. The
 #: same name the report phase's own deliverable carries, so one run leaves one
@@ -217,6 +239,22 @@ def _trajectory_of(base: Path) -> Trajectory:
         # unreadable prints no account of its turns and says everything else.
         logger.debug(f"the run's turns are unavailable for the report: {exc}")
         return Trajectory(session=SessionInfo(run_id=""))
+
+
+def _closes_of(
+    base: Path,
+) -> tuple[dict[str, dict[str, Any]], list[PhaseNote], list[dict[str, Any]]]:
+    """What the run's phase closes, notes and report calls said, read whole.
+
+    Best-effort for the same reason the turns are: a ledger these readers
+    cannot read costs the document its prose, never the document.
+    """
+
+    try:
+        return read_gate_decisions(base), read_phase_notes(base), read_report_envelopes(base)
+    except Exception as exc:
+        logger.debug(f"the run's phase closes are unavailable for the report: {exc}")
+        return {}, [], []
 
 
 def _card_for(directory: Path, base: Path) -> RunResultCard | None:
@@ -359,6 +397,206 @@ def _what_was_set_up(env_overlay: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _opens_a_block(word: str) -> bool:
+    """Whether a line beginning with this word would stop being prose."""
+
+    return word.startswith(_BLOCK_OPENERS) or _LIST_OR_RULE.fullmatch(word) is not None
+
+
+def _escaped(line: str) -> str:
+    """A line that opens a block, escaped so that it reads as the text it is."""
+
+    ordinal = re.match(r"\d{1,9}(?=[.)])", line)
+    if ordinal is not None:
+        return f"{line[: ordinal.end()]}\\{line[ordinal.end() :]}"
+    return f"\\{line}"
+
+
+def _wrapped(text: str, width: int = _PROSE_WIDTH) -> list[str]:
+    """One paragraph as lines of at most `width`, broken between words.
+
+    The words are the record's, every one of them, in order. A word longer than
+    a line is cut, because a line that overflows is the one thing this exists
+    to prevent. A break that would start a line with `|`, `-` or `#` — the
+    agent's prose holds shell pipes and dashes — moves the word before it down
+    too, so the line starts with a word that is only a word; where that cannot
+    be done, the line is escaped, and the budget keeps a column for it.
+    """
+
+    budget = width - 1
+    words: list[str] = []
+    for word in str(text).split():
+        while len(word) > budget:
+            words.append(word[:budget])
+            word = word[budget:]
+        words.append(word)
+
+    lines: list[list[str]] = []
+    current: list[str] = []
+    length = 0
+    for word in words:
+        if current and length + 1 + len(word) <= budget:
+            current.append(word)
+            length += 1 + len(word)
+            continue
+        carried: list[str] = []
+        if (
+            len(current) > 1
+            and _opens_a_block(word)
+            and not _opens_a_block(current[-1])
+            and len(current[-1]) + 1 + len(word) <= budget
+        ):
+            carried = [current.pop()]
+        if current:
+            lines.append(current)
+        current = [*carried, word]
+        length = len(" ".join(current))
+    if current:
+        lines.append(current)
+    return [
+        _escaped(" ".join(line)) if _opens_a_block(line[0]) else " ".join(line) for line in lines
+    ]
+
+
+def _paragraph(text: str | None) -> list[str]:
+    """One wrapped paragraph and the blank line that ends it, or nothing."""
+
+    if not text or not text.strip():
+        return []
+    return [*_wrapped(text), ""]
+
+
+def _close_said(decision: Mapping[str, Any], actor: str | None) -> list[str]:
+    """What one phase close said, in the words of whoever closed it.
+
+    The agent's close is quoted whole: its key results for `done`, the reason
+    it gave for `blocked`. The harness's close is its own key results. When the
+    gate graded the agent's close to a different word, or did not accept it,
+    a second sentence says so and why, because the agent's word alone would
+    then be the wrong one to leave a reader with.
+    """
+
+    key_results = decision.get("key_results")
+    reason = decision.get("reason")
+    code = f" ({decision['code']})" if decision.get("code") else ""
+    expected = decision.get("expected_outcome")
+    outcome = decision.get("claimed_outcome") or expected or "unknown"
+
+    if actor == "controller":
+        told = key_results or decision.get("claim_reason") or reason
+        return [
+            f"The harness closed this phase: {told}" if told else "The harness closed this phase."
+        ]
+    if actor != "model":
+        # No record says who carried this gate; the close is stated without
+        # naming anyone, rather than credited to a guess.
+        word = expected or outcome
+        return [
+            (
+                f"This phase closed as {word}: {key_results}"
+                if key_results
+                else f"This phase closed as {word}."
+            )
+        ]
+
+    rejected = decision.get("accepted") is False
+    if decision.get("signal") == "blocked":
+        why = decision.get("claim_reason") or key_results
+        head = f"The agent reported this phase blocked ({outcome})"
+    else:
+        why = key_results
+        head = f"The agent {'asked to close' if rejected else 'closed'} this phase as {outcome}"
+    said = [f"{head}: {why}" if why else f"{head}."]
+    if rejected:
+        said.append(
+            f"The harness did not accept it{code}: {reason}"
+            if reason
+            else f"The harness did not accept it{code}."
+        )
+    elif expected and expected != outcome:
+        said.append(
+            f"The harness recorded this phase as {expected}{code}: {reason}"
+            if reason
+            else f"The harness recorded this phase as {expected}{code}."
+        )
+    return said
+
+
+def _band_account(
+    band: PhaseInfo | None,
+    decisions: Mapping[str, Mapping[str, Any]],
+    carried: Mapping[str, str],
+    notes: Sequence[str],
+) -> list[str]:
+    """What closed one band and what the agent noted in it, below its table.
+
+    The close is the band's last gate decision, read whole from the ledger:
+    the trajectory's band holds it cut to 400 characters, and the table's row
+    holds the gate's reason cut to 80. Who closed it is the turn record that
+    names the decision, then the turn the trajectory gave it to.
+    """
+
+    lines: list[str] = []
+    gate = band.gates[-1] if band is not None and band.gates else None
+    decision = decisions.get(gate.decision_id) if gate is not None and gate.decision_id else None
+    if decision is not None:
+        actor = decision.get("actor") or carried.get(gate.decision_id)
+        for sentence in _close_said(decision, actor):
+            lines.extend(_paragraph(sentence))
+    for text in notes:
+        lines.extend(_paragraph(f"Note from the agent: {text}"))
+    return lines
+
+
+def _notes_by_band(
+    banded: Sequence[tuple[str, list[Turn], PhaseInfo | None]], notes: Sequence[PhaseNote]
+) -> list[list[str]]:
+    """Each band's notes: the ones whose call that band holds.
+
+    A phase visited twice has two bands of one name, so a note is placed by the
+    call that recorded it. A note whose call no band holds goes to the last
+    band of its phase, which is where the run was when it wrote it.
+    """
+
+    where: dict[str, int] = {}
+    for index, (_, held, _) in enumerate(banded):
+        for turn in held:
+            if turn.call is not None and turn.call.params_ref:
+                where[turn.call.params_ref] = index
+    placed: list[list[str]] = [[] for _ in banded]
+    for note in notes:
+        index = where.get(note.envelope_id) if note.envelope_id else None
+        if index is None:
+            index = next(
+                (i for i in reversed(range(len(banded))) if banded[i][0] == note.phase), None
+            )
+        if index is not None:
+            placed[index].append(note.text)
+    return placed
+
+
+def _what_the_agent_reported(reports: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The agent's own report call: its summary, then its details.
+
+    Present only when the agent wrote one. A report the harness wrote on its
+    own says so in the report band's close, and quoting the harness here would
+    put its sentence under a heading that credits the agent with it.
+    """
+
+    written = [
+        report
+        for report in reports
+        if report.get("actor") == "model" and (report.get("summary") or report.get("details"))
+    ]
+    if not written:
+        return []
+    report = written[-1]
+    lines = ["## What the agent reported", "", *_paragraph(report.get("summary"))]
+    for block in re.split(r"\n\s*\n", report.get("details") or ""):
+        lines.extend(_paragraph(block))
+    return lines
+
+
 def _turn_rows(turns: Sequence[Turn]) -> list[str]:
     """One row per turn: what was asked, what came back, how long it took."""
 
@@ -381,7 +619,7 @@ def _turn_rows(turns: Sequence[Turn]) -> list[str]:
     return rows
 
 
-def _banded(document: Trajectory) -> list[tuple[str, list[Turn]]]:
+def _banded(document: Trajectory) -> list[tuple[str, list[Turn], PhaseInfo | None]]:
     """The run's turns, in the bands the reducer banded them into.
 
     The bands are the record's, not a grouping of consecutive phase names: a
@@ -392,18 +630,18 @@ def _banded(document: Trajectory) -> list[tuple[str, list[Turn]]]:
     and including its own last gate, and the next band starts after it.
 
     A run whose ledger bands nothing still has its turns, under the phase each
-    one names.
+    one names, and no band to say what closed it.
     """
 
     turns = list(document.turns)
     bands = list(document.phases)
     if not bands:
-        grouped: list[tuple[str, list[Turn]]] = []
+        grouped: list[tuple[str, list[Turn], PhaseInfo | None]] = []
         for turn in turns:
             if grouped and grouped[-1][0] == turn.phase:
                 grouped[-1][1].append(turn)
             else:
-                grouped.append((turn.phase, [turn]))
+                grouped.append((turn.phase, [turn], None))
         return grouped
 
     decided_at = {
@@ -427,16 +665,25 @@ def _banded(document: Trajectory) -> list[tuple[str, list[Turn]]]:
         while index < len(bands) - 1 and (ends[index] is None or position > ends[index]):
             index += 1
         held[index].append(turn)
-    return [(band.name, held[index]) for index, band in enumerate(bands)]
+    return [(band.name, held[index], band) for index, band in enumerate(bands)]
 
 
-def _the_run(document: Trajectory) -> list[str]:
+def _the_run(
+    document: Trajectory,
+    decisions: Mapping[str, Mapping[str, Any]] | None = None,
+    notes: Sequence[PhaseNote] = (),
+) -> list[str]:
     """The run as its turns, banded by phase. Section C.4 of the spec.
 
     Every cell is a field the derivation already holds — the same summaries
     `sag trajectory` prints, for the same turns, in the same order. Nothing is
     computed here, so the table and the stream cannot come to disagree about
     what a turn did.
+
+    Below each band's table, in prose, is what closed the band and what the
+    agent noted in it: `decisions` are the ledger's gate decisions by id and
+    `notes` its phase notes. A table cell holds one line; a phase reports a
+    paragraph, and the reader of this document is the one who needs all of it.
     """
 
     turns = list(document.turns)
@@ -455,7 +702,14 @@ def _the_run(document: Trajectory) -> list[str]:
     elapsed = duration_text(document.session.wall_clock_seconds)
     lines = ["## The run", "", f"{said}, {elapsed}." if elapsed else f"{said}.", ""]
 
-    for band, held in _banded(document):
+    banded = _banded(document)
+    carried = {
+        turn.gate.decision_id: turn.actor
+        for turn in turns
+        if turn.gate is not None and turn.gate.decision_id
+    }
+    placed = _notes_by_band(banded, notes)
+    for index, (band, held, info) in enumerate(banded):
         if not held:
             continue
         lines.extend(
@@ -468,6 +722,7 @@ def _the_run(document: Trajectory) -> list[str]:
                 "",
             ]
         )
+        lines.extend(_band_account(info, decisions or {}, carried, placed[index]))
     return lines
 
 
@@ -720,11 +975,13 @@ def render_setup_report(
         ended_at=run_ended_at(base),
     )
     lines.extend(render_result_card_markdown(resolved_card))
+    decisions, notes, reports = _closes_of(base)
+    lines.extend(_what_the_agent_reported(reports))
     lines.extend(
         _what_was_set_up(_mapping(env_overlay) or read_run_document(base, _ENV_OVERLAY_NAME) or {})
     )
     turns = _trajectory_of(base)
-    lines.extend(_the_run(turns))
+    lines.extend(_the_run(turns, decisions, notes))
     lines.extend(_tokens(resolved_card, turns))
     sealed = _mapping(verdict) or read_run_document(base, _VERDICT_NAME) or {}
     lines.extend(_evidence(resolved_card, turns, sealed))

@@ -86,7 +86,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Generator, Iterable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from sag.agent.output_storage import OutputStorageManager
 from sag.tools.base import is_output_storage_ref
@@ -232,6 +232,235 @@ def read_call_envelope(session_dir: Path | str, envelope_id: str) -> dict[str, A
             "exact_params": exact_params,
         }
     return None
+
+
+class PhaseNote(NamedTuple):
+    """One working note the agent recorded with `phase(action="note")`.
+
+    `envelope_id` names the call that recorded it, which is what places the
+    note in its band: two visits to one phase share a name and nothing else.
+    """
+
+    phase: str
+    text: str
+    envelope_id: str | None = None
+
+
+def _ledger_events(session_dir: Path | str, kinds: frozenset[str]) -> Iterator[dict[str, Any]]:
+    """The ledger's events of these kinds, in ledger order, parsed.
+
+    A line is parsed only when it names one of the kinds, because these readers
+    run beside a full replay at run end and a ledger can hold megabytes of
+    events none of them is asking about. A session without a ledger has no
+    events, which is an answer rather than an error.
+    """
+    ledger = _SessionSources(session_dir, detail="summary").control_events()
+    if ledger is None:
+        return
+    lines, _ = _read_lines(ledger)
+    for line in lines:
+        if not any(f'"{kind}"' in line for kind in kinds):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get("kind") in kinds
+            and isinstance(event.get("payload"), dict)
+        ):
+            yield event
+
+
+def _stated_text(value: Any) -> str | None:
+    """A string the event stated, or nothing: the engine writes "" for unsaid."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+_ACTORS = ("model", "controller")
+
+
+def read_gate_decisions(session_dir: Path | str) -> dict[str, dict[str, Any]]:
+    """Every gate decision the ledger holds, whole, keyed by its `decision_id`.
+
+    The trajectory keeps a band's `key_results` cut at 400 characters, because
+    it is a summary; a reader printing what a phase reported needs all of it,
+    and the gate decision is where all of it is. `reason` is the gate's own
+    reading of the phase; `claim_reason` is the reason the close itself gave,
+    which for a `blocked` close is the agent's account of what stopped it.
+
+    `actor` is who carried the decision, as the turn record that names it
+    states — the engine's own word, which survives an engine close sealing its
+    gate after the model's turn has ended. `None` when no record names it.
+
+    A `gate_outcome_revised` replaces the word, not what the phase reported: the
+    revised decision is keyed by its own id, keeps the close's text, and takes
+    the revision's outcome, code and reason.
+    """
+    decisions: dict[str, dict[str, Any]] = {}
+    carried_by: dict[str, str] = {}
+    revised_from: dict[str, str] = {}
+    for event in _ledger_events(
+        session_dir, frozenset({"gate_decision", "gate_outcome_revised", "turn_record"})
+    ):
+        kind, payload = event["kind"], event["payload"]
+        if kind == "turn_record":
+            stated = _stated_text(payload.get("gate_decision_id"))
+            if stated and payload.get("actor") in _ACTORS:
+                carried_by[stated] = payload["actor"]
+            continue
+        if kind == "gate_decision":
+            decision_id = _stated_text(payload.get("decision_id"))
+            if decision_id is None:
+                continue
+            claim = payload.get("phase_claim")
+            claim = claim if isinstance(claim, dict) else {}
+            accepted = payload.get("expected_accepted")
+            decisions[decision_id] = {
+                "decision_id": decision_id,
+                "sequence": event.get("sequence"),
+                "phase": _stated_text(payload.get("phase")),
+                "signal": _stated_text(payload.get("signal"))
+                or _stated_text(claim.get("signal")),
+                "claimed_outcome": _stated_text(payload.get("claimed_outcome")),
+                "expected_outcome": _stated_text(payload.get("expected_outcome")),
+                "accepted": accepted if isinstance(accepted, bool) else None,
+                "code": _stated_text(payload.get("code")),
+                "reason": _stated_text(payload.get("reason")),
+                "key_results": _stated_text(payload.get("key_results"))
+                or _stated_text(claim.get("key_results")),
+                "claim_reason": _stated_text(claim.get("reason")),
+            }
+            continue
+        revised = _stated_text(payload.get("revised_decision_id"))
+        if revised is None:
+            continue
+        delivered = _stated_text(payload.get("delivered_decision_id"))
+        accepted = payload.get("revised_accepted")
+        entry = dict(decisions.get(delivered or "") or {})
+        entry.update(
+            {
+                "decision_id": revised,
+                "sequence": event.get("sequence"),
+                "phase": _stated_text(payload.get("phase")) or entry.get("phase"),
+                "expected_outcome": _stated_text(payload.get("revised_outcome")),
+                "accepted": accepted if isinstance(accepted, bool) else None,
+                "code": _stated_text(payload.get("code")),
+                "reason": _stated_text(payload.get("reason")),
+            }
+        )
+        for field in ("signal", "claimed_outcome", "key_results", "claim_reason"):
+            entry.setdefault(field, None)
+        decisions[revised] = entry
+        if delivered:
+            revised_from[revised] = delivered
+
+    for decision_id, entry in decisions.items():
+        # A revision is carried by the turn the word it replaces was carried by.
+        entry["actor"] = carried_by.get(decision_id) or carried_by.get(
+            revised_from.get(decision_id, "")
+        )
+    return decisions
+
+
+def read_phase_notes(session_dir: Path | str) -> list[PhaseNote]:
+    """The working notes the agent recorded, in the order it recorded them.
+
+    Read from `phase` call envelopes whose action is `note`. A note the phase
+    tool refused was never recorded, so its envelope is not a note; and the
+    harness writes no notes, so a controller-sourced envelope is not one either.
+    The phase is the one the engine stated for the call — its turn record's,
+    then its tool result's — or `unknown` when neither said.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    for event in _ledger_events(
+        session_dir, frozenset({"action_envelope", "tool_result", "turn_record"})
+    ):
+        kind, payload = event["kind"], event["payload"]
+        if kind == "action_envelope":
+            params = payload.get("exact_params")
+            if (
+                payload.get("tool") != "phase"
+                or payload.get("intent_source") == "controller"
+                or not isinstance(params, dict)
+                or str(params.get("action") or "").strip().lower() != "note"
+            ):
+                continue
+            text = _stated_text(params.get("text"))
+            if text is None:
+                continue
+            envelope_id = _stated_text(payload.get("envelope_id"))
+            key = envelope_id or f"sequence:{event.get('sequence')}"
+            found[key] = {"text": text, "envelope_id": envelope_id, "phase": None}
+            continue
+        if kind == "tool_result":
+            entry = found.get(_stated_text(payload.get("envelope_id")) or "")
+            if entry is None:
+                continue
+            result = payload.get("result")
+            result = result if isinstance(result, dict) else {}
+            outcome = _stated_text(result.get("operation_outcome"))
+            if outcome is not None and outcome != "success":
+                entry["refused"] = True
+            facts = result.get("facts")
+            stated = _stated_text(facts.get("phase")) if isinstance(facts, dict) else None
+            entry["result_phase"] = stated or _stated_text(payload.get("source_phase"))
+            continue
+        entry = found.get(_stated_text(payload.get("envelope_ref")) or "")
+        if entry is not None:
+            entry["phase"] = _stated_text(payload.get("phase")) or entry["phase"]
+
+    return [
+        PhaseNote(
+            phase=entry["phase"] or entry.get("result_phase") or "unknown",
+            text=entry["text"],
+            envelope_id=entry["envelope_id"],
+        )
+        for entry in found.values()
+        if not entry.get("refused")
+    ]
+
+
+def read_report_envelopes(session_dir: Path | str) -> list[dict[str, Any]]:
+    """Every `report` call the run made, with who made it and what it said.
+
+    `actor` is `controller` for a call the harness made on its own — an envelope
+    the engine sourced to itself, or a forced action — and `model` otherwise; a
+    turn record naming the envelope has the last word, because the engine
+    stated it when the turn was over. `summary` and `details` are the call's
+    own words, or `None` when it said nothing in them.
+    """
+    reports: list[dict[str, Any]] = []
+    by_envelope: dict[str, dict[str, Any]] = {}
+    for event in _ledger_events(
+        session_dir, frozenset({"action_envelope", "forced_action", "turn_record"})
+    ):
+        kind, payload = event["kind"], event["payload"]
+        if kind == "turn_record":
+            entry = by_envelope.get(_stated_text(payload.get("envelope_ref")) or "")
+            if entry is not None and payload.get("actor") in _ACTORS:
+                entry["actor"] = payload["actor"]
+            continue
+        params = payload.get("exact_params")
+        if payload.get("tool") != "report" or not isinstance(params, dict):
+            continue
+        controller = kind == "forced_action" or payload.get("intent_source") == "controller"
+        entry = {
+            "sequence": event.get("sequence"),
+            "envelope_id": _stated_text(payload.get("envelope_id")),
+            "actor": "controller" if controller else "model",
+            "action": _stated_text(params.get("action")),
+            "status": _stated_text(params.get("status")),
+            "summary": _stated_text(params.get("summary")),
+            "details": _stated_text(params.get("details")),
+        }
+        reports.append(entry)
+        if entry["envelope_id"]:
+            by_envelope[entry["envelope_id"]] = entry
+    return reports
 
 
 def read_output_bytes(session_dir: Path | str, refs: Iterable[str]) -> dict[str, str]:
@@ -1167,10 +1396,14 @@ def _text(value: Any) -> str | None:
 __all__ = [
     "CONTROL_EVENTS_NAME",
     "DEFAULT_POLL_SECONDS",
+    "PhaseNote",
     "TrajectoryFollow",
     "build_trajectory",
     "control_events_path",
     "follow_trajectory",
+    "read_gate_decisions",
     "read_output_bytes",
+    "read_phase_notes",
+    "read_report_envelopes",
     "resolve_session_dir",
 ]

@@ -1966,12 +1966,41 @@ def _report_blocks(report_raw: str) -> list[dict[str, Any]]:
                 blocks.append({"type": "table", "rows": rows})
             continue
         else:
-            blocks.append({"type": "p", "text": _clean_inline_markdown(text)})
+            # A paragraph wrapped across lines is one paragraph, the way
+            # markdown reads it: the setup report wraps its prose at 160
+            # columns, and a line per block would print each fragment as a
+            # paragraph of its own.
+            paragraph = [text]
+            while index + 1 < len(lines) and _continues_paragraph(lines[index + 1]):
+                index += 1
+                paragraph.append(lines[index].strip())
+            blocks.append({"type": "p", "text": _clean_inline_markdown(" ".join(paragraph))})
 
         if len(blocks) >= max_blocks:
             break
         index += 1
     return blocks
+
+
+#: A line that begins a list item, which starts a block of its own.
+_LIST_ITEM = re.compile(r"([-*+]|\d{1,9}[.)])(\s|$)")
+
+
+def _continues_paragraph(line: str) -> bool:
+    """Whether this line carries on the paragraph above it.
+
+    Not when it is blank, indented as code, or opens a block of its own: a
+    heading, a table, a fence, a quote, a list item, or a bold label such as
+    the report header's `**Run**` line, which states a second thing rather
+    than finishing the first.
+    """
+
+    text = line.strip()
+    if not text or line.startswith("    "):
+        return False
+    if text.startswith(("#", "|", "\u2502", "```", "**", ">")):
+        return False
+    return _LIST_ITEM.match(text) is None
 
 
 def _markdown_table_rows(markdown: str) -> list[list[str]]:
@@ -2339,7 +2368,7 @@ def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
                 status="info",
                 counts="1 artifact",
                 time=time,
-                summary="A narrative report written during the run. The recorded result is what the run is judged on.",
+                summary="The report written when the run ended, from the recorded result.",
                 records=[
                     EvidenceRecord(
                         time=time,

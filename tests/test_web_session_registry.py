@@ -55,6 +55,9 @@ def test_evidence_groups_use_actual_refs_and_do_not_fabricate_a_session_record()
     assert groups[0].records[0].ref == "output_build"
     assert groups[1].counts == "2 references"
     assert all(group.source != "SAG session" for group in groups)
+    # The report is rendered from the record once the run has ended; it is not
+    # a narrative the agent wrote along the way.
+    assert groups[2].summary == "The report written when the run ended, from the recorded result."
 
 
 def test_evidence_groups_are_empty_when_no_artifact_refs_exist():
