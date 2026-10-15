@@ -1,6 +1,7 @@
 """Project analyzer tool for physical project surveying."""
 
 import re
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -79,7 +80,10 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # document-map fingerprint the contract freeze pins against. A v10 manifest was
 # written by a survey that produced neither, so reusing it would leave a run
 # with no claims to cite and no map to retrieve from.
-SURVEY_FACTS_VERSION = 13
+# v14: the trunk env-summary also carries the compact ``survey_facts`` the
+# analyze brief renders. A v13 trunk has none, so it is re-surveyed once
+# instead of opening analyze with an empty brief.
+SURVEY_FACTS_VERSION = 14
 
 
 def _project_recommendation_coordinates(rec):
@@ -98,6 +102,107 @@ def _project_recommendation_coordinates(rec):
                 {k: isl[k] for k in ("root", "system") if k in isl} for isl in islands
             ]
     return projected
+
+
+def _root_shape(project_path: str, build_root: Optional[str], maven_modules: Any) -> str:
+    """Classify the chosen build targeting (see ``_persist_build_requirements``)."""
+    root = project_path.rstrip("/")
+    target = build_root or project_path
+    if target.rstrip("/") == root and maven_modules:
+        return "healthy_reactor"
+    if target.startswith(f"{root}/"):
+        return "pathological_aggregator"
+    return "single_module"
+
+
+def _survey_fact_value(value: Any) -> bool:
+    """Whether a survey fact carries a value worth storing ("unknown" does not)."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "unknown", "none")
+    if isinstance(value, (Mapping, list, tuple)):
+        return bool(value)
+    return True
+
+
+def _survey_fact_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _survey_fact_list(value: Any, *, first: int, limit: int = 256) -> List[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [_survey_fact_text(item, limit) for item in value if _survey_fact_value(item)][:first]
+
+
+def compact_survey_facts(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """The survey facts the analyze brief shows, small enough to live on the trunk.
+
+    Only keys with a value are kept; lists keep their first entries and state
+    their total, and documented commands keep at most three of 120 characters.
+    """
+    rec = analysis.get("build_recommendation") or {}
+    if not isinstance(rec, Mapping):
+        rec = {}
+    project_path = analysis.get("project_path")
+    build_root = rec.get("build_root") or project_path
+    facts: Dict[str, Any] = {
+        "project_type": analysis.get("project_type"),
+        "build_system": (
+            rec.get("build_system")
+            if _survey_fact_value(rec.get("build_system"))
+            else analysis.get("build_system")
+        ),
+        "build_root": build_root,
+        "test_root": rec.get("test_root"),
+        "root_shape": (
+            _root_shape(project_path, rec.get("build_root"), analysis.get("maven_modules"))
+            if isinstance(project_path, str) and project_path
+            else None
+        ),
+        "is_multi_module": analysis.get("is_multi_module"),
+    }
+    for key in ("project_type", "build_system", "build_root", "test_root"):
+        if _survey_fact_value(facts[key]):
+            facts[key] = _survey_fact_text(facts[key], 256)
+    modules = analysis.get("maven_modules")
+    if isinstance(modules, (list, tuple)) and modules:
+        facts["modules"] = _survey_fact_list(modules, first=8)
+        facts["modules_total"] = len(modules)
+    if _survey_fact_value(analysis.get("java_version")):
+        facts["java_version"] = _survey_fact_text(analysis["java_version"], 64)
+        facts["java_version_source"] = analysis.get("java_version_source")
+        if isinstance(analysis.get("java_version_enforced"), bool):
+            facts["java_version_enforced"] = analysis["java_version_enforced"]
+    for key in ("test_framework", "static_test_count", "method_count", "test_count_method"):
+        facts[key] = analysis.get(key)
+    if facts["test_framework"] is not None:
+        facts["test_framework"] = _survey_fact_text(facts["test_framework"], 128)
+    parameterized_info = analysis.get("parameterized_info")
+    if isinstance(parameterized_info, Mapping):
+        methods = parameterized_info.get("parameterized_methods")
+        facts["parameterized"] = isinstance(methods, int) and methods > 0
+    dependencies = analysis.get("dependencies")
+    if isinstance(dependencies, (list, tuple)) and dependencies:
+        facts["dependencies"] = _survey_fact_list(dependencies, first=5)
+        facts["dependencies_total"] = len(dependencies)
+    documentation = analysis.get("documentation")
+    if isinstance(documentation, Mapping):
+        documented: Dict[str, Any] = {}
+        requirement = documentation.get("java_version_requirement")
+        if _survey_fact_value(requirement):
+            documented["java_version_requirement"] = _survey_fact_text(requirement, 120)
+        for key in ("build_commands", "test_commands"):
+            commands = _survey_fact_list(documentation.get(key), first=3, limit=120)
+            if commands:
+                documented[key] = commands
+        facts["documentation"] = documented
+    facts["existing_files"] = _survey_fact_list(analysis.get("existing_files"), first=32, limit=128)
+    return {key: value for key, value in facts.items() if _survey_fact_value(value)}
 
 
 def _analysis_failure(code: str, **facts: Any) -> ToolResult:
@@ -1216,12 +1321,7 @@ class ProjectAnalyzerTool(BaseTool):
         rec = analysis.get("build_recommendation") or {}
         build_root = rec.get("build_root") or project_path
         root = project_path.rstrip("/")
-        if build_root.rstrip("/") == root and analysis.get("maven_modules"):
-            root_shape = "healthy_reactor"
-        elif build_root.startswith(f"{root}/"):
-            root_shape = "pathological_aggregator"
-        else:
-            root_shape = "single_module"
+        root_shape = _root_shape(project_path, build_root, analysis.get("maven_modules"))
 
         fail_at_end = root_shape == "healthy_reactor"
         # Fail-at-end testing only makes sense at reactor scope; when the test
@@ -1482,6 +1582,16 @@ class ProjectAnalyzerTool(BaseTool):
                 "config_fingerprint": analysis.get("config_fingerprint"),
                 "target_sha": analysis.get("target_sha"),
             }
+
+        # The compact facts the analyze brief renders (Survey: lines), so the
+        # model does not re-read the build file and README to learn them.
+        # Replaced whole on every survey: a fact the new survey did not find
+        # must not linger from the old one.
+        survey_facts = compact_survey_facts(analysis)
+        if survey_facts:
+            trunk_context.environment_summary["survey_facts"] = survey_facts
+        else:
+            trunk_context.environment_summary.pop("survey_facts", None)
 
         build_recommendation = analysis.get("build_recommendation")
         if build_recommendation:

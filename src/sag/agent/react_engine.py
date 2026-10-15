@@ -270,8 +270,9 @@ PHASE_OBJECTIVES = {
         "remains an explicit blocker or unknown fact."
     ),
     "analyze": (
-        "Inspect relevant project documentation, configuration and CI; treat the survey as "
-        "evidence hints. Record a short strategy and unresolved prerequisites in key_results. "
+        "The survey facts in the Survey: lines are on record. Read project documentation, "
+        "configuration and CI only where the survey leaves a gap or disagrees with the "
+        "pinned task. Record a short strategy and unresolved prerequisites in key_results. "
         "A structured execution_plan is optional. The user task and pinned CI scope remain "
         "the acceptance requirements. Unknown runner semantics may be explored through "
         "bounded execution; neither a plan nor a command name establishes success."
@@ -3027,7 +3028,7 @@ class ReActEngine:
             f"For an external impediment, call phase(action='blocked', "
             f"outcome='failed|partial|unknown', reason=..., evidence=[refs]).",
         ]
-        # Surface only survey status and coordinates.  The phase contract names
+        # Surface only survey status and survey facts.  The phase contract names
         # required evidence; neither source chooses a public project action.
         if phase == "analyze":
             survey_projection = {
@@ -3045,11 +3046,17 @@ class ReActEngine:
                     "replacement project action."
                 ),
             }.get(survey_state)
-            if survey_projection:
-                lines.insert(lines.index(f"Objective: {objective}") + 1, survey_projection)
-            fact_guidance = self._analyze_fact_sheet_guidance()
-            if fact_guidance:
-                lines.extend(["", fact_guidance])
+            # The survey's own facts follow its status line, so the model
+            # does not re-read the build file and README to learn them. A
+            # failed survey shows none: the trunk may hold an older survey's.
+            survey_lines = (
+                self._survey_brief_lines() if survey_state in ("created", "present") else []
+            )
+            anchor = lines.index(f"Objective: {objective}") + 1
+            lines[anchor:anchor] = [
+                *([survey_projection] if survey_projection else []),
+                *survey_lines,
+            ]
             inventory_guidance = self._document_inventory_guidance()
             if inventory_guidance:
                 lines.extend(["", inventory_guidance])
@@ -3152,7 +3159,7 @@ class ReActEngine:
         # The ref is only known after storing the omitted lines, so reserve room
         # for the widest possible count and a store_output-sized ref id.
         reserved_footer = footer_template.format(count=len(candidates), ref="output_" + "x" * 12)
-        important = ("=== PHASE:", "Objective:", "Budget:", "Task ", "Required task", "Runtime observed:", "Receipt source:")
+        important = ("=== PHASE:", "Objective:", "Budget:", "Task ", "Required task", "Runtime observed:", "Receipt source:", "Survey:")
         ordered = sorted(candidates, key=lambda pair: (not pair[1].startswith(important), pair[0]))
         selected = []
         used = len(reserved_footer)
@@ -3277,46 +3284,17 @@ class ReActEngine:
                 "Inspect retained execution evidence; do not infer that any step completed.",
             ]
 
-    def _analyze_fact_sheet_guidance(self) -> str:
-        """Project the small observed coordinate set useful for Analyze."""
+    def _survey_brief_lines(self) -> List[str]:
+        """The trunk's survey facts as ``Survey:`` lines; [] when unreadable."""
 
         try:
-            from sag.tools.internal.build_preflight import read_live_build_requirements
+            from .survey_brief import render_survey_brief
 
-            orchestrator = getattr(self, "orchestrator", None) or getattr(
-                getattr(self, "context_manager", None), "orchestrator", None
-            )
-            observed = read_live_build_requirements(orchestrator)
-            if (
-                not observed.complete
-                or observed.conflict is not None
-                or not isinstance(observed.payload, Mapping)
-            ):
-                return ""
-            manifest = observed.payload
-            module_structure = manifest.get("module_structure")
-            modules = (
-                module_structure.get("modules") if isinstance(module_structure, Mapping) else None
-            )
-            fields = [
-                ("build_root", manifest.get("build_root")),
-                ("test_root", manifest.get("test_root")),
-                ("root_shape", manifest.get("root_shape")),
-                ("surveyed_modules", len(modules) if isinstance(modules, Sequence) else None),
-            ]
-            rendered = " · ".join(
-                f"{name}={value}" for name, value in fields if value not in (None, "", [])
-            )
-            if not rendered:
-                return ""
-            return (
-                "Harness fact-sheet hints (mechanically observed coordinates, not a runner "
-                "choice or execution plan): "
-                f"{rendered}. Use them to locate and gap-check project docs/CI/config; "
-                "project evidence still controls the test runner and strategy."
-            )
-        except Exception:
-            return ""
+            trunk = self.context_manager.load_trunk_context()
+            return render_survey_brief(getattr(trunk, "environment_summary", None) or {})
+        except Exception as exc:
+            logger.debug(f"survey brief unavailable: {exc}")
+            return []
 
     def _document_inventory_guidance(self) -> str:
         """Bounded Analyze inventory projection; never a document allowlist."""

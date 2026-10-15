@@ -314,3 +314,48 @@ def test_bounded_phase_contract_rejects_budget_smaller_than_footer():
     engine.output_storage = _RecordingStorage()
     with pytest.raises(ValueError):
         engine._bounded_phase_contract("=== PHASE: BUILD ===\n" + "x" * 500, 40)
+
+
+@pytest.mark.parametrize("policy", ["facts", "relevant"])
+def test_survey_lines_survive_the_whole_intro_cut_in_the_analyze_brief(policy):
+    survey_facts = {
+        "project_type": "Java",
+        "build_system": "maven",
+        "build_root": "/workspace/demo",
+        "root_shape": "single_module",
+        "java_version": "17",
+        "java_version_source": "maven-compiler",
+        "java_version_enforced": False,
+        "test_framework": "JUnit",
+        "static_test_count": 974,
+        "dependencies": ["org.junit.jupiter:junit-jupiter"],
+        "dependencies_total": 1,
+        "documentation": {"build_commands": ["mvn clean verify"], "test_commands": ["mvn test"]},
+        "existing_files": ["pom.xml", "README.md"],
+    }
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.config = SimpleNamespace(phase_context_policy=policy, phase_handoff_char_budget=6000)
+    engine.phase_machine = PhaseMachine(start_phase="analyze")
+    engine.phase_handoff = PhaseHandoff(fixture_state(), retain_context=True, context_policy=policy)
+    engine.output_storage = _RecordingStorage()
+    engine._phase_budget_numbers = lambda phase: (150, 10, 100)
+    engine._detected_build_system = lambda: "maven"
+    engine._ensure_project_facts = lambda: "present"
+    engine._current_phase_evidence_lines = lambda: []
+    engine.context_manager = SimpleNamespace(
+        load_trunk_context=lambda: SimpleNamespace(environment_summary={"survey_facts": survey_facts})
+    )
+    # A document inventory far larger than the whole-intro budget.
+    engine._document_inventory_guidance = lambda: "\n".join(
+        f"- docs/guide-{i:03d}.md: section index with build notes and long headings" for i in range(400)
+    )
+    intro = engine._phase_intro_step().content
+    survey = [line for line in intro.splitlines() if line.startswith("Survey: ")]
+    assert len(intro) <= 6000
+    assert engine._phase_handoff_audit["contract_omission_ref"] == "output_test123"
+    assert survey[0].startswith("Survey: project type Java; build system maven at /workspace/demo")
+    assert "Survey: documented build commands: mvn clean verify; documented test commands: mvn test" in survey
+    assert survey[-1].startswith("Survey: these are observed facts")
+    assert len(survey) == 6
+    omitted = engine.output_storage.calls[0]["output"]
+    assert "Survey:" not in omitted and "docs/guide-399.md" in omitted

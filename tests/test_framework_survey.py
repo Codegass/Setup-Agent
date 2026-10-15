@@ -868,3 +868,170 @@ def test_analysis_validity_is_facts_based_not_plan_based():
         )
         is False
     )
+
+
+# ---- Token levers 2, Unit A: the analyze brief carries the survey facts ----
+
+
+def _java_analysis(**overrides):
+    analysis = {
+        "analyzer_version": "project-analyzer-v1",
+        "project_path": "/workspace/x",
+        "project_type": "Java",
+        "build_system": "Maven",
+        "build_recommendation": {
+            "build_system": "maven",
+            "build_root": "/workspace/x",
+            "test_root": "/workspace/x",
+            "test_system": "maven",
+            "goal": "install",
+            "rationale": "root reactor",
+        },
+        "is_multi_module": True,
+        "maven_modules": [f"module-{i}" for i in range(11)],
+        "java_version": "11",
+        "java_version_source": "maven-compiler",
+        "java_version_enforced": False,
+        "test_framework": "JUnit",
+        "static_test_count": 473,
+        "method_count": 473,
+        "test_count_method": "catalog_based_discovery",
+        "parameterized_info": {"regular_tests": 469, "parameterized_methods": 4},
+        "dependencies": [f"group:artifact-{i}" for i in range(10)],
+        "documentation": {
+            "source_path": "README.md",
+            "readme_content": "# x\n" * 400,
+            "setup_instructions": ["install a JDK"],
+            "java_version_requirement": "11",
+            "build_commands": ["mvn clean install", "mvn " + "b" * 300, "mvn package", "mvn site"],
+            "test_commands": [],
+            "requirements": [],
+        },
+        "existing_files": ["pom.xml", "README.md"],
+        "special_requirements": [],
+    }
+    analysis.update(overrides)
+    return analysis
+
+
+def test_trunk_carries_compact_survey_facts():
+    trunk = SimpleNamespace(environment_summary={})
+    ProjectAnalyzerTool()._record_environment_metrics(trunk, _java_analysis())
+    assert trunk.environment_summary["survey_facts"] == {
+        "project_type": "Java",
+        "build_system": "maven",
+        "build_root": "/workspace/x",
+        "test_root": "/workspace/x",
+        "root_shape": "healthy_reactor",
+        "is_multi_module": True,
+        "modules": [f"module-{i}" for i in range(8)],
+        "modules_total": 11,
+        "java_version": "11",
+        "java_version_source": "maven-compiler",
+        "java_version_enforced": False,
+        "test_framework": "JUnit",
+        "static_test_count": 473,
+        "method_count": 473,
+        "test_count_method": "catalog_based_discovery",
+        "parameterized": True,
+        "dependencies": [f"group:artifact-{i}" for i in range(5)],
+        "dependencies_total": 10,
+        "documentation": {
+            "java_version_requirement": "11",
+            "build_commands": ["mvn clean install", ("mvn " + "b" * 300)[:119] + "…", "mvn package"],
+        },
+        "existing_files": ["pom.xml", "README.md"],
+    }
+
+
+def test_survey_facts_keep_only_keys_with_a_value():
+    trunk = SimpleNamespace(environment_summary={})
+    python_analysis = {
+        "project_path": "/workspace/proj",
+        "project_type": "Python",
+        "build_system": "pip/poetry",
+        "build_recommendation": {"build_system": "python", "build_root": "/workspace/proj"},
+        "java_version": None,
+        "dependencies": [],
+        "test_framework": "unknown",
+        "documentation": {"build_commands": [], "test_commands": [], "java_version_requirement": None},
+        "static_test_count": None,
+        "existing_files": ["pyproject.toml"],
+    }
+    ProjectAnalyzerTool()._record_environment_metrics(trunk, python_analysis)
+    assert trunk.environment_summary["survey_facts"] == {
+        "project_type": "Python",
+        "build_system": "python",
+        "build_root": "/workspace/proj",
+        "root_shape": "single_module",
+        "existing_files": ["pyproject.toml"],
+    }
+
+
+def test_a_resurvey_replaces_the_survey_facts_whole():
+    trunk = SimpleNamespace(environment_summary={})
+    tool = ProjectAnalyzerTool()
+    tool._record_environment_metrics(trunk, _java_analysis())
+    tool._record_environment_metrics(
+        trunk, _java_analysis(dependencies=[], documentation={}, maven_modules=[], is_multi_module=False)
+    )
+    facts = trunk.environment_summary["survey_facts"]
+    assert "dependencies" not in facts and "documentation" not in facts and "modules" not in facts
+    assert facts["root_shape"] == "single_module"
+
+
+def test_survey_version_bump_resurveys_a_trunk_written_by_the_older_survey():
+    """An older trunk stamp has no survey_facts; the fast path keys on the
+    version stamp, so it re-surveys once and the facts land."""
+    assert SURVEY_FACTS_VERSION >= 14
+    orch = SurveyOrch()
+    cm = IntegrationCM()
+    tool = ProjectAnalyzerTool(orch, cm)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+    assert cm.trunk.environment_summary["survey_facts"]["project_type"] == "Python"
+
+    cm.trunk.environment_summary.pop("survey_facts")
+    cm.trunk.environment_summary["survey"]["analyzer_version"] = SURVEY_FACTS_VERSION - 1
+    assert tool.ensure_facts("/workspace/proj") == "created"  # NOT 'present'
+    assert cm.trunk.environment_summary["survey_facts"]["project_type"] == "Python"
+    assert tool.ensure_facts("/workspace/proj") == "present"
+
+
+def test_analyze_brief_carries_the_survey_lines_after_the_status_line():
+    from test_python_phase_guidance import _engine_at
+
+    cm = IntegrationCM()
+    orch = StrictSurveyOrch()
+    engine = _engine_at(1, cm.trunk.environment_summary)  # analyze phase
+    engine.context_manager = cm
+    engine.physical_validator = SimpleNamespace(docker_orchestrator=orch)
+
+    intro_lines = engine._phase_intro_step().content.splitlines()
+
+    assert cm.trunk.environment_summary["survey_facts"]["project_type"] == "Python"
+    status = next(i for i, line in enumerate(intro_lines) if line.startswith("Engine survey status: created"))
+    survey = [line for line in intro_lines if line.startswith("Survey: ")]
+    assert survey and intro_lines[status + 1 : status + 1 + len(survey)] == survey
+    assert survey[0].startswith("Survey: project type Python; build system python at /workspace")
+    assert survey[-1] == (
+        "Survey: these are observed facts recorded by the harness, not a plan or a runner choice."
+    )
+    assert intro_lines[status - 1].startswith("Objective: The survey facts in the Survey: lines are on record.")
+    # The old four-field hints line is folded into the first survey line.
+    assert not any("fact-sheet hints" in line for line in intro_lines)
+
+
+def test_analyze_brief_shows_no_survey_lines_when_the_survey_failed(monkeypatch):
+    from sag.agent.react_engine import ReActEngine
+
+    trunk = SimpleNamespace(environment_summary={})
+    ProjectAnalyzerTool()._record_environment_metrics(trunk, _java_analysis())
+    monkeypatch.setattr(ReActEngine, "_ensure_project_facts", lambda self: "failed")
+    intro = _mutable_engine(1, trunk.environment_summary)._phase_intro_step().content
+    assert "Engine survey status: failed" in intro
+    assert not any(line.startswith("Survey: ") for line in intro.splitlines())
+
+    monkeypatch.setattr(ReActEngine, "_ensure_project_facts", lambda self: "present")
+    intro = _mutable_engine(1, trunk.environment_summary)._phase_intro_step().content
+    assert "Survey: project type Java; build system maven at /workspace/x (multi-module root" in intro
+    assert "Survey: java version in build config: 11 (source maven-compiler; enforced: no)" in intro
