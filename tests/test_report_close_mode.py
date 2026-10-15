@@ -39,6 +39,7 @@ from sag.agent.report_departures import (
     DEPARTURE_BLOCK_CAP,
     DEPARTURE_HEADER,
     DEPARTURE_LINE_CAP,
+    departure_items,
     render_departure_block,
     report_turn_needed,
 )
@@ -620,6 +621,92 @@ def test_a_task_that_was_never_given_is_not_a_departure():
     needed, reason = _predicate(task_status=None)
     assert needed is False
     assert reason.startswith("verdict success; task none given;")
+
+
+# The 2026-10-15 httpcomponents-client run: the agent closed build as partial
+# because the first Maven run failed on a timing-sensitive test, the gate graded
+# the phase success on compilation evidence, and the harness wrote the report
+# without the agent's notes. The agent's own word is a departure.
+BUILD_FAILURE_NOTES = (
+    "Compiled every module; Terminal result: BUILD FAILURE on a timing-sensitive test"
+)
+
+
+def _claimed(phase, claimed, key_results=""):
+    """A gate-graded success over the agent's own claim, as `PhaseMachine` records it."""
+    return _record(
+        phase,
+        key_results=key_results,
+        claim=PhaseClaim(phase=phase, claimed_outcome=claimed, key_results=key_results),
+    )
+
+
+def _with_build(record):
+    clean = _clean_records()
+    return [*clean[:2], record, clean[3]]
+
+
+def test_a_phase_the_agent_did_not_call_a_success_needs_the_model_turn():
+    needed, reason = _predicate(
+        records=_with_build(_claimed("build", "partial", BUILD_FAILURE_NOTES))
+    )
+    assert needed is True
+    assert "build closed as success but the agent claimed partial" in reason
+
+
+def test_the_departure_lines_name_what_the_agent_claimed_with_its_notes():
+    items = departure_items(
+        records=_with_build(_claimed("build", "partial", BUILD_FAILURE_NOTES)),
+        blockers=(),
+        conflicts=(),
+        repairs=(),
+    )
+    assert items == [
+        "Departure: build attempt build-1: completed [success], the agent claimed partial "
+        f"— {BUILD_FAILURE_NOTES}"
+    ]
+
+
+def test_a_claimed_departure_with_no_notes_says_so():
+    items = departure_items(
+        records=[_claimed("build", "failed")], blockers=(), conflicts=(), repairs=()
+    )
+    assert items == [
+        "Departure: build attempt build-1: completed [success], the agent claimed failed "
+        "— no notes recorded"
+    ]
+
+
+def test_a_success_the_agent_also_claimed_stays_clean():
+    records = _with_build(_claimed("build", "success", "every module compiled"))
+    needed, reason = _predicate(records=records)
+    assert needed is False
+    assert reason.startswith("verdict success; task complete;")
+    assert departure_items(records=records, blockers=(), conflicts=(), repairs=()) == []
+
+
+def test_a_record_with_no_claim_is_judged_on_its_close_alone():
+    records = _clean_records()
+    assert all(record.claim is None for record in records)
+    needed, _ = _predicate(records=records)
+    assert needed is False
+    assert departure_items(records=records, blockers=(), conflicts=(), repairs=()) == []
+
+
+def test_a_graded_departure_is_not_reported_twice_for_its_claim():
+    record = _record(
+        "build",
+        "partial",
+        key_results="14 of 15 modules",
+        claim=PhaseClaim(phase="build", claimed_outcome="partial", key_results="14 of 15 modules"),
+    )
+    needed, reason = _predicate(records=_with_build(record))
+    assert needed is True
+    assert "build closed completed [partial]" in reason
+    assert "the agent claimed" not in reason
+    assert departure_items(records=[record], blockers=(), conflicts=(), repairs=()) == [
+        "Departure: build attempt build-1: completed [partial] — 14 of 15 modules"
+    ]
 
 
 def test_the_engine_predicate_needs_a_current_verdict(tmp_path, monkeypatch):

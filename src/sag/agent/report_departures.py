@@ -10,9 +10,10 @@ Both functions here read the record alone and re-run nothing:
 
 - `report_turn_needed` decides whether the run is green — success verdict, the
   task complete when one was given, each of provision/analyze/build/test closed
-  exactly once as completed/success, no blocker (active or resolved), no
-  conflict, no repair, and the evidence closed when the tests ended — and says
-  why in plain English for the ledger.
+  exactly once as completed/success (and, when the agent closed it, the agent
+  itself claimed success), no blocker (active or resolved), no conflict, no
+  repair, and the evidence closed when the tests ended — and says why in plain
+  English for the ledger.
 - `render_departure_block` lists every departure, one `Departure: ` line per
   item, so the report brief can keep whole lines under a bounded contract.
 """
@@ -52,6 +53,22 @@ def _task_words(task_status: Optional[str]) -> str:
     return f"task {task_status}" if task_status else "task none given"
 
 
+def _claimed_below_success(record: Any) -> str:
+    """What the agent claimed when it did not call its close a success; else empty.
+
+    A record with no claim was minted by the harness and is judged on its close
+    alone. The gate can grade a phase success over the agent's own "partial";
+    that is exactly when the agent's notes are wanted.
+    """
+    claim = getattr(record, "claim", None)
+    if claim is None:
+        return ""
+    claimed = _value(claim.claimed_outcome)
+    if claimed == "success":
+        return ""
+    return claimed or "an unrecorded outcome"
+
+
 def report_turn_needed(
     *,
     verdict: str,
@@ -81,6 +98,10 @@ def report_turn_needed(
         outcome = _value(closes[0].outcome)
         if termination != "completed" or outcome != "success":
             reasons.append(f"{phase} closed {termination} [{outcome}]")
+            continue
+        claimed = _claimed_below_success(closes[0])
+        if claimed:
+            reasons.append(f"{phase} closed as success but the agent claimed {claimed}")
     if blockers:
         reasons.append(f"{_count(len(blockers), 'blocker')} on record")
     if conflicts:
@@ -120,12 +141,15 @@ def departure_items(
     for record in records:
         termination = _value(record.termination)
         outcome = _value(record.outcome)
+        close = f"{termination} [{outcome}]"
         if termination == "completed" and outcome == "success":
-            continue
+            claimed = _claimed_below_success(record)
+            if not claimed:
+                continue
+            close += f", the agent claimed {claimed}"
         text = _one_line(record.key_results or record.reason) or "no notes recorded"
         items.append(
-            f"{DEPARTURE_PREFIX}{record.phase} attempt {record.attempt_id}: "
-            f"{termination} [{outcome}] — {text}"
+            f"{DEPARTURE_PREFIX}{record.phase} attempt {record.attempt_id}: {close} — {text}"
         )
     for blocker in blockers:
         items.append(
