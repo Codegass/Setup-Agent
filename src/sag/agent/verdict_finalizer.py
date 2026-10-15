@@ -2031,6 +2031,16 @@ class VerdictFinalizer:
         snapshot = self._snapshot_for_state(state)
         return read_live_verdict_snapshot(self.orchestrator) == snapshot
 
+    def current_snapshot(self, state: RunEvidenceState) -> RunVerdictSnapshot | None:
+        """This run's sealed snapshot, or None when host authority does not hold it.
+
+        A read of what `finalize` already computed and published; nothing is
+        recomputed beyond the cached expectation and nothing is written.
+        """
+        if not self.has_current_snapshot(state):
+            return None
+        return self._snapshot_for_state(state)
+
     def finalize(
         self,
         state: RunEvidenceState,

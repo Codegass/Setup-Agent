@@ -149,6 +149,7 @@ from .repair_contexts import (
     write_repair_context,
 )
 from .replay import recover_active_repair_context_from_path
+from .report_departures import render_departure_block, report_turn_needed
 from .stall_diagnostics import (
     STALL_CONFIRMATION_TRIGGER,
     WALL_GUARD_TRIGGER,
@@ -302,11 +303,16 @@ PHASE_OBJECTIVES = {
         "Claim the outcome the receipts support; "
         "absence of a runner receipt cannot support test success."
     ),
+    # The report brief reaches the model only when the run left the clean
+    # path (a green run's report is written by the harness without a model
+    # turn), so it asks for the notes the record cannot hold.
     "report": (
-        "Persist the final setup report grounded in fixed task requirements, the sealed "
-        "verdict, current receipts, "
-        "artifacts, test counts, and unresolved conflicts. Completion requires a durable report "
-        "artifact reference; report delivery status does not rewrite the verdict."
+        "Write what the record cannot say. This run departed from a clean path; the "
+        "departures are listed below. Call report(action='generate', summary=<one "
+        "sentence>, details=<notes>) where details say where the run got stuck, why, and "
+        "what a person needs to do next. Do not repeat commands, versions, exit codes or "
+        "test counts; the record already carries them. Completion requires a durable "
+        "report artifact reference; report delivery status does not rewrite the verdict."
     ),
 }
 
@@ -336,7 +342,15 @@ PYTHON_PHASE_OBJECTIVES = {
 
 # Kickoff tasks are authored before the ecosystem is known.  The base contracts
 # are deliberately ecosystem-neutral, so kickoff needs no prescriptive rewrite.
-KICKOFF_PHASE_OBJECTIVES = dict(PHASE_OBJECTIVES)
+# The report task is the exception: it is written before the run has a record,
+# so it cannot speak of departures, and the t=0 plan selects no call.
+KICKOFF_REPORT_OBJECTIVE = (
+    "Persist the final setup report grounded in fixed task requirements, the sealed "
+    "verdict, current receipts, "
+    "artifacts, test counts, and unresolved conflicts. Completion requires a durable report "
+    "artifact reference; report delivery status does not rewrite the verdict."
+)
+KICKOFF_PHASE_OBJECTIVES = {**PHASE_OBJECTIVES, "report": KICKOFF_REPORT_OBJECTIVE}
 
 # Back-compat aliases: dim (d) collapsed the FACTS_* variants INTO the base
 # maps above, so these names now point at the same facts-wording objects. Kept
@@ -3060,6 +3074,14 @@ class ReActEngine:
             inventory_guidance = self._document_inventory_guidance()
             if inventory_guidance:
                 lines.extend(["", inventory_guidance])
+        if phase == "report":
+            # The departures the objective refers to, read from the record and
+            # placed right under it. Every line starts with "Departure", which
+            # the bounded contract keeps whole.
+            departures = self._report_departure_lines()
+            if departures:
+                anchor = lines.index(f"Objective: {objective}") + 1
+                lines[anchor:anchor] = departures
         if phase in ("build", "test"):
             if not retained:
                 lines.extend(self._required_task_progress_lines())
@@ -3159,7 +3181,7 @@ class ReActEngine:
         # The ref is only known after storing the omitted lines, so reserve room
         # for the widest possible count and a store_output-sized ref id.
         reserved_footer = footer_template.format(count=len(candidates), ref="output_" + "x" * 12)
-        important = ("=== PHASE:", "Objective:", "Budget:", "Task ", "Required task", "Runtime observed:", "Receipt source:", "Survey:")
+        important = ("=== PHASE:", "Objective:", "Budget:", "Task ", "Required task", "Runtime observed:", "Receipt source:", "Survey:", "Departure")
         ordered = sorted(candidates, key=lambda pair: (not pair[1].startswith(important), pair[0]))
         selected = []
         used = len(reserved_footer)
@@ -3583,6 +3605,11 @@ class ReActEngine:
             self._journal_intro_dirty = True
             self._journal_last_ledger = None
             self._start_phase_branch()
+            if decision.route.kind == "evidence_close" and machine.current_phase == "report":
+                # A green record needs no notes: the harness writes the report
+                # and the loop's delivery close ends the flow this iteration.
+                # Otherwise (or on failure) the brief above asks the model.
+                self._close_green_report_without_model()
             if self._reuse_verified_test_phase():
                 return
             # Guarantee 1 (spec §3.2): the advice lands in the fresh window
@@ -4621,7 +4648,13 @@ class ReActEngine:
                 ):
                     self._maybe_consult_advisor_for_problem()
 
-                if phase_mode and self._enforce_phase_floors() and self.phase_machine.is_complete:
+                if (
+                    phase_mode
+                    and self._enforce_phase_floors()
+                    # A floor close that lands in a green report phase has its
+                    # report delivered already; close it before any model turn.
+                    and (self.phase_machine.is_complete or self._close_delivered_report())
+                ):
                     self._export_token_usage_csv()
                     return self._close_flow(RunTerminationStatus.COMPLETED)
 
@@ -4841,6 +4874,233 @@ class ReActEngine:
         )
         self._apply_phase_decision(record, route)
         return machine.is_complete
+
+    # The harness's own report call when the record is green. The summary is
+    # fixed because there is nothing to add; `details` carries the reason the
+    # predicate gave, so the ledger states why no model was asked.
+    _GREEN_REPORT_SUMMARY = (
+        "Every phase closed as success and the record carries the result; the harness "
+        "wrote the report without asking the agent for notes."
+    )
+    _GREEN_REPORT_ACTION_TEXT = "HARNESS REPORT: every phase closed as success"
+    _GREEN_REPORT_NATIVE_TEXT = (
+        "[harness] writing the report from the record; every phase closed as success"
+    )
+
+    def _current_verdict_snapshot(self):
+        """The finalizer's current snapshot, read only once delivery is allowed."""
+        if getattr(self, "phase_machine", None) is None or not self._report_execution_allowed():
+            return None
+        current = getattr(getattr(self, "verdict_finalizer", None), "current_snapshot", None)
+        if not callable(current):
+            return None
+        return current(self.run_evidence_state)
+
+    def _report_turn_needed(self) -> tuple[bool, str]:
+        """Whether the report phase needs a model turn, and why (for the ledger).
+
+        Green is read from the sealed record and the finalizer's current
+        snapshot; nothing is re-run. Anything that cannot be read needs the
+        model, so an unknown never passes for green.
+        """
+        snapshot = self._current_verdict_snapshot()
+        if snapshot is None:
+            return True, "the verdict is not on record for this run"
+        state = self.run_evidence_state
+        task = snapshot.task_completion
+        return report_turn_needed(
+            verdict=snapshot.verdict,
+            task_status=task.status if task is not None else None,
+            records=self.phase_machine.records,
+            blockers=state.blockers,
+            conflicts=snapshot.conflicts,
+            repairs=state.repair_records,
+            close_reason=state.close_reason,
+        )
+
+    def _report_departure_lines(self) -> List[str]:
+        """The report brief's departures block, from the record; [] when unreadable."""
+        try:
+            machine = self.phase_machine
+            state = getattr(self, "run_evidence_state", None)
+            snapshot = self._current_verdict_snapshot()
+            task = snapshot.task_completion if snapshot is not None else None
+            return render_departure_block(
+                records=machine.records,
+                blockers=state.blockers if state is not None else (),
+                conflicts=(
+                    snapshot.conflicts
+                    if snapshot is not None
+                    else (state.conflicts if state is not None else ())
+                ),
+                repairs=state.repair_records if state is not None else (),
+                verdict=snapshot.verdict if snapshot is not None else "unknown",
+                task_status=task.status if task is not None else None,
+            )
+        except Exception as exc:
+            logger.warning(f"Report departures unavailable: {exc}")
+            return []
+
+    def _close_green_report_without_model(self) -> bool:
+        """Write the report as a controller action when the record is green.
+
+        Called once the report window is open. Without effect unless delivery
+        is allowed, the report tool is registered, nothing was delivered yet
+        and the record is green. The call takes the same path a model call
+        takes — the intent-minting boundary, `_record_tool_execution`, the
+        envelope and its result, the paired observation, the phase history —
+        under a controller intent, and seals a controller turn. The loop's
+        `_close_delivered_report()` then closes the flow, so a green run makes
+        no report-phase model request.
+
+        On an exception the window and the delivery flags are put back as
+        they were and the model turn proceeds with the brief already in the
+        window. A call that ran and failed stays on the record; the model
+        then writes the report. Returns whether a delivery was verified.
+        """
+        machine = getattr(self, "phase_machine", None)
+        if (
+            machine is None
+            or machine.is_complete
+            or machine.current_phase != "report"
+            or getattr(self, "_report_delivery", None)
+            or getattr(self, "_green_report_attempted", False)
+            or "report" not in (getattr(self, "tools", None) or {})
+        ):
+            return False
+        try:
+            needed, reason = self._report_turn_needed()
+        except Exception as exc:
+            logger.warning(f"Report phase needs the agent; the record could not be read: {exc}")
+            return False
+        if needed:
+            logger.info(f"Report phase needs the agent: {reason}")
+            return False
+        self._green_report_attempted = True
+        saved_steps = list(self.steps)
+        saved_flags = {
+            name: getattr(self, name, default)
+            for name, default in (
+                ("_report_attempted", False),
+                ("_report_delivered", False),
+                ("_report_failed", False),
+                ("_report_delivery", None),
+            )
+        }
+        try:
+            self._write_green_report(reason)
+        except Exception as exc:
+            logger.warning(f"Harness report failed; the agent writes it: {exc}")
+            self.steps = saved_steps
+            for name, value in saved_flags.items():
+                setattr(self, name, value)
+            return False
+        delivered = bool(getattr(self, "_report_delivery", None))
+        if not delivered:
+            logger.warning("Harness report was not delivered; the agent writes it")
+        return delivered
+
+    def _write_green_report(self, reason: str) -> None:
+        """One controller `report` call, recorded like any dispatched call."""
+        machine = self.phase_machine
+        turn_started = self._turn_stamp()
+        branch_task_id = getattr(getattr(self, "context_manager", None), "current_task_id", None)
+        tool, params = self._canonicalize_tool_action(
+            "report",
+            {
+                "action": "generate",
+                "status": "success",
+                "summary": self._GREEN_REPORT_SUMMARY,
+                "details": reason,
+            },
+        )
+        intent = EngineActionIntentFactory.for_controller().from_submission(
+            {
+                "domain_id": self._action_domain_id(params),
+                "tool": tool,
+                "params": params,
+                "next_action_kind": str(params.get("action") or tool),
+            },
+            tool_call_id=f"controller:{machine.current_attempt_id}:green_report",
+            predecessor_contract_id=getattr(self, "_last_invocation_contract_id", None),
+        )
+        call = ToolCall(
+            name=tool,
+            raw_params=dict(params),
+            raw_action_text=self._GREEN_REPORT_ACTION_TEXT,
+            source_step_index=getattr(self, "current_iteration", 0),
+            model_used="harness",
+            action_intent=intent,
+        )
+        self._green_report_counter = int(getattr(self, "_green_report_counter", 0)) + 1
+        call_id = f"harness-report-{self._green_report_counter}"
+        # The ACTION step goes first: the envelope keys off the newest ACTION
+        # identity, exactly as for a model-issued call.
+        step = ReActStep(
+            step_type=StepType.ACTION,
+            content=self._GREEN_REPORT_ACTION_TEXT,
+            tool_name=tool,
+            tool_params=dict(params),
+            timestamp=self._get_timestamp(),
+            model_used="harness",
+            tool_call_id=call_id,
+            native_text=self._GREEN_REPORT_NATIVE_TEXT,
+        )
+        self.steps.append(step)
+        previous_call_id = getattr(self, "_active_native_tool_call_id", None)
+        self._active_native_tool_call_id = call_id
+        try:
+            execution = self._execute_tool_call(call)
+            if not execution.attempted_execution:
+                raise RuntimeError(
+                    "the report call was refused before dispatch: "
+                    f"{execution.result.error or execution.result.error_code}"
+                )
+            result, execution_id, actual_executions = self._record_execution_bundle(
+                execution, call
+            )
+            step.tool_result = result
+            control_params = dict(execution.validated_params or call.validated_params or params)
+            envelope_id = str(execution.metadata.get("control_envelope_id") or "") or None
+            if envelope_id is None:
+                envelope_id = self._emit_control_action_envelope(
+                    tool, control_params, intent=call.action_intent
+                )
+            step.control_envelope_id = envelope_id
+            step.control_execution_id = execution_id
+            self._emit_control_tool_result(
+                envelope_id=envelope_id,
+                execution_id=execution_id,
+                tool=tool,
+                params=control_params,
+                result=result,
+                actual_executions=actual_executions,
+            )
+        finally:
+            self._active_native_tool_call_id = previous_call_id
+        self._observe_action_intent_progress(execution)
+        observation_step = self._append_native_observation(
+            call_id,
+            execution.observation_text,
+            source_tool=tool,
+        )
+        self._apply_tool_execution_loop_effects(execution)
+        self._persist_action_to_branch_history(
+            branch_task_id,
+            tool_name=tool,
+            tool_params=dict(params),
+            result=result,
+            observation_text=execution.observation_text,
+        )
+        self._seal_turn_record(
+            actor="controller",
+            t0=turn_started,
+            t1=self._turn_stamp(),
+            envelope_ref=envelope_id,
+            observation_ref=self._delivered_observation_ref(observation_step),
+            iteration=getattr(self, "current_iteration", None),
+            tool=tool,
+        )
 
     def _deliver_runtime_handoff(self) -> None:
         if not getattr(self.config, "export_runtime_handoff", False):
