@@ -873,3 +873,263 @@ def test_the_full_tier_resolves_the_whole_window_and_declares_the_cut(tmp_path):
     assert [(w.code, w.detail.split(" ", 1)[0]) for w in snapshot.warnings] == [
         ("ref_out_of_store", "window_truncated:953")
     ]
+
+
+# ---- what a phase close said, whole --------------------------------------
+
+#: The archived commons-cli run the reader's report is rendered from. Its five
+#: gate decisions state key results of 366 to 893 characters, which is the whole
+#: reason the readers below exist: the trajectory carries them cut at 400.
+REPORT_FIXTURE = Path(__file__).parent / "fixtures" / "report_document" / "commons-cli"
+
+
+def _ledger_event(sequence: int, kind: str, payload: dict) -> str:
+    return json.dumps(
+        {
+            "event_id": f"control-{sequence:06d}",
+            "kind": kind,
+            "payload": payload,
+            "sequence": sequence,
+            "source": None,
+            "timestamp": f"2026-10-15T10:00:{sequence:02d}.000000Z",
+        }
+    )
+
+
+def _gate_payload(decision_id: str, **fields) -> dict:
+    payload = {
+        "phase": "build",
+        "signal": "done",
+        "claimed_outcome": "success",
+        "expected_outcome": "success",
+        "expected_accepted": True,
+        "decision_id": decision_id,
+        "code": "build_green",
+        "reason": "the gate's own reading",
+        "key_results": "",
+        "phase_claim": {"reason": "", "key_results": ""},
+    }
+    payload.update(fields)
+    return payload
+
+
+def test_gate_decisions_are_read_whole_and_keyed_by_their_id():
+    """The trajectory cuts key results at 400 characters; the ledger does not."""
+    from sag.trajectory.builder import read_gate_decisions
+
+    decisions = read_gate_decisions(REPORT_FIXTURE)
+
+    assert len(decisions) == 5
+    analyze = decisions["gate-db798ee51c334cd8caecd5686dbbe2e7"]
+    assert analyze["phase"] == "analyze"
+    assert analyze["signal"] == "done"
+    assert analyze["claimed_outcome"] == "success"
+    assert analyze["expected_outcome"] == "success"
+    assert analyze["code"] == "analysis_green"
+    assert analyze["reason"] == "project analysis validator returned no conclusion"
+    assert len(analyze["key_results"]) == 893
+    assert analyze["key_results"].endswith("whether any plugin goals fail in this environment.")
+    # The archived run's turn records name no gate, so no record states who
+    # carried one; the reader says nothing rather than guessing.
+    assert analyze["actor"] is None
+    clipped = build_trajectory(REPORT_FIXTURE).phases[1].key_results
+    assert clipped is not None and len(clipped) == 400 and clipped != analyze["key_results"]
+
+
+def test_a_gate_is_carried_by_the_turn_record_that_states_it(tmp_path):
+    """An engine close is the harness's own turn, and its record says so."""
+    from sag.trajectory.builder import read_gate_decisions
+
+    events = [
+        _ledger_event(1, "gate_decision", _gate_payload("gate-model")),
+        _ledger_event(
+            2, "turn_record", {"turn_id": 1, "actor": "model", "gate_decision_id": "gate-model"}
+        ),
+        _ledger_event(
+            3,
+            "gate_decision",
+            _gate_payload(
+                "gate-harness",
+                phase="report",
+                code="report_present",
+                key_results="The report was written from the run's record.",
+            ),
+        ),
+        _ledger_event(
+            4,
+            "turn_record",
+            {"turn_id": 2, "actor": "controller", "gate_decision_id": "gate-harness"},
+        ),
+    ]
+    session_dir = _session(tmp_path, events="\n".join(events) + "\n")
+
+    decisions = read_gate_decisions(session_dir)
+
+    assert decisions["gate-model"]["actor"] == "model"
+    assert decisions["gate-harness"]["actor"] == "controller"
+    assert (
+        decisions["gate-harness"]["key_results"] == "The report was written from the run's record."
+    )
+
+
+def test_a_blocked_close_keeps_the_reason_the_agent_gave(tmp_path):
+    """The gate's `reason` is its own reading; the agent's is on the claim."""
+    from sag.trajectory.builder import read_gate_decisions
+
+    payload = _gate_payload(
+        "gate-blocked",
+        signal="blocked",
+        claimed_outcome="failed",
+        expected_outcome="failed",
+        reason="the build validator saw no compiled classes",
+        phase_claim={"reason": "the artifact repository refused our credentials"},
+    )
+    session_dir = _session(tmp_path, events=_ledger_event(1, "gate_decision", payload) + "\n")
+
+    decision = read_gate_decisions(session_dir)["gate-blocked"]
+
+    assert decision["signal"] == "blocked"
+    assert decision["reason"] == "the build validator saw no compiled classes"
+    assert decision["claim_reason"] == "the artifact repository refused our credentials"
+
+
+def test_a_revised_gate_keeps_what_the_close_said_under_its_new_word(tmp_path):
+    """A revision replaces the word, not the paragraph the phase reported."""
+    from sag.trajectory.builder import read_gate_decisions
+
+    events = [
+        _ledger_event(
+            1, "gate_decision", _gate_payload("gate-first", key_results="Built 3 of 4 modules.")
+        ),
+        _ledger_event(
+            2, "turn_record", {"turn_id": 1, "actor": "model", "gate_decision_id": "gate-first"}
+        ),
+        _ledger_event(
+            3,
+            "gate_outcome_revised",
+            {
+                "phase": "build",
+                "delivered_decision_id": "gate-first",
+                "revised_decision_id": "gate-second",
+                "delivered_outcome": "success",
+                "revised_outcome": "partial",
+                "delivered_accepted": True,
+                "revised_accepted": True,
+                "reason": "one module produced no classes",
+                "code": "build_partial",
+            },
+        ),
+    ]
+    session_dir = _session(tmp_path, events="\n".join(events) + "\n")
+
+    revised = read_gate_decisions(session_dir)["gate-second"]
+
+    assert revised["expected_outcome"] == "partial"
+    assert revised["claimed_outcome"] == "success"
+    assert revised["key_results"] == "Built 3 of 4 modules."
+    assert revised["reason"] == "one module produced no classes"
+    assert revised["code"] == "build_partial"
+    assert revised["actor"] == "model"
+
+
+def test_phase_notes_are_the_agents_own_and_name_their_phase(tmp_path):
+    """A refused note was never recorded, and the harness writes no notes."""
+    from sag.trajectory.builder import read_phase_notes
+
+    def _note(sequence, envelope_id, params, *, source="model"):
+        return _ledger_event(
+            sequence,
+            "action_envelope",
+            {
+                "envelope_id": envelope_id,
+                "tool": "phase",
+                "intent_source": source,
+                "exact_params": params,
+            },
+        )
+
+    def _answer(sequence, envelope_id, outcome):
+        return _ledger_event(
+            sequence,
+            "tool_result",
+            {
+                "envelope_id": envelope_id,
+                "tool": "phase",
+                "source_phase": "build",
+                "result": {"operation_outcome": outcome, "facts": {"phase": "build"}},
+            },
+        )
+
+    events = [
+        _note(1, "envelope-1", {"action": "note", "text": "core needs JDK 17; api builds on 11"}),
+        _answer(2, "envelope-1", "success"),
+        _ledger_event(
+            3,
+            "turn_record",
+            {"turn_id": 1, "actor": "model", "envelope_ref": "envelope-1", "phase": "build"},
+        ),
+        _note(4, "envelope-4", {"action": "note", "text": "refused", "outcome": "success"}),
+        _answer(5, "envelope-4", "failed"),
+        _note(
+            6,
+            "envelope-6",
+            {"action": "note", "text": "the harness never says this"},
+            source="controller",
+        ),
+        _note(7, "envelope-7", {"action": "done", "outcome": "success", "key_results": "x"}),
+    ]
+    session_dir = _session(tmp_path, events="\n".join(events) + "\n")
+
+    notes = read_phase_notes(session_dir)
+
+    assert [(note.phase, note.text) for note in notes] == [
+        ("build", "core needs JDK 17; api builds on 11")
+    ]
+    assert notes[0].envelope_id == "envelope-1"
+
+
+def test_report_envelopes_say_who_wrote_them():
+    """The archived run's model wrote one report call, with a summary and no details."""
+    from sag.trajectory.builder import read_report_envelopes
+
+    reports = read_report_envelopes(REPORT_FIXTURE)
+
+    assert len(reports) == 1
+    report = reports[0]
+    assert report["actor"] == "model"
+    assert report["envelope_id"] == "envelope-000110"
+    assert report["summary"].startswith("Setup completed for apache/commons-cli")
+    assert report["details"] is None
+    assert report["status"] == "success"
+
+
+def test_a_report_the_harness_wrote_is_its_own(tmp_path):
+    from sag.trajectory.builder import read_report_envelopes
+
+    envelope = _ledger_event(
+        1,
+        "action_envelope",
+        {
+            "envelope_id": "envelope-1",
+            "tool": "report",
+            "intent_source": "controller",
+            "exact_params": {"action": "generate", "status": "success", "summary": "s"},
+        },
+    )
+    session_dir = _session(tmp_path, events=envelope + "\n")
+
+    assert [report["actor"] for report in read_report_envelopes(session_dir)] == ["controller"]
+
+
+def test_a_session_without_a_ledger_has_no_closes_to_read(tmp_path):
+    from sag.trajectory.builder import (
+        read_gate_decisions,
+        read_phase_notes,
+        read_report_envelopes,
+    )
+
+    session_dir = _session(tmp_path)
+
+    assert read_gate_decisions(session_dir) == {}
+    assert read_phase_notes(session_dir) == []
+    assert read_report_envelopes(session_dir) == []

@@ -174,8 +174,11 @@ def test_the_archived_copy_does_not_overwrite_the_document(monkeypatch, tmp_path
     assert "## The run" in document
     assert "Project Setup Report" not in document
     # The row names the file the reader is holding, not the container's copy.
+    # No row does: the container's path appears only where the agent's own
+    # report-phase close quotes it, which the document prints in its words.
     assert "| **Report** | delivered | setup-report-20260917-183804.md |" in document
-    assert "/workspace/setup-report" not in document
+    rows = [line for line in document.splitlines() if line.startswith("|")]
+    assert not [row for row in rows if "/workspace/setup-report" in row]
 
 
 def test_the_document_says_what_was_provisioned():
@@ -390,6 +393,10 @@ def test_the_document_is_written_in_plain_english():
     # A raw reason code quoted in brackets is the handle a reader searches
     # for, and is exempt; the prose around it is not.
     prose = re.sub(r"\([A-Za-z0-9_]+\)", "", document)
+    # So is a Maven version such as `1.12.0-SNAPSHOT`: the project's own name
+    # for its build, quoted whole from what the agent reported. The house word
+    # is a lowercase concept; Maven's qualifier is uppercase and hyphen-bound.
+    prose = re.sub(r"\S*-SNAPSHOT\b\S*", "", prose)
 
     found = [word for word in forbidden if word in prose.lower()]
     assert not found, f"house vocabulary in the reader's report: {found}"
@@ -901,3 +908,477 @@ def test_sag_result_answers_which_model_the_advisor_was():
     card = json.loads(result.output)
     assert card["stats"]["model"] == "gpt-5.4-mini"
     assert card["stats"]["advisor_model"] == "gpt-5.4-mini"
+
+
+# ---- what each phase close said, and what the agent reported --------------
+
+#: How wide a line of the document's own prose may run.
+_PROSE_WIDTH = 160
+
+
+def _ledger_events(directory: Path = FIXTURE) -> list[dict]:
+    import json
+
+    return [
+        json.loads(line)
+        for line in (directory / "control_events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.startswith("{")
+    ]
+
+
+def _closes_in_the_ledger() -> dict[str, str]:
+    """Each phase's key results, whole, read straight from its gate decision."""
+
+    return {
+        event["payload"]["phase"]: event["payload"]["key_results"]
+        for event in _ledger_events()
+        if event["kind"] == "gate_decision"
+    }
+
+
+def _paragraphs(lines: list[str]) -> list[str]:
+    """The document's prose, each wrapped paragraph joined back into one line."""
+
+    found: list[str] = []
+    held: list[str] = []
+    for line in [*lines, ""]:
+        if line.strip() and not line.startswith(("|", "#", "    ")):
+            held.append(line.strip())
+            continue
+        if held:
+            found.append(" ".join(held))
+            held = []
+    return found
+
+
+def _band_text(document: str, band: str) -> list[str]:
+    """The lines of one band of `## The run`, from its label to the next one."""
+
+    lines = document.splitlines()
+    section = lines[lines.index("## The run") :]
+    start = section.index(f"**{band}**")
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(section))
+            if (section[index].startswith("**") and section[index].endswith("**"))
+            or section[index].startswith("## ")
+        ),
+        len(section),
+    )
+    return section[start:end]
+
+
+def test_every_phase_close_is_printed_whole_under_its_own_band():
+    """The table cut each close to its gate's reason; the record holds the rest."""
+
+    document = render_setup_report(FIXTURE)
+    whole = _paragraphs(document.splitlines())
+
+    for phase, key_results in _closes_in_the_ledger().items():
+        said = f"The agent closed this phase as success: {key_results}"
+        assert said in _paragraphs(_band_text(document, phase)), phase
+        assert whole.count(said) == 1, phase
+
+
+def test_the_trajectorys_cut_is_not_what_the_document_prints():
+    """Analyze reported 893 characters; the trajectory keeps the first 400."""
+
+    from sag.trajectory.builder import build_trajectory
+
+    document = render_setup_report(FIXTURE)
+    clipped = build_trajectory(FIXTURE).phases[1].key_results
+    prose = " ".join(_paragraphs(document.splitlines()))
+
+    assert clipped is not None and clipped.endswith("…")
+    assert clipped not in prose
+    assert _closes_in_the_ledger()["analyze"] in prose
+
+
+def test_the_closes_are_wrapped_to_a_readable_width():
+    """Every line of prose fits 160 columns, and none of it can be read as a row."""
+
+    document = render_setup_report(FIXTURE)
+    lines = document.splitlines()
+    run = lines[lines.index("## The run") : lines.index("## Tokens")]
+    prose = [line for line in run if line.strip() and not line.startswith("|")]
+
+    assert prose, run
+    assert all(len(line) <= _PROSE_WIDTH for line in prose), [
+        line for line in prose if len(line) > _PROSE_WIDTH
+    ]
+    # Wrapping happened: the 893-character close cannot fit one line.
+    assert any(line.startswith("The agent closed this phase as success: ") for line in run)
+    assert max(len(line) for line in prose) > _PROSE_WIDTH - 40
+
+
+def test_what_the_agent_reported_follows_the_result():
+    """The report call's own words, which no other section of the document carries."""
+
+    document = render_setup_report(FIXTURE)
+    lines = document.splitlines()
+    summary = next(
+        event["payload"]["exact_params"]["summary"]
+        for event in _ledger_events()
+        if event["kind"] == "action_envelope" and event["payload"].get("tool") == "report"
+    )
+
+    heading = lines.index("## What the agent reported")
+    assert lines.index("## Result") < heading < lines.index("## What was set up")
+    section = lines[heading + 1 : lines.index("## What was set up")]
+    assert _paragraphs(section) == [summary]
+    assert all(len(line) <= _PROSE_WIDTH for line in section)
+
+
+def test_a_report_the_harness_wrote_has_no_agent_section(tmp_path):
+    """When nobody but the harness wrote the report, there is nothing to quote."""
+
+    import json
+
+    session = _session(tmp_path)
+    ledger = session / "control_events.jsonl"
+    rewritten = []
+    # The call and the record that closed its turn, both stated as the
+    # harness's — the shape a report the harness wrote on its own leaves.
+    for line in ledger.read_text(encoding="utf-8").splitlines():
+        if line.startswith("{"):
+            event = json.loads(line)
+            payload = event["payload"]
+            if event["kind"] == "action_envelope" and payload.get("tool") == "report":
+                payload["intent_source"] = "controller"
+                line = json.dumps(event)
+            elif event["kind"] == "turn_record" and payload.get("envelope_ref") == (
+                "envelope-000110"
+            ):
+                payload["actor"] = "controller"
+                line = json.dumps(event)
+        rewritten.append(line)
+    ledger.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+    assert "## What the agent reported" in render_setup_report(FIXTURE)
+    assert "## What the agent reported" not in render_setup_report(session)
+
+
+#: What the synthetic run's agent and harness said, long enough to need wrapping
+#: and holding the two characters a wrapped line must never start with.
+_BLOCKED_REASON = (
+    "The build cannot finish: core resolves org.example:private-parent:4.2 from "
+    "https://repo.example.internal/maven, which answered 401 for every request "
+    "in this container | the settings.xml in the repository names a server id "
+    "with no credentials - a person with access to that repository needs to "
+    "supply them, or the parent has to be published somewhere public, before "
+    "mvn -B verify can get past dependency resolution for the core module and "
+    "the three modules that depend on it."
+)
+_NOTE = "core needs JDK 17 while api still builds on 11; trying core alone first"
+_HARNESS_CLOSE = "The report was written from the run's record."
+_HARNESS_SUMMARY = (
+    "Every phase closed as success and the record carries the result; the harness "
+    "wrote the report without asking the agent for notes."
+)
+
+
+def _event(sequence: int, kind: str, payload: dict) -> str:
+    import json
+
+    return json.dumps(
+        {
+            "event_id": f"control-{sequence:06d}",
+            "kind": kind,
+            "payload": payload,
+            "run_id": "synthetic",
+            "sequence": sequence,
+            "source": None,
+            "timestamp": f"2026-10-15T10:00:{sequence:02d}.000000Z",
+        }
+    )
+
+
+def _turn(sequence: int, turn_id: int, actor: str, phase: str, **fields) -> str:
+    return _event(
+        sequence,
+        "turn_record",
+        {
+            "turn_id": turn_id,
+            "actor": actor,
+            "phase": phase,
+            "iteration": turn_id,
+            "t0": f"2026-10-15T10:00:{sequence - 1:02d}.000000Z",
+            "t1": f"2026-10-15T10:00:{sequence:02d}.000000Z",
+            **fields,
+        },
+    )
+
+
+def _call(sequence: int, tool: str, params: dict, *, source: str = "model") -> str:
+    return _event(
+        sequence,
+        "action_envelope",
+        {
+            "envelope_id": f"envelope-{sequence:06d}",
+            "tool": tool,
+            "intent_source": source,
+            "exact_params": params,
+        },
+    )
+
+
+def _answer(sequence: int, envelope: int, tool: str, phase: str, outcome: str = "success"):
+    return _event(
+        sequence,
+        "tool_result",
+        {
+            "envelope_id": f"envelope-{envelope:06d}",
+            "tool": tool,
+            "source_phase": phase,
+            "result": {
+                "invocation_status": "completed",
+                "operation_outcome": outcome,
+                "facts": {"phase": phase},
+            },
+        },
+    )
+
+
+def _blocked_run(tmp_path: Path) -> Path:
+    """A run whose build the agent reported blocked, after a note, and whose
+    report the harness wrote and closed on its own."""
+
+    session = _session(tmp_path)
+    events = [
+        _call(1, "bash", {"command": "mvn -B verify", "timeout": 60}),
+        _answer(2, 1, "bash", "build", "failed"),
+        _turn(3, 1, "model", "build", envelope_ref="envelope-000001"),
+        _call(4, "phase", {"action": "note", "text": _NOTE}),
+        _answer(5, 4, "phase", "build"),
+        _turn(6, 2, "model", "build", envelope_ref="envelope-000004"),
+        _call(7, "phase", {"action": "blocked", "outcome": "failed", "reason": _BLOCKED_REASON}),
+        _event(
+            8,
+            "gate_decision",
+            {
+                "phase": "build",
+                "signal": "blocked",
+                "claimed_outcome": "failed",
+                "expected_outcome": "failed",
+                "expected_accepted": True,
+                "decision_id": "gate-blocked",
+                "code": "build_blocked",
+                "reason": "no compiled classes were found",
+                "key_results": "",
+                "phase_claim": {"reason": _BLOCKED_REASON, "key_results": ""},
+            },
+        ),
+        _answer(9, 7, "phase", "build"),
+        _turn(
+            10, 3, "model", "build", envelope_ref="envelope-000007", gate_decision_id="gate-blocked"
+        ),
+        _event(11, "phase_transition", {"expected_kind": "advance", "expected_target": "report"}),
+        _call(
+            12,
+            "report",
+            {
+                "action": "generate",
+                "status": "partial",
+                "summary": _HARNESS_SUMMARY,
+                "details": "build blocked",
+            },
+            source="controller",
+        ),
+        _answer(13, 12, "report", "report"),
+        _turn(14, 4, "controller", "report", envelope_ref="envelope-000012", tool="report"),
+        _event(
+            15,
+            "gate_decision",
+            {
+                "phase": "report",
+                "signal": "done",
+                "claimed_outcome": "success",
+                "expected_outcome": "success",
+                "expected_accepted": True,
+                "decision_id": "gate-report",
+                "code": "report_present",
+                "reason": "report artifact exists",
+                "key_results": _HARNESS_CLOSE,
+                "phase_claim": {"reason": "", "key_results": _HARNESS_CLOSE},
+            },
+        ),
+        _turn(16, 5, "controller", "report", gate_decision_id="gate-report"),
+        _event(17, "phase_transition", {"expected_kind": "flow_close", "expected_target": None}),
+    ]
+    (session / "control_events.jsonl").write_text("\n".join(events) + "\n", encoding="utf-8")
+    return session
+
+
+def test_a_blocked_phase_says_why_in_the_agents_words(tmp_path):
+    """The reason the agent gave, whole — not the gate's reading of the phase."""
+
+    document = render_setup_report(_blocked_run(tmp_path))
+    build = _paragraphs(_band_text(document, "build"))
+
+    assert f"The agent reported this phase blocked (failed): {_BLOCKED_REASON}" in build
+    assert "no compiled classes were found" not in " ".join(build)
+
+
+def test_a_note_the_agent_recorded_is_printed_under_its_phase(tmp_path):
+    document = render_setup_report(_blocked_run(tmp_path))
+
+    assert f"Note from the agent: {_NOTE}" in _paragraphs(_band_text(document, "build"))
+    assert _NOTE not in " ".join(_paragraphs(_band_text(document, "report")))
+
+
+def test_a_close_the_harness_made_is_the_harnesss_own(tmp_path):
+    """The report band says who closed it, so no agent section is needed."""
+
+    document = render_setup_report(_blocked_run(tmp_path))
+
+    assert f"The harness closed this phase: {_HARNESS_CLOSE}" in _paragraphs(
+        _band_text(document, "report")
+    )
+    assert "## What the agent reported" not in document
+    assert _HARNESS_SUMMARY not in document
+
+
+def test_the_synthetic_run_keeps_one_row_per_turn_and_no_row_shaped_prose(tmp_path):
+    document = render_setup_report(_blocked_run(tmp_path))
+    lines = document.splitlines()
+    run = lines[lines.index("## The run") : lines.index("## Tokens")]
+
+    numbered = [
+        line for line in run if line.startswith("| ") and line[2:].split(" ")[0].isdigit()
+    ]
+    assert len(numbered) == 5
+    prose = [line for line in run if line.strip() and not line.startswith("|")]
+    assert all(len(line) <= _PROSE_WIDTH for line in prose)
+    # The reason holds a pipe and a dash; no wrapped line may begin with either.
+    assert not [line for line in prose if line.startswith(("| ", "- ", "|"))]
+
+
+def test_a_wrapped_line_never_begins_a_table_row_or_a_list():
+    """A pipe or a dash at the start of a line is markdown, not the agent's prose."""
+
+    from sag.report_document.render import _wrapped
+
+    words = ["word"] * 31 + ["|", "tee", "build.log", "-", "then", "1.", "more", "#", "words"]
+    for shift in range(40):
+        text = " ".join(["x" * (shift % 9 + 1)] * (shift // 9 + 1) + words * 3)
+        lines = _wrapped(text)
+        assert all(len(line) <= _PROSE_WIDTH for line in lines)
+        assert " ".join(lines) == " ".join(text.split())
+        starts = [line.split(" ", 1)[0] for line in lines]
+        assert not [word for word in starts if word in {"|", "-", "1.", "#"}], lines
+
+
+def test_a_word_too_long_for_a_line_is_cut_rather_than_overflowing():
+    from sag.report_document.render import _wrapped
+
+    lines = _wrapped("see " + "a" * 400 + " for details")
+
+    assert all(len(line) <= _PROSE_WIDTH for line in lines)
+    assert "".join(lines).replace(" ", "") == "see" + "a" * 400 + "fordetails"
+
+
+def test_the_web_tab_reads_a_wrapped_close_as_one_paragraph():
+    """A paragraph wrapped for the file is still one paragraph on the page."""
+
+    from sag.web.session_registry import _report_blocks
+
+    blocks = _report_blocks(render_setup_report(FIXTURE))
+    paragraphs = [block["text"] for block in blocks if block.get("type") == "p"]
+
+    analyze = _closes_in_the_ledger()["analyze"]
+    assert f"The agent closed this phase as success: {analyze}" in paragraphs
+    # The header's two lines are two statements, and stay two.
+    assert any(text.startswith("Repository ") for text in paragraphs)
+    assert any(text.startswith("Run ") for text in paragraphs)
+    # So are the accounting lines, which are a list.
+    assert any(text.startswith("- Evidence records:") for text in paragraphs)
+
+
+def _decision(**fields) -> dict:
+    decision = {
+        "signal": "done",
+        "claimed_outcome": "success",
+        "expected_outcome": "success",
+        "accepted": True,
+        "code": "build_green",
+        "reason": "compiled classes observed",
+        "key_results": "Built all four modules.",
+        "claim_reason": None,
+    }
+    decision.update(fields)
+    return decision
+
+
+def test_a_close_the_gate_did_not_accept_is_not_said_to_have_closed():
+    """The agent's word alone would leave a reader with the wrong outcome."""
+
+    from sag.report_document.render import _close_said
+
+    said = _close_said(
+        _decision(accepted=False, expected_outcome="failed", reason="no classes were found"),
+        "model",
+    )
+
+    assert said == [
+        "The agent asked to close this phase as success: Built all four modules.",
+        "The harness did not accept it (build_green): no classes were found",
+    ]
+
+
+def test_a_close_graded_to_another_word_says_both_words():
+    from sag.report_document.render import _close_said
+
+    said = _close_said(
+        _decision(expected_outcome="partial", code="build_partial", reason="one module failed"),
+        "model",
+    )
+
+    assert said == [
+        "The agent closed this phase as success: Built all four modules.",
+        "The harness recorded this phase as partial (build_partial): one module failed",
+    ]
+
+
+def test_a_close_nobody_is_recorded_as_carrying_credits_nobody():
+    from sag.report_document.render import _close_said
+
+    assert _close_said(_decision(), None) == [
+        "This phase closed as success: Built all four modules."
+    ]
+    assert _close_said(_decision(key_results=None), "controller") == [
+        "The harness closed this phase: compiled classes observed"
+    ]
+
+
+def test_a_note_is_placed_in_the_visit_that_recorded_it():
+    """Two visits to one phase share a name; the call that wrote the note does not."""
+
+    from sag.report_document.render import _the_run
+    from sag.trajectory.builder import PhaseNote
+    from sag.trajectory.schema import CallInfo, GateInfo, PhaseInfo, SessionInfo, Trajectory, Turn
+
+    def _turn(turn_id, tool, gate=None):
+        return Turn(
+            turn_id=turn_id,
+            phase="build",
+            actor="model",
+            call=CallInfo(tool=tool, params_ref=f"envelope-{turn_id}"),
+            gate=GateInfo(word="success", decision_id=gate) if gate else None,
+        )
+
+    document = Trajectory(
+        session=SessionInfo(run_id="twice"),
+        phases=[
+            PhaseInfo(name="build", gates=[GateInfo(word="failed", decision_id="g1")]),
+            PhaseInfo(name="build", gates=[GateInfo(word="success", decision_id="g2")]),
+        ],
+        turns=[_turn(1, "phase", gate="g1"), _turn(2, "phase"), _turn(3, "phase", gate="g2")],
+    )
+    notes = [PhaseNote(phase="build", text="retrying core alone", envelope_id="envelope-2")]
+
+    text = "\n".join(_the_run(document, {}, notes))
+    first, second = text.split("**build**")[1:]
+
+    assert "Note from the agent: retrying core alone" not in first
+    assert "Note from the agent: retrying core alone" in second
