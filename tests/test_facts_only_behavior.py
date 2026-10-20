@@ -640,6 +640,32 @@ def test_kickoff_tasks_carry_no_recommendation_wording():
     assert "build(action=" not in tasks["build"]
 
 
+def test_analyze_objective_names_the_task_lines_as_the_pinned_ci_scope():
+    """The brief already carries the pinned task; re-reading CI files to confirm it is waste.
+
+    In 7 of 8 candidate runs on 2026-10-15 the model read pom.xml, README and the CI
+    workflow once each "for CI scope confirmation" while the brief's Task lines
+    already named the command.
+    """
+    from sag.agent.react_engine import PHASE_OBJECTIVES, kickoff_phase_objectives, phase_objective
+
+    analyze = phase_objective("analyze")
+    assert analyze == PHASE_OBJECTIVES["analyze"]
+    # The analyze brief locates the objective by this first sentence.
+    assert analyze.startswith("The survey facts in the Survey: lines are on record. ")
+    assert "The Task lines are the pinned CI scope." in analyze
+    assert (
+        "Read project documentation and configuration only where the survey leaves a gap "
+        "or disagrees with the pinned task; CI configuration files add nothing when a Task "
+        "line names the command."
+    ) in analyze
+    assert "configuration and CI only where" not in analyze
+    # Acceptance and execution semantics are unchanged.
+    assert "The user task and pinned CI scope remain the acceptance requirements." in analyze
+    assert "neither a plan nor a command name establishes success" in analyze
+    assert kickoff_phase_objectives()["analyze"] == analyze
+
+
 def test_python_objectives_carry_no_recommendation_wording():
     from sag.agent.react_engine import PYTHON_PHASE_OBJECTIVES, phase_objective
 

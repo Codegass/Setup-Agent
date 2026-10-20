@@ -271,12 +271,13 @@ PHASE_OBJECTIVES = {
         "remains an explicit blocker or unknown fact."
     ),
     "analyze": (
-        "The survey facts in the Survey: lines are on record. Read project documentation, "
-        "configuration and CI only where the survey leaves a gap or disagrees with the "
-        "pinned task. Record a short strategy and unresolved prerequisites in key_results. "
-        "A structured execution_plan is optional. The user task and pinned CI scope remain "
-        "the acceptance requirements. Unknown runner semantics may be explored through "
-        "bounded execution; neither a plan nor a command name establishes success."
+        "The survey facts in the Survey: lines are on record. The Task lines are the pinned "
+        "CI scope. Read project documentation and configuration only where the survey leaves "
+        "a gap or disagrees with the pinned task; CI configuration files add nothing when a "
+        "Task line names the command. Record a short strategy and unresolved prerequisites in "
+        "key_results. A structured execution_plan is optional. The user task and pinned CI "
+        "scope remain the acceptance requirements. Unknown runner semantics may be explored "
+        "through bounded execution; neither a plan nor a command name establishes success."
     ),
     "build": (
         "Execute the task's project command with its original lifecycle, profiles and scope. "
