@@ -110,8 +110,10 @@ initial_system:
     - The engine mechanically creates the initial project survey/fact sheet; treat these Harness
       outputs as broad evidence and gap-checking inputs, not a harness-authored project plan or
       execution strategy
-    - In Analyze, inspect the broad document inventory and relevant project-specific
-      documentation, configuration and CI. Record a short strategy and unresolved requirements
+    - In Analyze, the survey facts and the Task lines are already on record. Inspect the document
+      inventory and project documentation or configuration only where the survey leaves a gap or
+      disagrees with the pinned task; CI configuration files add nothing when a Task line names
+      the command. Record a short strategy and unresolved requirements
       in key_results. A structured execution_plan is optional guidance, not permission to execute.
       Invalid plan metadata is advisory and cannot establish a successful build or test.
       Do not spend the execution budget encoding duplicate command fields or document refs.
