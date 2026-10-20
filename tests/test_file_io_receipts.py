@@ -153,3 +153,75 @@ def test_lookalike_paths_are_not_redirected(path):
 
 def test_description_names_the_receipt_redirect():
     assert "returns its compact reading view, not the raw JSON" in FileIOTool(None).description
+
+
+def test_the_shared_helper_returns_the_view_file_io_returns():
+    from sag.agent.receipt_view import resolve_receipt_view
+
+    receipt = minimal_valid_receipt("inv-fileio-4")
+    raw_path = f"{RAW_DIR}/inv-fileio-4.json"
+    files = {f"{VIEW_DIR}/inv-fileio-4.json": view_body(receipt)}
+
+    helped = resolve_receipt_view(FakeContainer(files), raw_path)
+    read = FileIOTool(FakeContainer(files)).safe_execute(action="read", path=raw_path)
+
+    assert helped is not None and helped.succeeded
+    assert helped.output == read.output
+    assert helped.raw_output == read.raw_output
+    for key in ("path", "receipt_redirect", "view_path", "view_source"):
+        assert helped.metadata[key] == read.metadata[key]
+
+
+def test_the_shared_helper_builds_from_the_raw_receipt_and_fails_as_a_read():
+    from sag.agent.receipt_view import resolve_receipt_view
+
+    receipt = minimal_valid_receipt("inv-fileio-5")
+    raw_path = f"{RAW_DIR}/inv-fileio-5.json"
+    body = raw_bytes(receipt)
+
+    built = resolve_receipt_view(FakeContainer({raw_path: body}), raw_path)
+
+    assert built.metadata["view_source"] == "built_from_raw_receipt"
+    assert built.metadata["raw_receipt_bytes"] == len(body.encode())
+    with pytest.raises(ToolError) as missing:
+        resolve_receipt_view(FakeContainer({}), f"{RAW_DIR}/absent.json")
+    assert missing.value.error_code == "READ_FAILED"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/workspace/proj/pom.xml",
+        "/workspace/project/.setup_agent/invocation_receipts/x.json",
+        f"{RAW_DIR}/sub/x.json",
+        f"{VIEW_DIR}/nested/x.json",
+        f"{RAW_DIR}/x.json.bak",
+        f"{RAW_DIR}/notes.txt",
+        "/workspace/.setup_agent/other/x.json",
+    ],
+)
+def test_the_shared_helper_leaves_other_paths_alone(path):
+    from sag.agent.receipt_view import resolve_receipt_view
+
+    container = FakeContainer({})
+    assert resolve_receipt_view(container, path) is None
+    assert container.commands == []
+
+
+def test_file_io_reads_receipts_through_the_shared_helper(monkeypatch):
+    import sag.tools.file_io as file_io
+    from sag.tools.base import ToolResult
+
+    calls = []
+
+    def fake_helper(orchestrator, path):
+        calls.append((orchestrator, path))
+        return ToolResult.completed_success(output="from the helper")
+
+    monkeypatch.setattr(file_io, "resolve_receipt_view", fake_helper)
+    container = FakeContainer({})
+    result = FileIOTool(container).safe_execute(action="read", path=f"{RAW_DIR}/x.json")
+
+    assert result.output == "from the helper"
+    assert calls == [(container, f"{RAW_DIR}/x.json")]
+    assert container.commands == []

@@ -3,6 +3,8 @@
 from copy import deepcopy
 import hashlib
 import json
+import posixpath
+import shlex
 
 from sag.utils.container_io import write_container_text_atomic
 
@@ -127,3 +129,66 @@ def receipt_observation(receipt):
     """Same projection for a settled job and the next phase, without new IO."""
     source_sha256 = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
     return render_receipt_view(build_receipt_view(receipt, source_sha256=source_sha256))
+
+
+def resolve_receipt_view(orchestrator, path):
+    """The reading view for a receipt or view path in the container; None for any other path.
+
+    A raw receipt is ~1 MB of machine-checked JSON. Every tool that can read a
+    container file by path (file_io read, search file:) answers a receipt path
+    with this view, so the raw JSON never reaches the window by another route.
+    """
+    from sag.agent.invocation_receipts import RECEIPT_DIR
+    from sag.runtime.container_io import _execute_untruncated
+    from sag.tools.base import ToolError, ToolResult
+
+    normalized = posixpath.normpath(path)
+    if not normalized.endswith(".json") or posixpath.dirname(normalized) not in (
+        RECEIPT_DIR,
+        VIEW_DIR,
+    ):
+        return None
+
+    def cat(container_path):
+        result = _execute_untruncated(orchestrator, "cat -- " + shlex.quote(container_path))
+        return str(result.get("output") or "") if result.get("success") else None
+
+    receipt_id = posixpath.basename(normalized)[: -len(".json")]
+    view_path = f"{VIEW_DIR}/{receipt_id}.json"
+    metadata = {"path": path, "receipt_redirect": True, "view_path": view_path}
+    text = None
+    body = cat(view_path)
+    if body is not None:
+        try:
+            text = render_receipt_view(json.loads(body), path=view_path)
+            metadata["view_source"] = "receipt_views"
+        except (ValueError, TypeError, KeyError, AttributeError):
+            text = None
+    if text is None:
+        raw_path = f"{RECEIPT_DIR}/{receipt_id}.json"
+        raw = cat(raw_path)
+        try:
+            if raw is None:
+                raise ValueError(f"neither {view_path} nor {raw_path} is readable")
+            payload = raw.encode("utf-8")
+            view = build_receipt_view(
+                json.loads(raw), source_sha256=hashlib.sha256(payload).hexdigest()
+            )
+            text = render_receipt_view(view, path=raw_path)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise ToolError(
+                message=f"Failed to read receipt {receipt_id}: {exc}",
+                category="execution",
+                error_code="READ_FAILED",
+                suggestions=[
+                    "Check the receipt id in the tool result that produced it",
+                    "Use the tool result's full output ref for the command log",
+                ],
+                retryable=True,
+            ) from exc
+        metadata.update(view_source="built_from_raw_receipt", raw_receipt_bytes=len(payload))
+    output = (
+        text + "\nThis path is the verifier's machine-checked receipt; "
+        "its raw JSON is not meant to be read."
+    )
+    return ToolResult.completed_success(output=output, raw_output=output, metadata=metadata)

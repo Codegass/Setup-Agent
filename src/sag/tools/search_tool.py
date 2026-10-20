@@ -10,6 +10,7 @@ import posixpath
 import json
 from typing import Any, Dict, Mapping, Optional
 
+from sag.agent.receipt_view import resolve_receipt_view
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.runtime.container_io import command_did_not_run
 
@@ -60,6 +61,9 @@ class SearchTool(BaseTool):
                 "'file:' greps file CONTENTS (a file, or a directory searched "
                 "recursively): it matches text INSIDE files, so it cannot report "
                 "whether a file exists. "
+                "'file:' on a receipt under /workspace/.setup_agent/invocation_receipts or "
+                "receipt_views returns its compact reading view whole, not the raw JSON; "
+                "pattern is not applied there. "
                 "'name:' matches file and directory NAMES under <dir>, to depth "
                 f"{NAME_SEARCH_MAX_DEPTH}, and never reads file content: this is the "
                 "form that establishes whether a path such as gradlew or pom.xml is "
@@ -99,6 +103,9 @@ class SearchTool(BaseTool):
     ) -> ToolResult:
         target = (target or "").strip()
         if target.startswith("file:"):
+            receipt_view = resolve_receipt_view(self.docker_orchestrator, target[5:])
+            if receipt_view is not None:
+                return self._receipt_view_result(receipt_view, pattern)
             return self._grep_container(target[5:], pattern, max_results, ignore_case=ignore_case,
                                         offset=offset, column_offset=column_offset, max_chars=max_chars)
         if target.startswith("name:"):
@@ -151,6 +158,27 @@ class SearchTool(BaseTool):
                 "Use 'job:<id>' to grep a background job log",
                 "Use 'web:<query>' for a web search",
             ],
+        )
+
+    @staticmethod
+    def _receipt_view_result(result: ToolResult, pattern: str) -> ToolResult:
+        """A receipt path answers with its whole reading view; a pattern is not applied to it.
+
+        Grepping the raw receipt put up to max_chars of evidence JSON into the
+        window (an empty pattern greps `.`, i.e. every line). The view is small,
+        so it is returned whole and the model is told its pattern was not used.
+        """
+
+        if not pattern:
+            return result
+        output = (
+            result.output + f"\nThe pattern {pattern!r} was not applied: this path is the "
+            "verifier's receipt, so its reading view is returned whole."
+        )
+        return ToolResult.completed_success(
+            output=output,
+            raw_output=output,
+            metadata={**result.metadata, "pattern_applied": False},
         )
 
     def _poll_job(self, job_id: str) -> ToolResult:
