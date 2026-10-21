@@ -49,6 +49,8 @@ from sag.testcases.compileall_metrics import (
     parse_compileall_metrics,
 )
 
+from sag.runtime.project_user import configured_project_user, project_user_kwargs
+
 from ..base import BaseTool, ToolResult
 
 # The native allowlists are the FACADE's module data (spec §C8). They are
@@ -1024,8 +1026,9 @@ class PythonTool(BaseTool):
                 if package not in packages:
                     packages.append(package)
         install_command = _APT_INSTALL.format(packages=" ".join(packages))
-        self._run(_APT_REFRESH, working_directory, timeout)
-        installed = self._run(install_command, working_directory, timeout)
+        # System packages are harness work: they stay root.
+        self._run(_APT_REFRESH, working_directory, timeout, as_project_user=False)
+        installed = self._run(install_command, working_directory, timeout, as_project_user=False)
         commands.append(install_command)
         preamble.append(
             f"[native] resolved {', '.join(features)} to {', '.join(packages)}"
@@ -1974,7 +1977,8 @@ class PythonTool(BaseTool):
         # pytest is absent. Install only the explicitly missing module, and
         # verify both the installer exit and the resulting import before tests.
         probe_command = f"{python} -m pytest --version"
-        probe = self.orchestrator.execute_command(probe_command) or {}
+        as_user = project_user_kwargs(self.orchestrator)
+        probe = self.orchestrator.execute_command(probe_command, **as_user) or {}
         bootstrap_failure = None
         if not probe.get("success") or probe.get("exit_code") != 0:
             missing_pytest = probe.get("exit_code") == 1 and re.search(
@@ -1993,7 +1997,7 @@ class PythonTool(BaseTool):
                 if installed.get("exit_code") != 0 or self._effective_install_failure(installed):
                     bootstrap_failure = ("install", install_command, installed)
                 else:
-                    verified = self.orchestrator.execute_command(probe_command) or {}
+                    verified = self.orchestrator.execute_command(probe_command, **as_user) or {}
                     if not verified.get("success") or verified.get("exit_code") != 0:
                         bootstrap_failure = ("verify", probe_command, verified)
                     else:
@@ -2114,7 +2118,7 @@ class PythonTool(BaseTool):
         self._test_attempt_counter += 1
         attempt_id = self._test_attempt_counter
         report = f"{PYTEST_REPORT_DIR}/pytest-attempt-{attempt_id:06d}.xml"
-        self.orchestrator.execute_command(f"mkdir -p {PYTEST_REPORT_DIR}")
+        self._ensure_pytest_report_dir()
         command = f"{python} -m pytest"
         if pytest_args:
             command += f" {pytest_args}"
@@ -3107,14 +3111,19 @@ class PythonTool(BaseTool):
         producer_role: Optional[str] = None,
         mechanical: bool = False,
         monitor_floor: int = 600,
+        as_project_user: bool = True,
     ) -> Dict[str, Any]:
         """One container command; monitored path when the orchestrator has it
         (installs and test runs are long), plain execute_command otherwise.
 
         `env_overlay` is prepended as a shell assignment prefix rather than
         exported: it applies to THIS command and cannot leak into the next one.
+        Every command here is the project's own (venv, pip, pytest, build) and
+        runs as the project user when one is configured, except system package
+        installs, which pass ``as_project_user=False``.
         """
         command = self._with_env(command, env_overlay)
+        as_user = project_user_kwargs(self.orchestrator) if as_project_user else {}
         trace = _ACTIVE_PRODUCER_TRACE.get()
         if trace is not None and not producer_role:
             raise RuntimeError(
@@ -3127,15 +3136,28 @@ class PythonTool(BaseTool):
                 silent_timeout=max(timeout, monitor_floor),
                 absolute_timeout=max(timeout, monitor_floor),
                 optimize_for_maven=False,
+                **as_user,
             )
         else:
-            result = self.orchestrator.execute_command(command, workdir=workdir)
+            result = self.orchestrator.execute_command(command, workdir=workdir, **as_user)
         normalized = dict(result or {})
         if trace is not None:
             trace.record(str(producer_role), mechanical, command, normalized)
             if normalized.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
                 raise _ProducerDetached(command, normalized)
         return normalized
+
+    def _ensure_pytest_report_dir(self) -> None:
+        """Create the JUnit report directory before pytest writes into it.
+
+        Its parent belongs to the harness, so root creates it either way; with
+        a project user it is created owned by that user, who runs pytest.
+        """
+        user = configured_project_user(self.orchestrator)
+        if user:
+            self.orchestrator.execute_command(f"install -d -o {user} {PYTEST_REPORT_DIR}")
+        else:
+            self.orchestrator.execute_command(f"mkdir -p {PYTEST_REPORT_DIR}")
 
     def _venv_exists(self, venv: str) -> bool:
         probe = self.orchestrator.execute_command(

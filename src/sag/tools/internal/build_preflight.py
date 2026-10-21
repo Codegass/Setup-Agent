@@ -36,6 +36,7 @@ from sag.agent.evidence_records import (
 )
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.runtime.paths import BUILD_REQUIREMENTS_PATH
+from sag.runtime.project_user import project_user_kwargs
 from sag.tools.internal.java_versions import (
     java_constraint_matches,
     java_major,
@@ -2009,24 +2010,32 @@ class PythonPreflight:
             return "apt"
         return None
 
+    # uv, its interpreters and the venv live in the project user's home and
+    # checkout when one is configured, so the project's own pip and pytest can
+    # use them. Only apt stays root.
+
     def _uv_available(self) -> bool:
-        probe = self.orchestrator.execute_command(f"{_UV_PATH}; command -v uv")
+        as_user = project_user_kwargs(self.orchestrator)
+        probe = self.orchestrator.execute_command(f"{_UV_PATH}; command -v uv", **as_user)
         if probe.get("success"):
             return True
-        install = self.orchestrator.execute_command(_UV_INSTALL)
+        install = self.orchestrator.execute_command(_UV_INSTALL, **as_user)
         if not install.get("success"):
             return False
-        probe = self.orchestrator.execute_command(f"{_UV_PATH}; command -v uv")
+        probe = self.orchestrator.execute_command(f"{_UV_PATH}; command -v uv", **as_user)
         return bool(probe.get("success"))
 
     def _uv_provision(self, version: str, venv: str) -> bool:
-        install = self.orchestrator.execute_command(f"{_UV_PATH}; uv python install {version}")
+        as_user = project_user_kwargs(self.orchestrator)
+        install = self.orchestrator.execute_command(
+            f"{_UV_PATH}; uv python install {version}", **as_user
+        )
         if not install.get("success"):
             return False
         # --seed: a plain `uv venv` ships NO pip inside the venv (bug #12),
         # which broke every `{venv}/bin/python -m pip ...` rung downstream.
         made = self.orchestrator.execute_command(
-            f"{_UV_PATH}; uv venv --seed --python {version} {venv}"
+            f"{_UV_PATH}; uv venv --seed --python {version} {venv}", **as_user
         )
         return bool(made.get("success"))
 
@@ -2059,7 +2068,9 @@ class PythonPreflight:
         )
         if not apt.get("success"):
             return False
-        made = self.orchestrator.execute_command(f"python{version} -m venv {venv}")
+        made = self.orchestrator.execute_command(
+            f"python{version} -m venv {venv}", **project_user_kwargs(self.orchestrator)
+        )
         return bool(made.get("success"))
 
 

@@ -6,6 +6,8 @@ import re
 import shlex
 from typing import Any, Dict, List, Optional
 
+from sag.runtime.project_user import project_user_kwargs
+
 try:
     import tomllib  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
@@ -325,9 +327,12 @@ def ensure_venv_pip(
     most once, in order."""
 
     ladder: List[str] = []
+    # The venv belongs to the project: every rung that touches it runs as the
+    # project user when one is configured. Only apt stays root.
+    as_user = project_user_kwargs(orchestrator)
 
     def pip_ok() -> bool:
-        probe = orchestrator.execute_command(f"{venv}/bin/python -m pip --version")
+        probe = orchestrator.execute_command(f"{venv}/bin/python -m pip --version", **as_user)
         return bool(probe.get("success"))
 
     # Rung 1: probe. A healthy venv issues zero repair commands.
@@ -337,7 +342,7 @@ def ensure_venv_pip(
     # Rung 2: ensurepip (fails outright when Debian split the module out —
     # 'No module named ensurepip').
     ladder.append("ensurepip")
-    orchestrator.execute_command(f"{venv}/bin/python -m ensurepip --upgrade")
+    orchestrator.execute_command(f"{venv}/bin/python -m ensurepip --upgrade", **as_user)
     if pip_ok():
         return {"ok": True, "action": "ensurepip", "ladder": ladder}
 
@@ -345,7 +350,7 @@ def ensure_venv_pip(
     # ensurepip-less system python, the fresh venv is pip-less again (the TVM
     # trap the old ladder dead-ended on).
     ladder.append("recreate (current interpreter, python3 -m venv --clear)")
-    orchestrator.execute_command(f"python3 -m venv --clear {venv}")
+    orchestrator.execute_command(f"python3 -m venv --clear {venv}", **as_user)
     if pip_ok():
         return {"ok": True, "action": "recreated", "ladder": ladder}
 
@@ -366,15 +371,17 @@ def ensure_venv_pip(
         f"python3-venv python3-pip{versioned}"
     )
     if apt.get("success"):
-        orchestrator.execute_command(f"python3 -m venv --clear {venv}")
+        orchestrator.execute_command(f"python3 -m venv --clear {venv}", **as_user)
         if pip_ok():
             return {"ok": True, "action": "apt-venv", "ladder": ladder}
 
     # Rung 5: install uv, then a seeded venv (ships pip inside — bug #12).
     ladder.append("install uv then uv venv --seed")
-    orchestrator.execute_command(f"{_LOCAL_BIN_PATH}; {_UV_INSTALL}")
+    orchestrator.execute_command(f"{_LOCAL_BIN_PATH}; {_UV_INSTALL}", **as_user)
     python_arg = f" --python {python_version}" if python_version else ""
-    orchestrator.execute_command(f"{_LOCAL_BIN_PATH}; uv venv --seed{python_arg} {venv}")
+    orchestrator.execute_command(
+        f"{_LOCAL_BIN_PATH}; uv venv --seed{python_arg} {venv}", **as_user
+    )
     if pip_ok():
         return {"ok": True, "action": "uv", "ladder": ladder}
 
