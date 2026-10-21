@@ -635,6 +635,76 @@ def test_a_command_that_publishes_is_not_eligible(tmp_path):
     assert "publishing_goal" in eligibility(tmp_path, task, project)["reasons"]
 
 
+def frozen_synthetic_definition(tmp_path, *, runtime=RUNTIME_21, image=None):
+    """select -> prepare -> (simulated container) -> build for the miniature dataset."""
+    dataset, twenty, out = tmp_path / "dataset", tmp_path / "twenty", tmp_path / "out"
+    synthetic_dataset(dataset)
+    twenty.mkdir()
+    freeze.select(dataset, twenty, out, projects=["commons-pool"])
+    freeze.prepare(out / "selection.json", out, ["commons-pool"], dataset, batch_label="t")
+    plan = json.loads((out / "preparation/plan-t-java21.json").read_text())["projects"][0]
+    simulate_container(out / "preparation", plan, runtime=runtime)
+    freeze.metadata_status(out / "preparation", plan, script_name="prepare-t-java21.sh",
+                           image=image or {"name": "eclipse-temurin:21-jdk", "id": "sha256:" + "0" * 64})
+    built = freeze.build(out, ["commons-pool"], repo_root=tmp_path, observer=OBSERVER)
+    assert built["commons-pool"]["status"] == "built", built
+    return out, out / "definitions/commons-pool"
+
+
+def test_select_can_be_restricted_to_a_decided_project_list(tmp_path):
+    dataset, twenty = tmp_path / "dataset", tmp_path / "twenty"
+    task, project = synthetic_dataset(dataset)
+    twenty.mkdir()
+    data = json.loads((dataset / "dataset.json").read_text())
+    other = {**task, "repo": "apache/commons-other", "task_id": "c" * 20}
+    data["reference_tasks"].append(other)
+    data["projects"].append({"repo": other["repo"], "canonical_task_id": other["task_id"]})
+    (dataset / "dataset.json").write_text(json.dumps(data))
+    selection = freeze.select(dataset, twenty, tmp_path / "out", projects=["commons-pool"])
+    rows = {r["project_id"]: r for r in selection["projects"]}
+    assert rows["commons-pool"]["eligible"] is True
+    assert "not_in_requested_set" in rows["commons-other"]["reasons"]
+    assert selection["criteria"]["requested_projects"] == ["commons-pool"]
+    assert json.loads((tmp_path / "out/selection.json").read_text())["counts"]["eligible"] == 1
+    with pytest.raises(ValueError, match="not candidates"):
+        freeze.select(dataset, twenty, tmp_path / "out2", projects=["commons-pool", "no-such-project"])
+
+
+def test_image_resolution_prefers_the_jdk_tag_then_alternatives_then_a_newer_lts():
+    def available(*tags):
+        return lambda tag: tag in tags
+    assert freeze.resolve_image(23, available("eclipse-temurin:23-jdk")) == {
+        "java_major": 23, "requested": "eclipse-temurin:23-jdk", "used": "eclipse-temurin:23-jdk",
+        "substitute": False, "tried": ["eclipse-temurin:23-jdk"]}
+    fallback = freeze.resolve_image(23, available("eclipse-temurin:23-jdk-noble"))
+    assert (fallback["used"], fallback["substitute"]) == ("eclipse-temurin:23-jdk-noble", False)
+    assert fallback["tried"][:2] == ["eclipse-temurin:23-jdk", "eclipse-temurin:23"]
+    newer = freeze.resolve_image(23, available("eclipse-temurin:25-jdk"))
+    assert (newer["used"], newer["substitute"], newer["used_java_major"]) == ("eclipse-temurin:25-jdk", True, 25)
+    assert "23" in newer["reason"] and "25" in newer["reason"]
+    assert freeze.resolve_image(26, available())["used"] is None
+
+
+RUNTIME_25 = RUNTIME_21.replace("Java version: 21.0.8", "Java version: 25.0.4")
+
+
+def test_a_substitute_jdk_capture_is_flagged_and_never_counts_as_captured(tmp_path):
+    image = {"name": "eclipse-temurin:25-jdk", "id": "sha256:" + "1" * 64, "substitute": True,
+             "requested": "eclipse-temurin:21-jdk", "used_java_major": 25,
+             "reason": "No eclipse-temurin image for Java 21; nearest newer LTS 25 used."}
+    out, definition = frozen_synthetic_definition(tmp_path, runtime=RUNTIME_25, image=image)
+    status = json.loads((out / "preparation/commons-pool/metadata-status.json").read_text())
+    assert status["steps"][0]["status"] == "captured_with_substitute_jdk"
+    assert status["status"] == "incomplete_metadata"
+    spec = json.loads((definition / "requirements.json").read_text())
+    assert spec["metadata_preparation"]["status"] == "partial_or_unavailable"
+    record = json.loads((definition / "freeze.json").read_text())
+    assert record["metadata_capture"]["image_substitute"] == {
+        "requested": "eclipse-temurin:21-jdk", "used": "eclipse-temurin:25-jdk", "used_java_major": 25,
+        "reason": image["reason"]}
+    assert [(r["project"], r["result"]) for r in freeze.verify(out, observer=OBSERVER)] == [("commons-pool", "ok")]
+
+
 # ------------------------------------------------------ harness and CLI
 
 def test_harness_admits_review_required_only_with_the_flag():
@@ -672,6 +742,42 @@ def test_sag_cli_admits_review_required_only_when_the_harness_sets_the_switch(tm
     if accepted:
         assert result.exit_code == 0, result.output
         assert len(RecordingSetupAgent.calls) == 1
+    else:
+        assert result.exit_code != 0
+        assert "annotation still needs review" in result.output
+        assert RecordingSetupAgent.calls == []
+
+
+@pytest.mark.parametrize("allowed", [True, False])
+def test_sag_cli_accepts_a_frozen_definition_only_with_the_switch(tmp_path, monkeypatch, allowed):
+    from click.testing import CliRunner
+
+    import sag.main as main_module
+    import test_cli_project_exit_codes as fakes
+    from test_requirements_protocol_surfaces import RecordingSetupAgent, forbid_container_work
+
+    _out, definition = frozen_synthetic_definition(tmp_path)
+    task = json.loads((definition / "task.json").read_text())
+    if allowed:
+        monkeypatch.setenv("SAG_BENCHMARK_ALLOW_REVIEW_REQUIRED", "1")
+    else:
+        monkeypatch.delenv("SAG_BENCHMARK_ALLOW_REVIEW_REQUIRED", raising=False)
+        forbid_container_work(monkeypatch)
+    RecordingSetupAgent.calls = []
+    fakes.reset_config_state(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_module, "DockerOrchestrator", fakes.FakeProjectOrchestrator)
+    monkeypatch.setattr(main_module, "SetupAgent", RecordingSetupAgent)
+    result = CliRunner().invoke(main_module.cli, [
+        "project", "https://github.com/" + task["repo"] + ".git", "--ref", task["sha"],
+        "--acceptance-task-file", str(definition / "task.json"),
+        "--ci-target-file", str(definition / "ci-target.json"),
+        "--requirements-file", str(definition / "requirements.json")])
+    if allowed:
+        assert result.exit_code == 0, result.output
+        call = RecordingSetupAgent.calls[0]
+        assert Path(call["requirements_source_root"]).resolve() == definition.resolve()
+        assert call["requirements_definition"]["annotation_completeness"]["status"] == "review_required"
     else:
         assert result.exit_code != 0
         assert "annotation still needs review" in result.output

@@ -528,8 +528,17 @@ def metadata_status(preparation, plan, *, script_name, image):
                   "commands": [command(f"{step['id']}:{c['goal']}", c["argv"], c["cwd"], c["log"], COMMAND_TIMEOUT)
                                for c in step["commands"]]}
         outputs = {c["goal"]: ref(c["output"]) for c in step["commands"]}
+        substitute = bool((image or {}).get("substitute"))
+        succeeded = (probe["status"] == "completed" and probe["exit_code"] == 0 and probe["log"] is not None
+                     and all(c["status"] == "completed" and c["exit_code"] == 0 and c["log"] is not None
+                             for c in result["commands"])
+                     and all(value is not None for value in outputs.values()))
         if not source_ok:
             result["status"] = "source_unavailable"
+        elif substitute and succeeded and result["observed_java_major"] == image.get("used_java_major"):
+            # Recorded for a reviewer, never imported as this task's capture.
+            result["status"] = "captured_with_substitute_jdk"
+            result["substitute_outputs"] = outputs
         elif (probe["status"] != "completed" or probe["exit_code"] != 0 or probe["log"] is None
               or result["observed_java_major"] != step["java_major"] or result["observed_maven_version"] is None
               or step["maven_version"] and result["observed_maven_version"] != step["maven_version"]):
@@ -780,7 +789,8 @@ def twenty_repositories(twenty):
     return repos
 
 
-def select(dataset_root, twenty, out, *, allow_two_steps=False, max_java_lines=None, max_modules=None):
+def select(dataset_root, twenty, out, *, allow_two_steps=False, max_java_lines=None, max_modules=None,
+           projects=None):
     dataset_root, out = Path(dataset_root), Path(out)
     dataset_path = dataset_root / "dataset.json"
     dataset = json.loads(dataset_path.read_text())
@@ -794,6 +804,14 @@ def select(dataset_root, twenty, out, *, allow_two_steps=False, max_java_lines=N
         rows.append(candidate(task, project, dataset_root=dataset_root, twenty_repos=repos,
                               allow_two_steps=allow_two_steps, max_java_lines=max_java_lines,
                               max_modules=max_modules))
+    if projects:
+        unknown = sorted(set(projects) - {row["project_id"] for row in rows})
+        if unknown:
+            raise ValueError("Requested projects are not candidates: " + ", ".join(unknown))
+        for row in rows:
+            if row["project_id"] not in projects:
+                row["reasons"].append("not_in_requested_set")
+                row["eligible"] = False
     seen = {}
     for row in rows:
         seen.setdefault(row["project_id"], []).append(row)
@@ -814,7 +832,8 @@ def select(dataset_root, twenty, out, *, allow_two_steps=False, max_java_lines=N
                      "max_java_lines": max_java_lines, "max_modules": max_modules,
                      "java_major_range": [JAVA_MIN, JAVA_MAX],
                      "maven_version": "Apache Maven x.y.z lines or maven keys; null when absent",
-                     "excluded": "projects already frozen in the twenty, by repository"},
+                     "excluded": "projects already frozen in the twenty, by repository",
+                     "requested_projects": sorted(projects) if projects else None},
         "tool": tool_identity(),
         "counts": {"candidates": len(rows), "eligible": sum(r["eligible"] for r in rows)},
         "projects": rows,
@@ -947,6 +966,77 @@ def prepare(selection_path, out, projects, dataset_root, *, batch_label="batch")
     return {"projects": names, "batches": {b: [p["project_id"] for p in plans] for b, plans in batches.items()}}
 
 
+# ---------------------------------------------------------------- images
+
+LTS_MAJORS = (8, 11, 17, 21, 25)
+
+
+def image_candidates(major):
+    """The JDK tag, the bare tag, then the Ubuntu-based Temurin variants (the script uses apt)."""
+    return [f"eclipse-temurin:{major}-jdk", f"eclipse-temurin:{major}",
+            *(f"eclipse-temurin:{major}-jdk-{base}" for base in ("noble", "jammy", "focal"))]
+
+
+def resolve_image(major, available):
+    """First available Temurin image for this Java major, else the nearest newer LTS.
+
+    A newer-LTS image is a flagged substitute: its capture never counts as
+    captured for a task pinned to another major.
+    """
+    tried = []
+    for tag in image_candidates(major):
+        tried.append(tag)
+        if available(tag):
+            return {"java_major": major, "requested": f"eclipse-temurin:{major}-jdk", "used": tag,
+                    "substitute": False, "tried": tried}
+    for lts in (m for m in LTS_MAJORS if m > major):
+        for tag in image_candidates(lts):
+            tried.append(tag)
+            if available(tag):
+                return {"java_major": major, "requested": f"eclipse-temurin:{major}-jdk", "used": tag,
+                        "substitute": True, "used_java_major": lts, "tried": tried,
+                        "reason": f"No eclipse-temurin image for Java {major}; the nearest newer LTS, Java {lts}, "
+                                  f"was used. Its capture is recorded but is not a capture for a Java {major} task."}
+    return {"java_major": major, "requested": f"eclipse-temurin:{major}-jdk", "used": None, "substitute": False,
+            "tried": tried, "reason": f"No eclipse-temurin image for Java {major} or any newer LTS."}
+
+
+def images(out, batches=None, *, log=print):
+    """Pull one image per JDK major in the prepared batches; record the choice and any gap."""
+    preparation = Path(out) / "preparation"
+    resolution_path = preparation / "image-resolution.json"
+    resolution = json.loads(resolution_path.read_text()) if resolution_path.exists() else {}
+    for plan_path in sorted(preparation.glob("plan-*.json")):
+        batch = json.loads(plan_path.read_text())
+        if batches and batch["batch"] not in batches:
+            continue
+        major = str(batch["java_major"])
+        if major in resolution and resolution[major].get("used"):
+            continue
+
+        def available(tag):
+            pulled = docker(["pull", "--platform", batch["platform"], tag], timeout=1800, log=log)
+            return pulled.returncode == 0
+        choice = resolve_image(int(major), available)
+        if choice["used"]:
+            info = json.loads(docker(["image", "inspect", choice["used"]], log=log).stdout)[0]
+            choice.update(id=info["Id"], repo_digests=info.get("RepoDigests", []),
+                          architecture=info.get("Architecture"), os=info.get("Os"), pulled_at=now())
+        resolution[major] = choice
+        log(f"Java {major}: {choice['used'] or 'no image'}" + (" (substitute)" if choice["substitute"] else ""))
+        write_json(resolution_path, resolution)
+    notes = [f"Java {k}: {v['used']} ({v['id'][:19] if v.get('id') else 'no id'})"
+             + (f" SUBSTITUTE: {v['reason']}" if v["substitute"] or not v["used"] else "")
+             for k, v in sorted(resolution.items(), key=lambda kv: int(kv[0]))]
+    gaps = [v for v in resolution.values() if v["substitute"] or not v["used"]]
+    (preparation / "image-notes.txt").write_text(
+        "Metadata capture images, one per Java major (linux/amd64).\n"
+        + ("No image gaps: every major has its own eclipse-temurin JDK image.\n" if not gaps
+           else f"{len(gaps)} major(s) without their own image; see SUBSTITUTE lines.\n")
+        + "\n".join(notes) + "\n")
+    return resolution
+
+
 # --------------------------------------------------------------- capture
 
 def docker(argv, *, timeout=120, attempts=5, wait=30, log=None):
@@ -972,7 +1062,12 @@ def capture(out, batches=None, *, pull=True, log=print):
         batch = json.loads(plan_path.read_text())
         if batches and batch["batch"] not in batches:
             continue
-        image = batch["image"]
+        resolution_path = preparation / "image-resolution.json"
+        choice = (json.loads(resolution_path.read_text()) if resolution_path.exists() else {}).get(
+            str(batch["java_major"]), {"used": batch["image"], "substitute": False})
+        image = choice["used"]
+        if not image:
+            raise RuntimeError(f"No capture image for Java {batch['java_major']}: {choice.get('reason')}")
         if pull:
             pulled = docker(["pull", "--platform", batch["platform"], image], timeout=1800, log=log)
             if pulled.returncode:
@@ -982,7 +1077,10 @@ def capture(out, batches=None, *, pull=True, log=print):
             raise RuntimeError(f"Image {image} is unavailable: {inspected.stderr.strip()[-500:]}")
         info = json.loads(inspected.stdout)[0]
         image_info = {"name": image, "id": info["Id"], "repo_digests": info.get("RepoDigests", []),
-                      "architecture": info.get("Architecture"), "os": info.get("Os"), "platform": batch["platform"]}
+                      "architecture": info.get("Architecture"), "os": info.get("Os"), "platform": batch["platform"],
+                      "requested": batch["image"], "substitute": bool(choice.get("substitute"))}
+        if image_info["substitute"]:
+            image_info.update(used_java_major=choice["used_java_major"], reason=choice["reason"])
         argv = ["run", "--rm", "--platform", batch["platform"], "--network", "bridge",
                 "--label", "sag.freeze.batch=" + batch["batch"], "-v", f"{preparation}:{METADATA}",
                 image, "sh", f"{METADATA}/{batch['script']}"]
@@ -1114,6 +1212,10 @@ def build_definition(entry, out, *, repo_root, observer, rebuild=False):
         "metadata_capture": {"status": spec.get("metadata_preparation", {}).get("status"),
                              "status_file_status": status.get("status"), "batch": dataset.get("batch"),
                              "image": status.get("image"),
+                             "image_substitute": ({k: status["image"].get(k) for k in
+                                                   ("requested", "used", "used_java_major", "reason")}
+                                                  | {"used": status["image"].get("name")}
+                                                  if (status.get("image") or {}).get("substitute") else None),
                              "steps": {s["id"]: s["status"] for s in status.get("steps", [])}},
         "timestamps": {"prepared_at": dataset.get("prepared_at"), "captured_at": status.get("written_at"),
                        "built_at": now()},
@@ -1190,7 +1292,9 @@ def verify_definition(definition, *, observer):
                requirements=len(spec["requirements"]), groups=",".join(spec["group_labels"]),
                counts=spec["ci_alignment"]["test_count_semantics"]["status"],
                target=f"{cell.executed_count}/{cell.red_count}/{cell.skipped} grade {cell.grade}",
-               count_agreement=record.get("ci_counts", {}).get("agreement"), sources=copied)
+               count_agreement=record.get("ci_counts", {}).get("agreement"), sources=copied,
+               image=((record.get("metadata_capture", {}).get("image") or {}).get("name") or "-")
+               + (" (substitute)" if record.get("metadata_capture", {}).get("image_substitute") else ""))
     if problems:
         row["result"] = "failed"
     return row
@@ -1209,13 +1313,13 @@ def verify(out, *, observer=None):
 
 def print_verify(rows, stream=sys.stdout):
     print("| project | result | java | maven | steps | annotation | harness | metadata | requirements | groups | "
-          "CI count semantics | ci-target executed/red/skipped | dataset vs log | sources copied | problems |",
-          file=stream)
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|", file=stream)
+          "CI count semantics | ci-target executed/red/skipped | dataset vs log | sources copied | capture image | "
+          "problems |", file=stream)
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|", file=stream)
     for row in rows:
         print("| " + " | ".join(str(row.get(k, "-")) for k in (
             "project", "result", "java", "maven", "steps", "annotation", "harness", "metadata", "requirements",
-            "groups", "counts", "target", "count_agreement", "sources")) + " | "
+            "groups", "counts", "target", "count_agreement", "sources", "image")) + " | "
               + ("; ".join(row["problems"]) or "-") + " |", file=stream)
 
 
@@ -1232,9 +1336,12 @@ def main(argv=None):
     chooser.add_argument("--allow-two-steps", action="store_true")
     chooser.add_argument("--max-java-lines", type=int)
     chooser.add_argument("--max-modules", type=int)
+    chooser.add_argument("--projects", nargs="*", help="Restrict eligibility to these project ids (a decided list)")
     preparer = commands.add_parser("prepare", help="Write tasks, the bundle and the metadata scripts")
     preparer.add_argument("--projects", nargs="*")
     preparer.add_argument("--batch-label", default="batch")
+    puller = commands.add_parser("images", help="Pull one capture image per Java major and record any gap")
+    puller.add_argument("--batches", nargs="*")
     capturer = commands.add_parser("capture", help="Run the metadata containers and write metadata-status.json")
     capturer.add_argument("--batches", nargs="*")
     capturer.add_argument("--no-pull", action="store_true")
@@ -1247,11 +1354,14 @@ def main(argv=None):
     out = args.out.resolve()
     if args.command == "select":
         selection = select(args.dataset.resolve(), args.twenty.resolve(), out, allow_two_steps=args.allow_two_steps,
-                           max_java_lines=args.max_java_lines, max_modules=args.max_modules)
+                           max_java_lines=args.max_java_lines, max_modules=args.max_modules,
+                           projects=args.projects)
         print_selection(selection)
     elif args.command == "prepare":
         print(json.dumps(prepare(out / "selection.json", out, args.projects, args.dataset.resolve(),
                                  batch_label=args.batch_label), indent=2))
+    elif args.command == "images":
+        images(out, args.batches)
     elif args.command == "capture":
         capture(out, args.batches, pull=not args.no_pull)
     elif args.command == "build":
