@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.runtime.project_user import configured_project_user, project_user_kwargs
+
 from .base import BaseTool, ToolError, ToolResult
 from .internal.build_utils import (
     DETACHED_HANDOFF_STATUSES,
@@ -17,6 +19,14 @@ from .internal.build_utils import (
     detached_handoff_tool_result,
     detached_poll_ref,
     detached_runner_from_command,
+)
+
+# Shown once on a permission-denied failure when the shell runs as the
+# unprivileged project user.
+SUDO_HINT = (
+    "This command ran as the unprivileged project user. Installing system "
+    "packages or changing files outside the project needs sudo, for example: "
+    "sudo apt-get install -y <package>"
 )
 
 
@@ -566,6 +576,10 @@ class BashTool(BaseTool):
             if env_vars:
                 logger.info(f"Environment variables: {list(env_vars.keys())}")
 
+            # The model's shell is the project's shell: it runs as the project
+            # user when one is configured (system changes then need sudo).
+            as_user = project_user_kwargs(self.docker_orchestrator)
+
             # Handle background execution
             if is_background and self.config.enable_background_processes:
                 return self._execute_background_command(command, workdir, env_vars)
@@ -585,6 +599,7 @@ class BashTool(BaseTool):
                     workdir=workdir,
                     environment=env_vars,
                     soft_timeout=soft_timeout,
+                    **as_user,
                 )
             elif is_long_running_command:
                 # Get dynamic timeouts based on command type
@@ -604,6 +619,7 @@ class BashTool(BaseTool):
                     enable_cpu_monitoring=True,
                     optimize_for_maven=("mvn" in command),
                     # Note: env vars handled in wrapped command for monitoring
+                    **as_user,
                 )
             else:
                 # Use regular execution for normal commands
@@ -614,6 +630,7 @@ class BashTool(BaseTool):
                     environment=env_vars,
                     timeout=timeout,
                     truncate_output=False,
+                    **as_user,
                 )
 
             # Handle a nonterminal dispatch-and-poll handoff; tell the agent how
@@ -847,7 +864,10 @@ class BashTool(BaseTool):
         """Dispatch a background command and return its stable poll handle."""
         try:
             handle = self.docker_orchestrator.execute_command_detached(
-                command, workdir=workdir, environment=env_vars
+                command,
+                workdir=workdir,
+                environment=env_vars,
+                **project_user_kwargs(self.docker_orchestrator),
             )
             source_dispatch_status = str(handle.get("dispatch_status") or "").strip()
             dispatch_status = source_dispatch_status
@@ -1396,6 +1416,8 @@ class BashTool(BaseTool):
                     "Constraint: the requested operation requires access to its target",
                 ]
             )
+            if configured_project_user(self.docker_orchestrator):
+                observations.append(SUDO_HINT)
         elif error_type == "not_found":
             observations.extend(
                 [
