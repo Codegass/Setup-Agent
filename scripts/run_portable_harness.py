@@ -33,6 +33,7 @@ POLICY = {'version': 'sag-unattended-v1', 'scope': 'task_affecting_human_actions
           'channels': {'stdin': 'disabled', 'runner_control': 'disabled_or_logged', 'external_actions': 'prohibited_or_logged'},
           'window': 'process_start_to_termination', 'initial_task_excluded': True,
           'operator_commitment': 'report_any_task_affecting_deviation', 'manual_cancellation': 'counted'}
+REVIEW_ENV = 'SAG_BENCHMARK_ALLOW_REVIEW_REQUIRED'
 
 
 def now():
@@ -48,6 +49,25 @@ def call(argv, *, timeout=60, env=None):
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def admit_definition(spec, *, allow_review_required=False):
+    """A live attempt needs a complete definition unless review_required is opted in.
+
+    The opt-in changes nothing in scoring: a review_required definition keeps
+    its task outcome and leaves the requirement groups unavailable.
+    """
+    status = spec['annotation_completeness']['status']
+    if status == 'complete':
+        return {'status': status, 'admission': 'complete'}
+    if status == 'review_required' and allow_review_required:
+        return {'status': status, 'admission': 'allowed_by_review_required_flag'}
+    raise ValueError('Task definition review must be complete before a live attempt')
+
+
+def review_environment(admission):
+    """The SAG CLI repeats the completeness check; pass the same opt-in to it."""
+    return {REVIEW_ENV: '1'} if admission['admission'] == 'allowed_by_review_required_flag' else {}
 
 
 def sag_model_config(protocol, *, image, seconds, no_advisor=False):
@@ -144,8 +164,7 @@ def run(args):
     prepared = args.project.resolve()
     task, spec = normalize_task(load_json(prepared/'task.json')), load_json(prepared/'requirements.json')
     validate_requirements(spec, task)
-    if spec['annotation_completeness']['status'] != 'complete':
-        raise ValueError('Task definition review must be complete before a live attempt')
+    admission = admit_definition(spec, allow_review_required=getattr(args, 'allow_review_required', False))
     if shutil.disk_usage(ROOT).free < RESERVE:
         raise RuntimeError('Host archival disk reserve unavailable')
     image = json.loads(call(['docker', 'image', 'inspect', args.image]))[0]
@@ -172,7 +191,8 @@ def run(args):
                 'independent_replay': 'disabled; never part of the primary score',
                 'time_boundary': 'fresh container preparation through agent termination and evidence close; no post-agent builds',
                 'input_digests': {p.name: digest(p) for p in (prepared/'task.json', prepared/'requirements.json')},
-                'cleanup': 'none after agent execution', 'phase': args.phase}
+                'cleanup': 'none after agent execution', 'phase': args.phase,
+                'annotation_completeness': admission}
     manifest['opencode_termination']='Native parent-session step_finish(reason=stop), otherwise process exit; CLI exit status retained separately'
     if getattr(args, 'maven_witness', False):
         manifest['maven_witness']='Common frozen image observer, active during agent execution; no model-visible hints; all overhead charged'
@@ -204,7 +224,7 @@ def run(args):
     container = None; gateway = None; agent = None; native_capture = None
     stop = threading.Event()
     result = {'run_key': run_id, 'run_id': run_id, 'authority_ok': False, 'evaluation_protocol': protocol_identity,
-              'process_started': False, 'process_finished': False}
+              'annotation_completeness': admission, 'process_started': False, 'process_finished': False}
 
     def dex(argv, **kwargs):
         return call(['docker', 'exec', container, *argv], **kwargs)
@@ -339,7 +359,7 @@ def run(args):
                        'OPENAI_BASE_URL':f'http://127.0.0.1:{args.port}/v1','OPENAI_API_BASE':f'http://127.0.0.1:{args.port}/v1',
                        'PYTHONPATH':str(out/'sag-source/src'),'PYTHONUNBUFFERED':'1','SAG_GIT_SHA':frozen['base_commit'],
                        'LITELLM_LOCAL_MODEL_COST_MAP':'True','SAG_RUN_ORDER_INDEX':'0',
-                       'SAG_DEPENDENCY_CACHE_STATE':manifest['cache']}
+                       'SAG_DEPENDENCY_CACHE_STATE':manifest['cache'],**review_environment(admission)}
             write_json(out/'effective-sag-config.json',
                        effective_sag_config(sag_config, child_env, out/'sag-native'))
             cli=[sys.executable,'-m','sag.main','project','https://github.com/'+task['repo']+'.git',
@@ -512,7 +532,7 @@ def run(args):
     print(json.dumps(result))
 
 
-def main():
+def build_parser():
     parser=argparse.ArgumentParser()
     parser.add_argument('--project',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
@@ -527,7 +547,13 @@ def main():
     parser.add_argument('--port',type=int,default=18571)
     parser.add_argument('--phase',default='instrumentation-qualification')
     parser.add_argument('--maven-witness',action='store_true')
-    run(parser.parse_args())
+    parser.add_argument('--allow-review-required',action='store_true',
+                        help='Admit a review_required definition; scoring keeps its requirement groups unavailable')
+    return parser
+
+
+def main():
+    run(build_parser().parse_args())
 
 
 if __name__=='__main__':
