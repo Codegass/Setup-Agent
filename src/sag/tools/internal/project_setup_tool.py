@@ -8,6 +8,11 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.runtime import EnvOverlayStore
+from sag.runtime.project_user import (
+    configured_project_user,
+    harness_git_prefix,
+    project_user_kwargs,
+)
 
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import JdkPreflight, PythonPreflight, read_live_build_requirements
@@ -437,6 +442,10 @@ class ProjectSetupTool(BaseTool):
         # failure (network, private submodule) must never fail the clone.
         submodule_status = self._init_submodules(clone_path, working_directory)
 
+        ownership_failure = self._hand_checkout_to_project_user(clone_path, repository_url)
+        if ownership_failure is not None:
+            return ownership_failure
+
         resolved_commit = self._resolve_commit(clone_path, working_directory)
 
         output = f"✅ Repository cloned successfully!\n\n"
@@ -571,6 +580,42 @@ class ProjectSetupTool(BaseTool):
                 details="\n".join(details),
             ),
             False,
+        )
+
+    def _hand_checkout_to_project_user(
+        self, clone_path: str, repository_url: str
+    ) -> Optional[ToolResult]:
+        """Give the finished checkout to the project user, when one is set.
+
+        Root cloned it (the workspace belongs to the harness); the project's
+        own builds and tests run as the project user and must be able to write
+        to it. Runs through the control channel, after the ref checkout and the
+        submodules, so nothing root writes later in the clone is left behind.
+        """
+        user = configured_project_user(self.orchestrator)
+        if not user:
+            return None
+        command = f"chown -R {user}:{user} {shlex.quote(clone_path)}"
+        result = self.orchestrator.execute_control_command(command, workdir=None)
+        if result.get("exit_code") == 0 and result.get("success") is not False:
+            return None
+        return ToolResult.completed_failure(
+            output=result.get("output", ""),
+            error=(
+                f"The repository was cloned, but the checkout could not be given to the "
+                f"project user {user!r}, so the project's own commands could not write to it"
+            ),
+            error_code="CHECKOUT_OWNERSHIP_FAILED",
+            suggestions=[
+                f"Observed fact: `{command}` exited with {result.get('exit_code')}",
+                f"Constraint: the container image must define the account {user!r}",
+            ],
+            metadata={
+                "repository_url": repository_url,
+                "target_directory": clone_path,
+                "command": command,
+                "exit_code": result.get("exit_code"),
+            },
         )
 
     def _init_submodules(self, clone_path: str, working_directory: str) -> Optional[str]:
@@ -1194,8 +1239,13 @@ class ProjectSetupTool(BaseTool):
 
         # Venv next. A provisioning pre-flight already created it (uv/apt).
         creation_failure: Optional[Dict[str, Any]] = None
+        # The venv and the installs are the project's own: they run as the
+        # project user when one is configured.
+        as_user = project_user_kwargs(self.orchestrator)
         if not outcome.provisioned and not self._python_venv_exists(venv):
-            made = self.orchestrator.execute_command(f"python3 -m venv {venv}", workdir=directory)
+            made = self.orchestrator.execute_command(
+                f"python3 -m venv {venv}", workdir=directory, **as_user
+            )
             if not made.get("success"):
                 # Do NOT return here. The exact live failure (Debian splits
                 # ensurepip out of the system python — 2026-07-24 TVM run) is
@@ -1250,7 +1300,7 @@ class ProjectSetupTool(BaseTool):
             c.replace("{venv}", venv).replace("{dir}", directory) for c in ladder["commands"]
         ]
         for cmd in commands:
-            result = self.orchestrator.execute_command(cmd, workdir=directory)
+            result = self.orchestrator.execute_command(cmd, workdir=directory, **as_user)
             output_lines.append(f"$ {cmd}")
             if not result.get("success"):
                 return {
@@ -1759,7 +1809,10 @@ class ProjectSetupTool(BaseTool):
 
             if git_check.get("success") and "HAS_GIT" in git_check.get("output", ""):
                 # Further verify it's a valid git repository
-                verify_cmd = f"cd '{check_path}' && git status 2>/dev/null && echo 'VALID_REPO' || echo 'INVALID_REPO'"
+                verify_cmd = (
+                    f"cd '{check_path}' && {harness_git_prefix(self.orchestrator)}git status "
+                    "2>/dev/null && echo 'VALID_REPO' || echo 'INVALID_REPO'"
+                )
                 verify_result = self.orchestrator.execute_command(verify_cmd, workdir=None)
 
                 if verify_result.get("success") and "VALID_REPO" in verify_result.get("output", ""):
