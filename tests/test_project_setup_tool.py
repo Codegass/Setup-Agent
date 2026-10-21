@@ -112,10 +112,24 @@ class FakeProjectSetupOrchestrator:
 
 
 class FakeCloneOrchestrator:
-    def __init__(self, *, checkout_success=True, has_submodules=False, submodule_success=True):
+    def __init__(
+        self,
+        *,
+        checkout_success=True,
+        has_submodules=False,
+        submodule_success=True,
+        direct_fetch_success=True,
+        checkout_after_direct_fetch_success=False,
+    ):
         self.checkout_success = checkout_success
         self.has_submodules = has_submodules
         self.submodule_success = submodule_success
+        # A pinned commit that no branch or tag of the remote reaches: the
+        # plain checkout fails, the remote still serves it by its id, and
+        # once fetched that way the checkout can succeed.
+        self.direct_fetch_success = direct_fetch_success
+        self.checkout_after_direct_fetch_success = checkout_after_direct_fetch_success
+        self.fetched_directly = False
         self.commands = []
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
@@ -146,8 +160,24 @@ class FakeCloneOrchestrator:
         if command == "git -C /workspace/commons-cli fetch --tags --force":
             return {"success": True, "output": "", "exit_code": 0}
 
+        if command.startswith("git -C /workspace/commons-cli fetch --force origin "):
+            if self.direct_fetch_success:
+                self.fetched_directly = True
+                return {
+                    "success": True,
+                    "output": "From https://github.com/apache/commons-cli\n * branch  ae44dcd -> FETCH_HEAD",
+                    "exit_code": 0,
+                }
+            return {
+                "success": False,
+                "output": "fatal: remote error: upload-pack: not our ref ae44dcd",
+                "exit_code": 128,
+            }
+
         if command.startswith("git -C /workspace/commons-cli checkout --detach "):
-            if self.checkout_success:
+            if self.checkout_success or (
+                self.fetched_directly and self.checkout_after_direct_fetch_success
+            ):
                 return {
                     "success": True,
                     "output": "HEAD is now at ae44dcd release",
@@ -230,6 +260,103 @@ def test_project_setup_clone_bad_ref_fails_without_project_detection():
         command.startswith("find /workspace/commons-cli ")
         for command, _, _ in orchestrator.commands
     )
+
+
+PINNED_SHA = "ae44dcdffd28d6a1a32dc4e0801b715adcef162e"
+CHECKOUT_PINNED = f"git -C /workspace/commons-cli checkout --detach {PINNED_SHA}"
+FETCH_PINNED = f"git -C /workspace/commons-cli fetch --force origin {PINNED_SHA}"
+
+
+def test_reachable_ref_checks_out_without_a_direct_fetch():
+    orchestrator = FakeCloneOrchestrator()
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        ref=PINNED_SHA,
+    )
+
+    assert result.succeeded is True
+    commands = [command for command, _, _ in orchestrator.commands]
+    assert commands.count(CHECKOUT_PINNED) == 1
+    assert not any("fetch --force origin" in command for command in commands)
+    assert "ref_fetched_directly" not in result.metadata
+    assert "fetched directly" not in result.output
+
+
+def test_unreachable_commit_is_fetched_directly_then_checked_out():
+    # spring-grpc, 2026-10-21: the pinned commit was no longer reachable from
+    # any branch or tag, so `git checkout --detach <sha>` failed after the
+    # clone, though the remote still served the commit by its id.
+    orchestrator = FakeCloneOrchestrator(
+        checkout_success=False, checkout_after_direct_fetch_success=True
+    )
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        ref=PINNED_SHA,
+    )
+
+    assert result.succeeded is True
+    commands = [command for command, _, _ in orchestrator.commands]
+    checkouts = [index for index, command in enumerate(commands) if command == CHECKOUT_PINNED]
+    assert len(checkouts) == 2
+    assert commands.index(FETCH_PINNED) == checkouts[0] + 1
+    assert checkouts[1] == checkouts[0] + 2
+    assert (FETCH_PINNED, "/workspace", None) in orchestrator.commands
+    assert result.metadata["ref"] == PINNED_SHA
+    assert result.metadata["ref_fetched_directly"] is True
+    assert result.metadata["resolved_commit"] == PINNED_SHA
+    assert "fetched directly" in result.output
+    assert f"🧾 Commit: {PINNED_SHA}" in result.output
+
+
+def test_unreachable_commit_whose_direct_fetch_fails_reports_the_original_checkout_failure():
+    orchestrator = FakeCloneOrchestrator(checkout_success=False, direct_fetch_success=False)
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        ref=PINNED_SHA,
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "REF_CHECKOUT_FAILED"
+    assert result.metadata["command"] == CHECKOUT_PINNED
+    assert result.metadata["ref"] == PINNED_SHA
+    assert f"Failed to check out repository ref '{PINNED_SHA}'" in result.error
+    assert "fetch" in result.error.splitlines()[-1]
+    assert "did not match any file(s) known to git" in result.raw_output
+    assert "not our ref" in result.raw_output
+    commands = [command for command, _, _ in orchestrator.commands]
+    assert commands.count(CHECKOUT_PINNED) == 1
+    assert FETCH_PINNED in commands
+    assert not any(command.startswith("find /workspace/commons-cli ") for command in commands)
+
+
+def test_direct_fetch_that_still_leaves_the_ref_unreachable_reports_the_original_failure():
+    orchestrator = FakeCloneOrchestrator(checkout_success=False)
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        ref="missing-ref",
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "REF_CHECKOUT_FAILED"
+    assert (
+        result.metadata["command"] == "git -C /workspace/commons-cli checkout --detach missing-ref"
+    )
+    assert "fetch" in result.error.splitlines()[-1]
+    commands = [command for command, _, _ in orchestrator.commands]
+    assert "git -C /workspace/commons-cli fetch --force origin missing-ref" in commands
+    assert commands.count("git -C /workspace/commons-cli checkout --detach missing-ref") == 2
 
 
 def test_clone_initializes_submodules_when_gitmodules_present():

@@ -417,8 +417,9 @@ class ProjectSetupTool(BaseTool):
                 error_code="CLONE_VERIFICATION_FAILED",
             )
 
+        ref_fetched_directly = False
         if requested_ref:
-            checkout_result = self._checkout_ref(
+            checkout_result, ref_fetched_directly = self._checkout_ref(
                 clone_path=clone_path,
                 requested_ref=requested_ref,
                 working_directory=working_directory,
@@ -445,6 +446,11 @@ class ProjectSetupTool(BaseTool):
             output += f"🌿 Branch: {legacy_branch}\n"
         if requested_ref:
             output += f"🔖 Ref: {requested_ref}\n"
+        if ref_fetched_directly:
+            output += (
+                "📥 No branch or tag of the remote reaches this ref, "
+                "so it was fetched directly from origin before the checkout\n"
+            )
         if resolved_commit:
             output += f"🧾 Commit: {resolved_commit}\n"
         if submodule_status:
@@ -478,6 +484,8 @@ class ProjectSetupTool(BaseTool):
             metadata["java_requirements"] = detected[1]
         if legacy_branch:
             metadata["branch"] = legacy_branch
+        if ref_fetched_directly:
+            metadata["ref_fetched_directly"] = True
 
         # Clone is side-effect free (spec §3.4-1): fetch, submodules, detect,
         # stop.  The result ends with observed project facts.  Phase policy and
@@ -494,28 +502,64 @@ class ProjectSetupTool(BaseTool):
         working_directory: str,
         repository_url: str,
         target_directory: str,
-    ) -> Optional[ToolResult]:
-        """Fetch tags and check out the requested repository ref."""
+    ) -> tuple[Optional[ToolResult], bool]:
+        """Fetch tags and check out the requested repository ref.
+
+        Returns ``(failure, fetched_directly)``: ``failure`` is None when the
+        checkout succeeded, and ``fetched_directly`` says the ref had to be
+        fetched from origin by name because no branch or tag reached it (a
+        pinned commit left behind by a force-push still checks out this way
+        while the remote serves it).
+        """
 
         fetch_cmd = f"git -C {shlex.quote(clone_path)} fetch --tags --force"
         fetch_result = self.orchestrator.execute_command(fetch_cmd, workdir=working_directory)
         if fetch_result["exit_code"] != 0:
-            return self._handle_ref_checkout_error(
-                output=fetch_result.get("output", ""),
-                repository_url=repository_url,
-                target_directory=target_directory,
-                clone_path=clone_path,
-                requested_ref=requested_ref,
-                command=fetch_cmd,
-                error_code="REF_FETCH_FAILED",
+            return (
+                self._handle_ref_checkout_error(
+                    output=fetch_result.get("output", ""),
+                    repository_url=repository_url,
+                    target_directory=target_directory,
+                    clone_path=clone_path,
+                    requested_ref=requested_ref,
+                    command=fetch_cmd,
+                    error_code="REF_FETCH_FAILED",
+                ),
+                False,
             )
 
         checkout_cmd = (
             f"git -C {shlex.quote(clone_path)} checkout --detach {shlex.quote(requested_ref)}"
         )
         checkout_result = self.orchestrator.execute_command(checkout_cmd, workdir=working_directory)
-        if checkout_result["exit_code"] != 0:
-            return self._handle_ref_checkout_error(
+        if checkout_result["exit_code"] == 0:
+            return None, False
+
+        # The clone only brings what branches and tags reach. A pinned commit
+        # the remote no longer reaches that way can still be fetched by name.
+        direct_fetch_cmd = (
+            f"git -C {shlex.quote(clone_path)} fetch --force origin {shlex.quote(requested_ref)}"
+        )
+        direct_fetch_result = self.orchestrator.execute_command(
+            direct_fetch_cmd, workdir=working_directory
+        )
+        details = [f"$ {direct_fetch_cmd}", direct_fetch_result.get("output", "")]
+        if direct_fetch_result["exit_code"] == 0:
+            retry_result = self.orchestrator.execute_command(
+                checkout_cmd, workdir=working_directory
+            )
+            if retry_result["exit_code"] == 0:
+                return None, True
+            note = (
+                "A direct fetch of this ref from origin succeeded, "
+                "but the checkout still failed."
+            )
+            details += [f"$ {checkout_cmd}", retry_result.get("output", "")]
+        else:
+            note = "A direct fetch of this ref from origin was also tried, and it failed."
+
+        return (
+            self._handle_ref_checkout_error(
                 output=checkout_result.get("output", ""),
                 repository_url=repository_url,
                 target_directory=target_directory,
@@ -523,9 +567,11 @@ class ProjectSetupTool(BaseTool):
                 requested_ref=requested_ref,
                 command=checkout_cmd,
                 error_code="REF_CHECKOUT_FAILED",
-            )
-
-        return None
+                note=note,
+                details="\n".join(details),
+            ),
+            False,
+        )
 
     def _init_submodules(self, clone_path: str, working_directory: str) -> Optional[str]:
         """Recurse git submodules when the repo declares any (`.gitmodules`).
@@ -577,18 +623,30 @@ class ProjectSetupTool(BaseTool):
         requested_ref: str,
         command: str,
         error_code: str,
+        note: Optional[str] = None,
+        details: Optional[str] = None,
     ) -> ToolResult:
-        """Return a clone result failure when the requested ref cannot be checked out."""
+        """Return a clone result failure when the requested ref cannot be checked out.
+
+        ``note`` is one extra line for the error, and ``details`` is extra
+        command output appended after ``output`` in the raw output."""
+
+        error = f"Failed to check out repository ref '{requested_ref}'"
+        if note:
+            error += f"\n{note}"
+        raw_output = output
+        if details:
+            raw_output = f"{output}\n\n{details}" if output else details
 
         return ToolResult.completed_failure(
             output="",
-            error=f"Failed to check out repository ref '{requested_ref}'",
+            error=error,
             error_code=error_code,
             suggestions=[
                 "Constraint: the requested ref must resolve to a branch, tag, or commit",
                 "Constraint: abbreviated commit ids must be unambiguous",
             ],
-            raw_output=output,
+            raw_output=raw_output,
             metadata={
                 "repository_url": repository_url,
                 "target_directory": target_directory,
