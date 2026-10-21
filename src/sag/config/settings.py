@@ -74,6 +74,9 @@ class Config(BaseModel):
     docker_cpu_limit: Optional[float] = Field(
         default=None, ge=1e-9, allow_inf_nan=False, strict=True
     )
+    # Opt-in account for the project's own commands (build, test, install and
+    # the bash tool). None keeps every command as root, exactly as before.
+    project_user: Optional[str] = Field(default=None, pattern=r"^[a-z_][a-z0-9_-]{0,31}$")
 
     # Agent configuration
     max_iterations: int = Field(default=50)
@@ -207,6 +210,7 @@ class Config(BaseModel):
                 if os.getenv("SAG_DOCKER_CPU_LIMIT")
                 else None
             ),
+            project_user=os.getenv("SAG_PROJECT_USER") or None,
             max_iterations=int(os.getenv("SAG_MAX_ITERATIONS", "50")),
             code_mode=os.getenv("SAG_CODE_MODE", "false").lower() == "true",
             max_logical_tool_calls=int(os.getenv("SAG_MAX_LOGICAL_TOOL_CALLS", "150")),
