@@ -1006,7 +1006,12 @@ def project(
             requirements = load_requirements(requirements_file, task=acceptance_task)
             if file_digest(requirements_file) != requirements_digest:
                 raise ValueError("requirements bytes changed during validation")
-            if requirements["annotation_completeness"]["status"] != "complete":
+            # The portable harness opts in to review_required definitions with
+            # this switch; scoring then keeps the requirement groups unavailable.
+            review_allowed = os.environ.get("SAG_BENCHMARK_ALLOW_REVIEW_REQUIRED") == "1"
+            if requirements["annotation_completeness"]["status"] != "complete" and not (
+                review_allowed and requirements["annotation_completeness"]["status"] == "review_required"
+            ):
                 raise ValueError("requirements annotation still needs review; complete metadata before a formal run")
             validate_ci_count_metadata(requirements, base=requirements_evidence_root(requirements_file), required=True)
             evaluation_protocol = evaluation_identity(requirements)
