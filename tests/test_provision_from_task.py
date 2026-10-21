@@ -240,6 +240,9 @@ def test_a_pinned_task_is_provisioned_and_closed_without_a_model_turn(tmp_path):
     # analyze, build, test, report — nothing in provision.
     assert len(engine.llm_client.requests) == 4
     assert "=== PHASE: ANALYZE ===" in engine.llm_client.requests[0][1]["content"]
+    # The run picture says provision completed; the close is not resent in analyze.
+    analyze_request = engine.llm_client.requests[0]
+    assert not any("PHASE_CLOSED" in str(message["content"]) for message in analyze_request)
 
     assert setup.calls == [{"action": "clone", "repository_url": URL, "ref": SHA}]
     assert system.calls == [
@@ -307,6 +310,33 @@ def test_a_pinned_task_is_provisioned_and_closed_without_a_model_turn(tmp_path):
         ("controller", None),
     ]
     assert trajectory.warnings == []
+
+
+def test_a_landed_call_without_an_output_ref_still_closes_the_phase(tmp_path):
+    """A small tool output has no output_ref; the claim cites what exists."""
+    engine = _provision_engine(tmp_path, _turns_after_provision(), task=_task(_gradle()))
+    engine.steps = [engine._phase_intro_step()]
+    checkout, java = plan_task_provision(_task(_gradle())).actions
+    cloned = ToolResult.completed_success(
+        output="cloned",
+        output_ref="output_clone",
+        metadata={"clone_path": WORKSPACE, "resolved_commit": SHA},
+    )
+    installed = ToolResult.completed_success(output="ok")
+    assert installed.output_ref is None
+
+    assert engine._close_provision_from_task(
+        _task(_gradle()), [(checkout, cloned), (java, installed)]
+    )
+
+    assert engine.phase_machine.current_phase == "analyze"
+    gate = next(
+        row["payload"]
+        for row in _events(engine, "gate_decision")
+        if row["payload"]["phase"] == "provision"
+    )
+    assert gate["expected_accepted"] is True
+    assert gate["phase_claim"]["evidence_refs"] == ["output_clone", WORKSPACE]
 
 
 def test_the_harness_calls_are_answered_in_the_window_like_any_call(tmp_path):

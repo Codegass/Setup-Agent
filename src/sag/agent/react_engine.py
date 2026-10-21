@@ -5269,7 +5269,8 @@ class ReActEngine:
         state = getattr(self, "run_evidence_state", None)
         checkout = next(result for action, result in landed if action.kind == "checkout")
         path = checkout_path(checkout)
-        refs = [result.output_ref for _action, result in landed]
+        # A small output carries no output_ref; only real refs are cited.
+        refs = [result.output_ref for _action, result in landed if result.output_ref]
         claim = PhaseClaim(
             phase="provision",
             signal="done",
@@ -5299,7 +5300,10 @@ class ReActEngine:
         if not gate.accepted or gate.validator_state is not ValidatorState.GREEN:
             logger.info(f"Harness provision close not accepted; the agent closes it: {gate.reason}")
             return False
-        self._seal_engine_gate(claim, gate)
+        # Not carried into analyze: the analyze brief's run picture already
+        # says provision completed, and a carried word would be resent in
+        # every analyze request.
+        self._seal_engine_gate(claim, gate, carry=False)
         # The transition policy reads `provision.workspace_ready` from the run
         # state, exactly as it does after a model-issued close.
         self._record_gate_facts("provision", gate)
