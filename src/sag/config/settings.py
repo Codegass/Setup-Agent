@@ -134,7 +134,10 @@ class Config(BaseModel):
     advisor_max_read_rounds: int = Field(default=3, ge=0, le=16)
     advisor_read_max_chars: int = Field(default=12000, ge=256, le=100000)
     compact_setup_prompt: bool = False
-    reuse_verified_test_phase: bool = False
+    # At test-phase entry the harness grades a success claim through the real
+    # phase gate; when the gate accepts it green with the pinned task complete,
+    # the phase closes without a model turn (round 5, 2026-10-21: -27.6% tokens).
+    reuse_verified_test_phase: bool = True
     # The harness checks out the pinned commit and installs the pinned JDK and
     # Maven before the first provision-phase model turn when a task is bound.
     provision_from_task: bool = True
@@ -232,7 +235,7 @@ class Config(BaseModel):
             export_runtime_handoff=os.getenv("SAG_EXPORT_RUNTIME_HANDOFF", "false").lower() == "true",
             phase_context_policy=os.getenv("SAG_PHASE_CONTEXT_POLICY", "legacy"),
             phase_handoff_char_budget=int(os.getenv("SAG_PHASE_HANDOFF_CHAR_BUDGET", "6000")),
-            reuse_verified_test_phase=os.getenv("SAG_REUSE_VERIFIED_TEST_PHASE", "false").lower()
+            reuse_verified_test_phase=os.getenv("SAG_REUSE_VERIFIED_TEST_PHASE", "true").lower()
             == "true",
             provision_from_task=os.getenv("SAG_PROVISION_FROM_TASK", "true").lower() == "true",
             advisor_summary_context_window=os.getenv("SAG_ADVISOR_SUMMARY_CONTEXT_WINDOW") or None,
