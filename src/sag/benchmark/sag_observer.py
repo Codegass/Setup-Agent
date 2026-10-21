@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 
+from sag.runtime.project_user import configured_project_user, project_user_environment
+
 from .requirements import (
     canonical_digest,
     evaluation_identity,
@@ -83,8 +85,11 @@ try:
   out['startup_rc_hashes']={str(p):hashlib.sha256(p.read_bytes()).hexdigest() if not p.is_symlink() else 'symlink' for p in paths if p.exists() or p.is_symlink()}
  if request['operation']=='probe':
   started=time.monotonic();out['probe_argv']=request['argv'];executable=str(safe(request['cwd'])/request['argv'][0]) if '/' in request['argv'][0] else shutil.which(request['argv'][0],path=env.get('PATH'));out['probe_executable']=str(pathlib.Path(executable).resolve()) if executable else None
+  argv=request['argv']
+  if request.get('project_user'):
+   user=request['project_user'];out['probe_user']=user;argv=['/usr/bin/setpriv','--reuid='+user,'--regid='+user,'--init-groups',*argv]
   try:
-   probe=subprocess.run(request['argv'],cwd=safe(request['cwd']),env=env,stdin=subprocess.DEVNULL,capture_output=True,timeout=request['timeout'],check=False)
+   probe=subprocess.run(argv,cwd=safe(request['cwd']),env=env,stdin=subprocess.DEVNULL,capture_output=True,timeout=request['timeout'],check=False)
    stdout,stderr=probe.stdout,probe.stderr;out['probe_exit_code']=probe.returncode
   except subprocess.TimeoutExpired as e:
    stdout,stderr=e.stdout or b'',e.stderr or b'';out['probe_exit_code']=None;out['probe_status']='timeout'
@@ -366,6 +371,19 @@ class SAGRequirementObserver:
                 if isinstance(environment, dict) and all(
                     isinstance(k, str) and isinstance(v, str) for k, v in environment.items()
                 ):
+                    # The project's Maven runs as the project user when one is
+                    # configured; its probes (local repository, wrapper
+                    # version) must see that user's home and run as that user.
+                    user = configured_project_user(owner)
+                    if user:
+                        return {
+                            "runtime_environment": {
+                                **environment,
+                                **project_user_environment(user),
+                            },
+                            "environment_observed": True,
+                            "project_user": user,
+                        }
                     return {"runtime_environment": environment, "environment_observed": True}
             except Exception:
                 pass
@@ -397,6 +415,8 @@ class SAGRequirementObserver:
                 environment_review=jvm_inputs.environment_review_for(self.spec, step),
             )
             request['maven_observer'] = self.spec.get('maven_observer')
+            if environment.get("project_user"):
+                request["project_user"] = environment["project_user"]
             answer = self.execute(
                 shlex.join(["python3", "-c", capture_program(), json.dumps(request)]),
                 truncate_output=False,

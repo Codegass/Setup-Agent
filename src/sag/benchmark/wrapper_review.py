@@ -372,8 +372,14 @@ def capture_wrapper_inputs(request):
         extra_properties = []
         if request.get("legacy_wrapper") is True:
             # JVM user.home defaults to the account directory; -Duser.home and
-            # alternative JVM option channels are rejected above.
-            user_dir = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+            # alternative JVM option channels are rejected above. Maven runs as
+            # the project user when the request names one.
+            account = (
+                pwd.getpwnam(request["project_user"])
+                if request.get("project_user")
+                else pwd.getpwuid(os.getuid())
+            )
+            user_dir = pathlib.Path(account.pw_dir)
             user_maven = pathlib.Path(env.get("MAVEN_USER_HOME") or user_dir / ".m2")
             for label, path in (("project", root / "maven.properties"), ("user", user_maven / "maven.properties")):
                 extra_properties.append({"scope": label, "path": str(path), "absent": not (path.exists() or path.is_symlink())})
