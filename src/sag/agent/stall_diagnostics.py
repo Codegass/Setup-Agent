@@ -31,6 +31,7 @@ from sag.agent.evidence_publications import (
     verify_latest_evidence_bytes,
 )
 from sag.runtime.container_io import read_container_text
+from sag.runtime.project_user import configured_project_user, drop_privileges_argv
 from sag.utils.container_io import (
     WRITE_COMPARE_CONFLICT,
     compare_publish_container_text_atomic,
@@ -264,7 +265,15 @@ def collect_stall_diagnostic(
     if existing_state != "absent":
         return _invalid_bundle(job, f"diagnostic_existing_{existing_state}")
 
-    command = _diagnostic_command(job_id=job_id, pid=pid, pgid=pgid, job=job)
+    # A JDK 8 JVM refuses an attach from root: jcmd/jstack attach as the
+    # project user that owns the build when one is configured.
+    command = _diagnostic_command(
+        job_id=job_id,
+        pid=pid,
+        pgid=pgid,
+        job=job,
+        project_user=configured_project_user(getattr(execute, "__self__", None)),
+    )
     probe = _execute(execute, command, timeout=30, truncate_output=False)
     if not _succeeded(probe):
         return _invalid_bundle(job, "diagnostic_probe_failed")
@@ -883,8 +892,18 @@ def control_stalled_job(
     )
 
 
-def _diagnostic_command(*, job_id: str, pid: int, pgid: int, job: Mapping[str, Any]) -> str:
+def _diagnostic_command(
+    *,
+    job_id: str,
+    pid: int,
+    pgid: int,
+    job: Mapping[str, Any],
+    project_user: Optional[str] = None,
+) -> str:
     log_path = shlex.quote(_text(job.get("log_path")))
+    # The output files stay root's (the shell opens them); only the attaching
+    # process changes identity.
+    attach_as = (" ".join(drop_privileges_argv(project_user)) + " ") if project_user else ""
     workdir = shlex.quote(_text(job.get("working_directory")) or "/workspace")
     prefix = _probe_prefix(job_id=job_id, pid=pid, pgid=pgid, log_path=log_path, workdir=workdir)
     raw_emit = " ".join(
@@ -926,10 +945,10 @@ def _diagnostic_command(*, job_id: str, pid: int, pgid: int, job: Mapping[str, A
         "java_pid=$(awk '$9 ~ /(^|\\/)java/ {print $1; exit}' \"$tmp/process\"); "
         'jvm_attempted=0; : > "$tmp/jvm"; '
         'if [ -n "$java_pid" ]; then if command -v jcmd >/dev/null 2>&1; then '
-        'jvm_attempted=1; timeout --kill-after=2 10 jcmd "$java_pid" Thread.print '
+        f'jvm_attempted=1; timeout --kill-after=2 10 {attach_as}jcmd "$java_pid" Thread.print '
         '> "$tmp/jvm" 2>&1; '
         "elif command -v jstack >/dev/null 2>&1; then jvm_attempted=1; "
-        'timeout --kill-after=2 10 jstack "$java_pid" > "$tmp/jvm" 2>&1; fi; fi; '
+        f'timeout --kill-after=2 10 {attach_as}jstack "$java_pid" > "$tmp/jvm" 2>&1; fi; fi; '
         'head -n 400 "$tmp/jvm" | head -c 262144 > "$tmp/jvm.bounded"; '
         'mv "$tmp/jvm.bounded" "$tmp/jvm"; '
         f'tail -n 120 {log_path} 2>/dev/null | head -c 65536 > "$tmp/log_tail"; '
