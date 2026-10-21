@@ -19,6 +19,11 @@ from loguru import logger
 
 from sag.config import get_config
 from sag.runtime.exec_env import DEFAULT_UTF8_ENVIRONMENT, default_utf8_environment
+from sag.runtime.project_user import (
+    configured_project_user,
+    drop_privileges_argv,
+    project_user_environment,
+)
 
 ENV_OVERLAY_SCRIPT_PATH = "/workspace/.setup_agent/env_overlay.sh"
 CONTROL_EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -289,13 +294,16 @@ class DockerOrchestrator:
         *,
         runtime_environment: Optional[Dict[str, str]] = None,
         timeout_seconds: Optional[int] = None,
+        project_user: Optional[str] = None,
     ) -> list[str]:
         """Build an argv whose controller utilities never use project PATH.
 
         Docker starts only absolute host-control executables. For a normal
         project command, ``/usr/bin/env`` installs the already validated
         runtime environment for the inner ``/bin/bash``; timeout and the outer
-        shell remain under the fixed control environment.
+        shell remain under the fixed control environment. With a project
+        user, ``setpriv`` drops to that account between ``timeout`` and
+        ``env``; the control path (no runtime environment) never drops.
         """
 
         if runtime_environment is None:
@@ -303,6 +311,8 @@ class DockerOrchestrator:
         else:
             assignments = [f"{key}={value}" for key, value in runtime_environment.items()]
             argv = ["/usr/bin/env", *assignments, "/bin/bash", "-c", command]
+            if project_user:
+                argv = [*drop_privileges_argv(project_user), *argv]
         if timeout_seconds is not None and timeout_seconds > 0:
             argv = [
                 "/usr/bin/timeout",
@@ -311,6 +321,19 @@ class DockerOrchestrator:
                 *argv,
             ]
         return argv
+
+    def _dispatch_project_user(self, as_project_user: bool) -> Optional[str]:
+        """The account a project dispatch drops to, or None to stay root."""
+
+        return configured_project_user(self) if as_project_user else None
+
+    @staticmethod
+    def _with_project_user_identity(
+        runtime_environment: Dict[str, str], project_user: Optional[str]
+    ) -> Dict[str, str]:
+        if not project_user:
+            return runtime_environment
+        return {**runtime_environment, **project_user_environment(project_user)}
 
     def _default_exec_environment(
         self, environment: Optional[Dict[str, str]] = None
@@ -551,6 +574,7 @@ class DockerOrchestrator:
         timeout: Optional[int] = None,
         truncate_output: bool = True,
         _clean_control_path: bool = False,
+        as_project_user: bool = False,
     ) -> Dict[str, Any]:
         """
         Execute a command in the container.
@@ -566,6 +590,9 @@ class DockerOrchestrator:
                 caller needs the complete output for durable storage (e.g.
                 persisting a finished detached build log to the output store);
                 the full log is never fed straight into the model context.
+            as_project_user: Run the project's own command as the configured
+                project user. Ignored when no project user is configured and
+                on the control path.
 
         Returns:
             A dictionary with the result of the command execution.
@@ -601,13 +628,21 @@ class DockerOrchestrator:
         runner_dispatched = False
         try:
             # Prepare environment
+            project_user = (
+                None if _clean_control_path else self._dispatch_project_user(as_project_user)
+            )
             runtime_environment = (
-                None if _clean_control_path else self._default_exec_environment(environment)
+                None
+                if _clean_control_path
+                else self._with_project_user_identity(
+                    self._default_exec_environment(environment), project_user
+                )
             )
             exec_command = self._isolated_exec_argv(
                 wrapped_command,
                 runtime_environment=runtime_environment,
                 timeout_seconds=timeout_seconds,
+                project_user=project_user,
             )
             exec_env = self._control_exec_environment()
 
@@ -823,6 +858,7 @@ class DockerOrchestrator:
         enable_cpu_monitoring: bool = True,
         optimize_for_maven: bool = True,
         _clean_control_path: bool = False,
+        as_project_user: bool = False,
     ) -> Dict[str, Any]:
         """
         Enhanced execute_command with comprehensive timeout and monitoring capabilities.
@@ -835,6 +871,7 @@ class DockerOrchestrator:
             use_timeout_wrapper: Whether to wrap command with GNU timeout
             enable_cpu_monitoring: Whether to monitor CPU usage for hang detection
             optimize_for_maven: Whether to apply Maven-specific optimizations
+            as_project_user: Run as the configured project user (see execute_command)
         """
 
         # Get the container object
@@ -892,11 +929,21 @@ class DockerOrchestrator:
 
         runner_dispatched = False
         try:
-            runtime_environment = None if _clean_control_path else self._default_exec_environment()
+            project_user = (
+                None if _clean_control_path else self._dispatch_project_user(as_project_user)
+            )
+            runtime_environment = (
+                None
+                if _clean_control_path
+                else self._with_project_user_identity(
+                    self._default_exec_environment(), project_user
+                )
+            )
             exec_command = self._isolated_exec_argv(
                 base_cmd,
                 runtime_environment=runtime_environment,
                 timeout_seconds=absolute_timeout if use_timeout_wrapper else None,
+                project_user=project_user,
             )
             # Streaming exec_run cannot expose the final exit code. Retain
             # the daemon exec id and inspect this exact process after its
@@ -1109,6 +1156,7 @@ class DockerOrchestrator:
         workdir: Optional[str] = None,
         environment: Optional[Dict[str, str]] = None,
         _clean_control_path: bool = False,
+        as_project_user: bool = False,
     ) -> Dict[str, Any]:
         """Start a command whose terminal status is owned by the Docker daemon.
 
@@ -1117,6 +1165,10 @@ class DockerOrchestrator:
         authority: the project command and its descendants may share the
         supervisor's uid and can therefore replace any predictable marker
         after the original leader exits.
+
+        With ``as_project_user`` and a configured project user, the supervisor,
+        the pid/pgid/identity files and the log descriptors stay root; only the
+        final ``exec`` drops to the user, in place, so pid = pgid = sid holds.
         """
         job_id = uuid.uuid4().hex[:12]
         log_path = f"{self.DISPATCH_DIR}/{job_id}.log"
@@ -1125,11 +1177,14 @@ class DockerOrchestrator:
         pgid_path = f"{self.DISPATCH_DIR}/{job_id}.pgid"
         identity_path = f"{self.DISPATCH_DIR}/{job_id}.identity"
 
+        project_user = None if _clean_control_path else self._dispatch_project_user(as_project_user)
         try:
             runtime_environment = (
                 self._control_exec_environment()
                 if _clean_control_path
-                else self._default_exec_environment(environment)
+                else self._with_project_user_identity(
+                    self._default_exec_environment(environment), project_user
+                )
             )
         except Exception as exc:
             dispatch_status = (
@@ -1177,6 +1232,7 @@ class DockerOrchestrator:
         quoted_identity_tmp = shlex.quote(identity_path + ".tmp")
         runtime_exec = " ".join(
             [
+                *(drop_privileges_argv(project_user) if project_user else ()),
                 "/usr/bin/env",
                 *(shlex.quote(f"{key}={value}") for key, value in runtime_environment.items()),
                 "/bin/bash",
@@ -1753,6 +1809,7 @@ class DockerOrchestrator:
         stall_seconds: Optional[int] = None,
         now=None,
         sleep=None,
+        as_project_user: bool = False,
     ) -> Dict[str, Any]:
         """Dispatch-and-poll execution with a soft window (no hard kill).
 
@@ -1787,7 +1844,14 @@ class DockerOrchestrator:
             stall_seconds = getattr(config, "dispatch_stall_seconds", 600)
         stall_seconds = max(0, int(stall_seconds or 0))
 
-        handle = self.execute_command_detached(command, workdir=workdir, environment=environment)
+        handle = self.execute_command_detached(
+            command,
+            workdir=workdir,
+            environment=environment,
+            # Only a project dispatch carries the flag, so the default call is
+            # exactly the one older detached doubles accept.
+            **({"as_project_user": True} if as_project_user else {}),
+        )
         if not handle.get("started"):
             if handle.get("runner_dispatched") is True:
                 # Docker accepted and started the exec, but the clean startup
@@ -2869,9 +2933,15 @@ class DockerOrchestrator:
             logger.info("Setting up container environment with robust workspace creation")
 
             # ★★★ STEP 1: CRITICAL - Ensure workspace directory exists and is permanent
+            # With a project user the checkout is handed to that user after
+            # clone; resetting the whole workspace to root would undo that.
             workspace_commands = [
                 f"mkdir -p {self.config.workspace_path}",
-                f"chown -R root:root {self.config.workspace_path}",
+                *(
+                    ()
+                    if configured_project_user(self)
+                    else (f"chown -R root:root {self.config.workspace_path}",)
+                ),
                 f"chmod 755 {self.config.workspace_path}",
                 f"touch {self.config.workspace_path}/.sag_workspace_marker",  # Marker to verify persistence
                 f"ls -la {self.config.workspace_path}",  # Verify creation
