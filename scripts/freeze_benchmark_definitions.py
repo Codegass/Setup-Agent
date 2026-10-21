@@ -40,7 +40,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = ROOT / "output/java-benchmark-20260916"
 DEFAULT_TWENTY = ROOT / "output/three-harness-twenty-20260924/formal/definitions"
 DEFAULT_OUT = ROOT / "output/benchmark-fifty-20261021"
-OBSERVER_DEFINITION = "commons-csv"
+# The 2026-10-08 campaign revised every definition's passive-observer block to the
+# policy carried by the current harness image; this definition holds that block.
+DEFAULT_OBSERVER_SOURCE = ROOT / "output/token-levers-3-20261020/inputs/commons-dbutils/requirements.json"
+REVISE_TWENTY = ("cayenne", "commons-cli", "commons-csv", "commons-dbcp", "commons-jcs", "commons-net", "creadur-rat",
+                 "creadur-whisker", "curator", "freemarker", "jackrabbit", "rocketmq")
 TIER = "review_required"
 DEFAULT_MAVEN = "3.9.16"
 HELP = "org.apache.maven.plugins:maven-help-plugin:3.5.2:"
@@ -1110,10 +1114,51 @@ def capture(out, batches=None, *, pull=True, log=print):
 
 # ----------------------------------------------------------------- build
 
-def observer_policy(twenty):
-    """The frozen passive-observer block; the harness compares it with the image."""
-    spec = json.loads((Path(twenty) / OBSERVER_DEFINITION / "requirements.json").read_text())
-    return spec["maven_observer"]
+def observer_policy(source):
+    """The passive-observer block of a revised definition, and where it came from.
+
+    With --maven-witness the harness compares this block with the image's
+    policy, so a stale block makes the evidence unavailable.
+    """
+    source = Path(source)
+    block = json.loads(source.read_text()).get("maven_observer")
+    if (not isinstance(block, dict) or set(block) != {"policy", "observer_sha256", "launcher_sha256", "activation_sha256"}
+            or not isinstance(block["policy"], str)
+            or any(not re.fullmatch(r"[0-9a-f]{64}", str(block[k]))
+                   for k in ("observer_sha256", "launcher_sha256", "activation_sha256"))):
+        raise ValueError(f"{source} has no well-formed maven_observer block")
+    return block, {"path": str(source), "sha256": file_sha(source), "field": "maven_observer"}
+
+
+def revise_definitions(source_root, names, dest, observer, observer_ref):
+    """Copy definitions and replace only their maven_observer block, recording the substitution."""
+    source_root, dest = Path(source_root), Path(dest)
+    results = {}
+    for name in names:
+        source, copy = source_root / name, dest / name
+        if copy.exists():
+            raise ValueError(f"{copy} already exists; a revised copy is written once")
+        raw = (source / "requirements.json").read_bytes()
+        spec = json.loads(raw)
+        if json_bytes(spec) != raw:
+            raise ValueError(f"{source / 'requirements.json'} is not in the canonical layout; refusing to rewrite it")
+        if "maven_observer" not in spec:
+            raise ValueError(f"{source / 'requirements.json'} has no maven_observer block")
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, copy, symlinks=True)
+        old = spec["maven_observer"]
+        spec["maven_observer"] = deepcopy(observer)
+        revised = json_bytes(spec)
+        (copy / "requirements.json").write_bytes(revised)
+        record = {"schema_version": 1, "project": name, "source_definition": str(source),
+                  "change": "maven_observer block replaced; every other byte of the definition is copied unchanged",
+                  "old_maven_observer": old, "new_maven_observer": observer, "observer_source": observer_ref,
+                  "requirements_sha256_before": sha256_bytes(raw), "requirements_sha256_after": sha256_bytes(revised),
+                  "revised_at": now(), "tool": tool_identity()}
+        write_json(copy / "revision.json", record)
+        results[name] = {"status": "revised", "unchanged": old == observer,
+                         "before": record["requirements_sha256_before"], "after": record["requirements_sha256_after"]}
+    return results
 
 
 def _remove(path):
@@ -1123,7 +1168,7 @@ def _remove(path):
         path.unlink()
 
 
-def build_definition(entry, out, *, repo_root, observer, rebuild=False):
+def build_definition(entry, out, *, repo_root, observer, rebuild=False, observer_ref=None):
     from scripts.build_benchmark_requirements import archive_source, build_project, digest, task_digest
     from scripts.requirements_metadata_inventory import attach_preparation_inventory
     from sag.benchmark.ci_count_semantics import unavailable
@@ -1208,6 +1253,7 @@ def build_definition(entry, out, *, repo_root, observer, rebuild=False):
             "definition_ci_sources": index["sources"],
         },
         "extraction": dataset["extraction"],
+        "maven_observer_source": observer_ref,
         "ci_counts": {"dataset": counts, "log": log_counts, "agreement": agreement,
                       "asserted_in_ci_target": agreement == "agree"},
         "metadata_capture": {"status": spec.get("metadata_preparation", {}).get("status"),
@@ -1236,14 +1282,14 @@ def build_definition(entry, out, *, repo_root, observer, rebuild=False):
             "requirements_digest": digest(spec)}
 
 
-def build(out, projects=None, *, repo_root, observer, rebuild=False):
+def build(out, projects=None, *, repo_root, observer, rebuild=False, observer_ref=None):
     manifest = json.loads((Path(out) / "bundle/manifest.json").read_text())
     entries = {entry["id"]: entry for entry in manifest["projects"]}
     results = {}
     for name in projects or sorted(entries):
         try:
             results[name] = build_definition(entries[name], out, repo_root=repo_root, observer=observer,
-                                             rebuild=rebuild)
+                                             rebuild=rebuild, observer_ref=observer_ref)
         except (ValueError, OSError, KeyError) as exc:
             results[name] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
     return results
@@ -1251,7 +1297,7 @@ def build(out, projects=None, *, repo_root, observer, rebuild=False):
 
 # ---------------------------------------------------------------- verify
 
-def verify_definition(definition, *, observer):
+def verify_definition(definition, *, observer, kind="freeze"):
     from sag.agent.acceptance_task import load_acceptance_task
     from sag.agent.ci_comparison import load_ci_target
     from sag.benchmark.ci_sources import archive_sources
@@ -1270,29 +1316,39 @@ def verify_definition(definition, *, observer):
     validate_ci_count_metadata(spec, base=requirements_evidence_root(requirements_path), required=True)
     admission = admit_definition(spec, allow_review_required=True)
     target = load_ci_target(definition / "ci-target.json").record
-    if (target.repo, target.sha) != (acceptance.repo, acceptance.sha) or target.matched_cell is None:
-        problems.append("ci_target_subject_or_cell")
+    if (target.repo, target.sha) != (acceptance.repo, acceptance.sha):
+        problems.append("ci_target_subject_differs")
+    if target.matched_cell is None and kind == "freeze":
+        problems.append("ci_target_has_no_matched_cell")
     with tempfile.TemporaryDirectory() as temporary:
         archive_sources(spec, definition, temporary)
         copied = sum(1 for p in Path(temporary).rglob("*") if p.is_file())
     if observer is not None and spec.get("maven_observer") != observer:
         problems.append("maven_observer_differs")
-    names = {p.name for p in definition.iterdir()}
-    if names != DEFINITION_FILES:
-        problems.append("contents:" + ",".join(sorted(names ^ DEFINITION_FILES)))
-    record = load_json(definition / "freeze.json")
-    if (record.get("task", {}).get("file_sha256") != file_digest(definition / "task.json")
-            or record.get("requirements", {}).get("file_sha256") != file_digest(requirements_path)
-            or record.get("ci_target", {}).get("file_sha256") != file_digest(definition / "ci-target.json")):
-        problems.append("freeze_record_hashes")
-    cell = target.cells[0]
+    if kind == "revised":
+        revision = load_json(definition / "revision.json")
+        record = {}
+        if (revision.get("requirements_sha256_after") != file_digest(requirements_path)
+                or revision.get("new_maven_observer") != spec.get("maven_observer")):
+            problems.append("revision_record_differs")
+    else:
+        names = {p.name for p in definition.iterdir()}
+        if names != DEFINITION_FILES:
+            problems.append("contents:" + ",".join(sorted(names ^ DEFINITION_FILES)))
+        record = load_json(definition / "freeze.json")
+        if (record.get("task", {}).get("file_sha256") != file_digest(definition / "task.json")
+                or record.get("requirements", {}).get("file_sha256") != file_digest(requirements_path)
+                or record.get("ci_target", {}).get("file_sha256") != file_digest(definition / "ci-target.json")):
+            problems.append("freeze_record_hashes")
+    cell = next((c for c in target.cells if c.cell_id == target.matched_cell), None)
     step = task["steps"][0]
     row.update(java=step.get("java_major"), maven=step.get("maven_version"), steps=len(task["steps"]),
                annotation=admission["status"], harness=admission["admission"],
                metadata=spec.get("metadata_preparation", {}).get("status"),
                requirements=len(spec["requirements"]), groups=",".join(spec["group_labels"]),
                counts=spec["ci_alignment"]["test_count_semantics"]["status"],
-               target=f"{cell.executed_count}/{cell.red_count}/{cell.skipped} grade {cell.grade}",
+               target=(f"{cell.executed_count}/{cell.red_count}/{cell.skipped} grade {cell.grade}" if cell
+                       else f"no matched cell ({len(target.cells)} cells)"),
                count_agreement=record.get("ci_counts", {}).get("agreement"), sources=copied,
                image=((record.get("metadata_capture", {}).get("image") or {}).get("name") or "-")
                + (" (substitute)" if record.get("metadata_capture", {}).get("image_substitute") else ""))
@@ -1301,11 +1357,13 @@ def verify_definition(definition, *, observer):
     return row
 
 
-def verify(out, *, observer=None):
+def verify(out, *, observer=None, kind="freeze"):
+    """kind "freeze" checks <out>/definitions; kind "revised" checks the revised copies under <out>."""
+    root = Path(out) / "definitions" if kind == "freeze" else Path(out)
     rows = []
-    for definition in sorted(p for p in (Path(out) / "definitions").iterdir() if p.is_dir()):
+    for definition in sorted(p for p in root.iterdir() if p.is_dir()):
         try:
-            rows.append(verify_definition(definition, observer=observer))
+            rows.append(verify_definition(definition, observer=observer, kind=kind))
         except Exception as exc:  # report every definition, not only the first failure
             rows.append({"project": definition.name, "result": "failed",
                          "problems": [f"{type(exc).__name__}: {exc}"]})
@@ -1332,6 +1390,8 @@ def main(argv=None):
     parser.add_argument("--twenty", type=Path, default=DEFAULT_TWENTY,
                         help="Directory of the twenty frozen definitions (excluded; source of the observer policy)")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--observer-source", type=Path, default=DEFAULT_OBSERVER_SOURCE,
+                        help="A revised requirements.json whose maven_observer block every definition copies")
     commands = parser.add_subparsers(dest="command", required=True)
     chooser = commands.add_parser("select", help="List eligible tasks and write selection.json")
     chooser.add_argument("--allow-two-steps", action="store_true")
@@ -1350,7 +1410,11 @@ def main(argv=None):
     builder.add_argument("--projects", nargs="*")
     builder.add_argument("--repo-root", type=Path)
     builder.add_argument("--rebuild", action="store_true")
-    commands.add_parser("verify", help="Reload every definition as the harness does")
+    reviser = commands.add_parser("revise-twenty", help="Copy twenty definitions with the current observer block")
+    reviser.add_argument("--names", nargs="*", default=list(REVISE_TWENTY))
+    reviser.add_argument("--dest", type=Path, help="Default: <out>/revised-twenty")
+    checker = commands.add_parser("verify", help="Reload every definition as the harness does")
+    checker.add_argument("--revised", action="store_true", help="Verify <out>/revised-twenty instead")
     args = parser.parse_args(argv)
     out = args.out.resolve()
     if args.command == "select":
@@ -1367,13 +1431,23 @@ def main(argv=None):
         capture(out, args.batches, pull=not args.no_pull)
     elif args.command == "build":
         repo_root = (args.repo_root or args.dataset.resolve().parents[1]).resolve()
-        results = build(out, args.projects, repo_root=repo_root, observer=observer_policy(args.twenty),
-                        rebuild=args.rebuild)
+        observer, observer_ref = observer_policy(args.observer_source)
+        results = build(out, args.projects, repo_root=repo_root, observer=observer, rebuild=args.rebuild,
+                        observer_ref=observer_ref)
         print(json.dumps(results, indent=2))
         if any(r["status"] != "built" for r in results.values()):
             sys.exit(1)
+    elif args.command == "revise-twenty":
+        observer, observer_ref = observer_policy(args.observer_source)
+        print(json.dumps(revise_definitions(args.twenty.resolve(), args.names,
+                                            (args.dest or out / "revised-twenty").resolve(), observer, observer_ref),
+                         indent=2))
     else:
-        rows = verify(out, observer=observer_policy(args.twenty))
+        observer, _ref = observer_policy(args.observer_source)
+        if args.revised:
+            rows = verify(out / "revised-twenty", observer=observer, kind="revised")
+        else:
+            rows = verify(out, observer=observer)
         print_verify(rows)
         if any(r["result"] != "ok" for r in rows):
             sys.exit(1)

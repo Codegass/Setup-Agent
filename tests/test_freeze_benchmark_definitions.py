@@ -715,6 +715,57 @@ def test_a_substitute_jdk_capture_is_flagged_and_never_counts_as_captured(tmp_pa
     assert [(r["project"], r["result"]) for r in freeze.verify(out, observer=OBSERVER)] == [("commons-pool", "ok")]
 
 
+REVISED_OBSERVER = {"policy": "passive-maven-events-v1", "observer_sha256": "1" * 64,
+                    "launcher_sha256": "4" * 64, "activation_sha256": "5" * 64}
+
+
+def test_the_observer_block_comes_from_a_named_revised_definition(tmp_path):
+    source = tmp_path / "requirements.json"
+    source.write_text(json.dumps({"schema_version": 2, "maven_observer": REVISED_OBSERVER}))
+    block, ref = freeze.observer_policy(source)
+    assert block == REVISED_OBSERVER
+    assert ref == {"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                   "field": "maven_observer"}
+    source.write_text(json.dumps({"maven_observer": {**REVISED_OBSERVER, "launcher_sha256": "stale"}}))
+    with pytest.raises(ValueError, match="observer"):
+        freeze.observer_policy(source)
+
+
+def test_a_revised_copy_changes_only_the_observer_block_and_records_both(tmp_path):
+    _out, definition = frozen_synthetic_definition(tmp_path)
+    original = (definition / "requirements.json").read_bytes()
+    dest = tmp_path / "revised"
+    observer_ref = {"path": "/x/requirements.json", "sha256": "6" * 64, "field": "maven_observer"}
+    results = freeze.revise_definitions(definition.parent, ["commons-pool"], dest, REVISED_OBSERVER, observer_ref)
+    assert results["commons-pool"]["status"] == "revised"
+    copy = dest / "commons-pool"
+    revised = (copy / "requirements.json").read_bytes()
+    before, after = json.loads(original), json.loads(revised)
+    assert after["maven_observer"] == REVISED_OBSERVER
+    assert {k: v for k, v in after.items() if k != "maven_observer"} == {
+        k: v for k, v in before.items() if k != "maven_observer"}
+    for path in definition.rglob("*"):
+        if path.is_file() and path.name != "requirements.json":
+            assert (copy / path.relative_to(definition)).read_bytes() == path.read_bytes()
+    record = json.loads((copy / "revision.json").read_text())
+    assert record["old_maven_observer"] == OBSERVER and record["new_maven_observer"] == REVISED_OBSERVER
+    assert record["requirements_sha256_before"] == hashlib.sha256(original).hexdigest()
+    assert record["requirements_sha256_after"] == hashlib.sha256(revised).hexdigest()
+    assert record["observer_source"] == observer_ref
+    assert record["source_definition"] == str(definition)
+    rows = freeze.verify(dest, observer=REVISED_OBSERVER, kind="revised")
+    assert [(r["project"], r["result"]) for r in rows] == [("commons-pool", "ok")], rows
+    with pytest.raises(ValueError, match="already exists"):
+        freeze.revise_definitions(definition.parent, ["commons-pool"], dest, REVISED_OBSERVER, observer_ref)
+    assert [r["result"] for r in freeze.verify(dest, observer=OBSERVER, kind="revised")] == ["failed"]
+    # A copied definition without a matched CI cell (twenty commons-cli) is reported, not failed:
+    # the harness and the SAG CLI accept a target without one.
+    target = json.loads((copy / "ci-target.json").read_text())
+    (copy / "ci-target.json").write_text(json.dumps({**target, "matched_cell": None}))
+    [row] = freeze.verify(dest, observer=REVISED_OBSERVER, kind="revised")
+    assert (row["result"], row["target"]) == ("ok", "no matched cell (1 cells)"), row
+
+
 # ------------------------------------------------------ harness and CLI
 
 def test_harness_admits_review_required_only_with_the_flag():
