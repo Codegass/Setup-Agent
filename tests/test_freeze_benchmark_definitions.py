@@ -8,6 +8,7 @@ test). They are inlined so that the tests do not depend on that directory.
 import hashlib
 import json
 import shlex
+import sys
 import zipfile
 from pathlib import Path
 
@@ -401,6 +402,37 @@ def test_a_runtime_that_differs_from_the_task_is_not_presented_as_captured(tmp_p
     assert status["steps"][0]["observed_java_major"] == 17
     result = attach_preparation_inventory(spec, task, preparation, tmp_path / "definition")
     assert result["metadata_preparation"]["status"] == "partial_or_unavailable"
+
+
+SETTINGS_WITH_SERVERS = SETTINGS.replace("<interactiveMode>", """<servers><server><id>repo.spring.io</id>
+  <username>${env.spring_username}</username><password>***</password></server></servers>
+  <interactiveMode>""")
+
+
+def test_settings_with_server_entries_are_a_gap_the_importer_never_sees_as_captured(tmp_path, monkeypatch):
+    # spring-projects/spring-grpc: .mvn/settings.xml declares servers with environment placeholders;
+    # attach_preparation_inventory refuses to export any settings that carry server credentials.
+    monkeypatch.setattr(sys.modules[__name__], "SETTINGS", SETTINGS_WITH_SERVERS)
+    task, preparation, _plan, status, spec = prepared(tmp_path)
+    assert status["steps"][0]["status"] == "settings_carry_server_credentials"
+    assert "outputs" not in status["steps"][0]
+    result = attach_preparation_inventory(spec, task, preparation, tmp_path / "definition")
+    assert result["metadata_preparation"]["status"] == "partial_or_unavailable"
+
+
+def test_status_can_be_rederived_from_the_receipts_without_rerunning_the_container(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "SETTINGS", SETTINGS_WITH_SERVERS)
+    out, _definition = frozen_synthetic_definition(tmp_path)
+    preparation = out / "preparation"
+    image = {"name": "eclipse-temurin:21-jdk", "id": "sha256:" + "2" * 64}
+    (preparation / "capture-t-java21.json").write_text(json.dumps({"batch": "t-java21", "image": image}))
+    before = (preparation / "commons-pool/receipts.tsv").read_bytes()
+    summary = freeze.restatus(out, ["commons-pool"])
+    assert summary == {"commons-pool": "incomplete_metadata"}
+    status = json.loads((preparation / "commons-pool/metadata-status.json").read_text())
+    assert status["steps"][0]["status"] == "settings_carry_server_credentials"
+    assert status["image"] == image
+    assert (preparation / "commons-pool/receipts.tsv").read_bytes() == before
 
 
 # ------------------------------------------------------------ CI target

@@ -478,6 +478,17 @@ def read_receipts(path):
     return rows
 
 
+def settings_carry_credentials(path):
+    """The same test attach_preparation_inventory applies before exporting settings."""
+    from scripts.build_benchmark_requirements import xml_root
+    try:
+        settings = xml_root(Path(path).read_bytes())
+    except Exception:  # unreadable settings are not exportable either
+        return True
+    return bool(settings.findall("servers/server")
+                or any(settings.findall(".//" + tag) for tag in ("password", "privateKey", "passphrase")))
+
+
 def metadata_status(preparation, plan, *, script_name, image):
     """Write <project>/metadata-status.json with the fields the importer reads.
 
@@ -550,6 +561,9 @@ def metadata_status(preparation, plan, *, script_name, image):
         elif (any(c["status"] != "completed" or c["exit_code"] != 0 or c["log"] is None for c in result["commands"])
               or any(value is None for value in outputs.values())):
             result["status"] = "metadata_capture_failed"
+        elif settings_carry_credentials(preparation / outputs["effective-settings"]["path"]):
+            # The importer refuses to export settings with server entries, even placeholders.
+            result["status"] = "settings_carry_server_credentials"
         else:
             result["status"] = "captured_review_required"
             result["outputs"] = outputs
@@ -1112,6 +1126,24 @@ def capture(out, batches=None, *, pull=True, log=print):
     return results
 
 
+def restatus(out, projects=None):
+    """Rewrite metadata-status.json from the recorded receipts and outputs; no container runs."""
+    preparation = Path(out) / "preparation"
+    summary = {}
+    for plan_path in sorted(preparation.glob("plan-*.json")):
+        batch = json.loads(plan_path.read_text())
+        receipt = preparation / f"capture-{batch['batch']}.json"
+        if not receipt.exists():
+            continue
+        image = json.loads(receipt.read_text())["image"]
+        for plan in batch["projects"]:
+            if projects and plan["project_id"] not in projects:
+                continue
+            state = metadata_status(preparation, plan, script_name=batch["script"], image=image)
+            summary[plan["project_id"]] = state["status"]
+    return summary
+
+
 # ----------------------------------------------------------------- build
 
 def observer_policy(source):
@@ -1410,6 +1442,8 @@ def main(argv=None):
     builder.add_argument("--projects", nargs="*")
     builder.add_argument("--repo-root", type=Path)
     builder.add_argument("--rebuild", action="store_true")
+    restater = commands.add_parser("status", help="Rewrite metadata-status.json from the recorded receipts")
+    restater.add_argument("--projects", nargs="*")
     reviser = commands.add_parser("revise-twenty", help="Copy twenty definitions with the current observer block")
     reviser.add_argument("--names", nargs="*", default=list(REVISE_TWENTY))
     reviser.add_argument("--dest", type=Path, help="Default: <out>/revised-twenty")
@@ -1437,6 +1471,8 @@ def main(argv=None):
         print(json.dumps(results, indent=2))
         if any(r["status"] != "built" for r in results.values()):
             sys.exit(1)
+    elif args.command == "status":
+        print(json.dumps(restatus(out, args.projects), indent=2))
     elif args.command == "revise-twenty":
         observer, observer_ref = observer_policy(args.observer_source)
         print(json.dumps(revise_definitions(args.twenty.resolve(), args.names,
