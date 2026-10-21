@@ -9,7 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from sag.agent.worktree_evidence import WorktreeEvidenceRecorder, probe_worktree
+from sag.agent.worktree_evidence import (
+    WorktreeEvidenceRecorder,
+    current_tracked_paths,
+    probe_worktree,
+    read_worktree_boundaries,
+)
 
 
 @pytest.fixture
@@ -214,3 +219,60 @@ def test_clone_callback_and_evidence_close_are_actual_lifecycle_boundaries(repos
     assert next(r for r in observed if r["boundary"] == "evidence_close")["untracked_paths"] == [
         "after-clone.txt"
     ]
+
+
+def _local_execute(command, **kwargs):
+    completed = subprocess.run(shlex.split(command), capture_output=True, check=False)
+    return {"exit_code": completed.returncode, "output": completed.stdout.decode()}
+
+
+def test_boundary_reader_returns_this_runs_verified_tracked_paths(repository, tmp_path):
+    root = str(repository)
+    recorder = WorktreeEvidenceRecorder(
+        tmp_path / "session", run_id="run-1", project_root=root, execute=_local_execute
+    )
+    owner = SimpleNamespace(worktree_evidence_recorder=recorder)
+    recorder.capture("acceptance_before", invocation_id="contract-1")
+    (repository / "tracked.txt").write_text("rewritten by the test suite\n")
+    recorder.capture("acceptance_after", invocation_id="contract-1", receipt_id="receipt-1")
+
+    rows = read_worktree_boundaries(owner, run_id="run-1", project_root=root)
+    before = rows[("acceptance_before", "contract-1")]
+    after = rows[("acceptance_after", "contract-1")]
+    assert before["tracked_paths"] == [] and after["tracked_paths"] == ["tracked.txt"]
+    assert after["receipt_id"] == "receipt-1"
+    assert before["head"] == after["head"] and len(after["head"]) == 40
+    assert current_tracked_paths(_local_execute, root) == ["tracked.txt"]
+    assert read_worktree_boundaries(owner, run_id="run-2", project_root=root) == {}
+    assert read_worktree_boundaries(SimpleNamespace(), run_id="run-1", project_root=root) == {}
+
+
+def test_boundary_reader_does_not_trust_altered_or_duplicate_records(repository, tmp_path):
+    root = str(repository)
+    recorder = WorktreeEvidenceRecorder(
+        tmp_path / "session", run_id="run-1", project_root=root, execute=_local_execute
+    )
+    owner = SimpleNamespace(worktree_evidence_recorder=recorder)
+    (repository / "tracked.txt").write_text("rewritten\n")
+    after = recorder.capture("acceptance_after", invocation_id="contract-1", receipt_id="r-1")
+    recorder.capture("acceptance_before", invocation_id="contract-2")
+    # Altered probe bytes no longer match the hash their record names.
+    stdout = tmp_path / "session" / after["probes"]["tracked"]["stdout"]["path"]
+    stdout.write_bytes(b"")
+    # A second record for one boundary leaves that boundary ambiguous.
+    second = WorktreeEvidenceRecorder(
+        tmp_path / "session", run_id="run-1", project_root=root, execute=_local_execute
+    )
+    second.capture("acceptance_before", invocation_id="contract-2")
+
+    rows = read_worktree_boundaries(owner, run_id="run-1", project_root=root)
+    assert rows[("acceptance_after", "contract-1")]["tracked_paths"] is None
+    assert rows[("acceptance_before", "contract-2")]["tracked_paths"] is None
+
+
+def test_current_tracked_paths_is_unknown_when_the_probe_cannot_run(repository):
+    def failed(*args, **kwargs):
+        return {"exit_code": -1, "dispatch_status": "timeout", "output": ""}
+
+    assert current_tracked_paths(failed, str(repository)) is None
+    assert current_tracked_paths(_local_execute, str(repository / "missing")) is None

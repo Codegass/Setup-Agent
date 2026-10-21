@@ -48,13 +48,47 @@ class ComparisonFS(ContainerFS):
     def __init__(self):
         super().__init__(markers={"pom.xml"})
         self.dirty = False
+        # Checkout-relative tracked paths that currently differ from HEAD.
+        # `dirty` alone stands for an unnamed edit to pom.xml.
+        self.tracked_changes = []
         self.files[ROOT + "/pom.xml"] = (
             "<project><modelVersion>4.0.0</modelVersion><artifactId>p</artifactId></project>"
         )
 
+    def tracked_now(self):
+        return sorted(set(self.tracked_changes) | ({"pom.xml"} if self.dirty else set()))
+
+    def _worktree_probe(self, command):
+        """Answer the worktree recorder's byte-preserving git probe program."""
+        import base64
+
+        _, _, _, root, probes = shlex.split(command)
+        out = {}
+        for name, args in json.loads(probes).items():
+            stdout = {
+                "head": (self.sha + "\n").encode(),
+                "tracked": b"".join(p.encode() + b"\0" for p in self.tracked_now()),
+                "untracked": b"",
+            }[name]
+            out[name] = {
+                "argv": ["git", "-C", root, *args],
+                "exit_code": 0,
+                "stdout": base64.b64encode(stdout).decode(),
+                "stderr": "",
+                "started_at": "2026-10-21T00:00:00+00:00",
+                "finished_at": "2026-10-21T00:00:01+00:00",
+            }
+        return {"success": True, "exit_code": 0, "output": json.dumps(out, sort_keys=True)}
+
     def execute_command(self, command, **kwargs):
+        if command.startswith("python3 -c ") and "base64,json,subprocess" in command:
+            return self._worktree_probe(command)
         if "diff --quiet HEAD --" in command:
-            return {"success": not self.dirty, "exit_code": 1 if self.dirty else 0, "output": ""}
+            paths = shlex.split(command.partition(" -- ")[2])
+            dirty = self.dirty or (
+                bool(set(paths) & set(self.tracked_changes)) if paths else bool(self.tracked_now())
+            )
+            return {"success": not dirty, "exit_code": 1 if dirty else 0, "output": ""}
         if command.startswith("realpath -e -- "):
             return {"success": True, "exit_code": 0, "output": shlex.split(command)[-1]}
         if "__SAG_GRAPH_FILE__" in command:

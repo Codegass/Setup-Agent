@@ -575,7 +575,157 @@ def test_source_edits_do_not_prove_the_fixed_software_revision(tmp_path):
     run = task_run(tmp_path, "mvn test")
     retain(run, dispatch(run, "mvn test"))
     run.fs.dirty = True
-    assert completion(run).reasons == ("task_source_changed_or_unverified",)
+    closed = completion(run)
+    assert closed.status == "unavailable" and closed.steps == ()
+    assert closed.reasons[0] == "task_source_changed_or_unverified"
+    assert "pom.xml" in closed.reasons[1]
+
+
+POLICY_FILES = ("src/test/resources/abac_policy.csv", "src/test/resources/rbac_policy.csv")
+
+
+def record_worktree(run, tmp_path):
+    """Attach the host recorder the agent attaches, probing this fake checkout."""
+    from sag.agent.worktree_evidence import WorktreeEvidenceRecorder
+
+    recorder = WorktreeEvidenceRecorder(
+        tmp_path / "session",
+        run_id=run.state.run_id,
+        project_root=ROOT,
+        execute=run.fs.execute_control_command,
+        task_definition=run.task.model_dump(mode="json"),
+    )
+    run.fs.worktree_evidence_recorder = recorder
+    return recorder
+
+
+def rewrite_during_next_invocation(monkeypatch, run, *paths):
+    """The next runner invocation rewrites these tracked files, as a test suite can."""
+    import test_ci_comparison as runner_module
+
+    original = runner_module.record_invocation
+
+    def rewrite_then_record(*args, **kwargs):
+        monkeypatch.setattr(runner_module, "record_invocation", original)
+        run.fs.tracked_changes.extend(paths)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "record_invocation", rewrite_then_record)
+
+
+def red_dispatch(run, command, *, suffix="red"):
+    params = {"command": command, "working_directory": ROOT}
+    domain = "test:" + ROOT
+    with action_context(
+        envelope_id="envelope-" + suffix,
+        intent_id="intent-" + suffix,
+        intent_domain_id=domain,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(domain_id=domain, tool="build", params=params),
+    ):
+        return BuildTool(run.fs, maven_tool=Runner(run.fs, exit_code=1)).execute(**params)
+
+
+def test_a_clean_tree_completes_without_recording_source_changes(tmp_path):
+    run = task_run(tmp_path, "mvn test")
+    record_worktree(run, tmp_path)
+    retain(run, dispatch(run, "mvn test"))
+    closed = completion(run)
+    assert closed.status == "complete"
+    assert closed.source_changes_by_task == ()
+    # Records without the new field keep their exact bytes.
+    assert "source_changes_by_task" not in closed.model_dump(mode="json")
+
+
+def test_tracked_files_the_required_command_rewrote_do_not_block_completion(tmp_path, monkeypatch):
+    run = task_run(tmp_path, "mvn test")
+    record_worktree(run, tmp_path)
+    rewrite_during_next_invocation(monkeypatch, run, *POLICY_FILES)
+    retain(run, dispatch(run, "mvn test"))
+    closed = completion(run)
+    assert closed.status == "complete", closed
+    assert closed.reasons == ()
+    assert closed.source_changes_by_task == POLICY_FILES
+    dumped = closed.model_dump(mode="json")
+    assert dumped["source_changes_by_task"] == list(POLICY_FILES)
+    assert TaskCompletionSnapshot.model_validate(dumped) == closed
+
+
+@pytest.mark.parametrize("edit", ["before_command", "after_command", "by_other_command"])
+def test_a_tracked_change_the_required_command_did_not_make_still_blocks_completion(
+    tmp_path, monkeypatch, edit
+):
+    run = task_run(tmp_path, "mvn test")
+    record_worktree(run, tmp_path)
+    agent_edit = "src/main/java/org/casbin/Enforcer.java"
+    if edit == "before_command":
+        run.fs.tracked_changes.append(agent_edit)
+    elif edit == "by_other_command":
+        rewrite_during_next_invocation(monkeypatch, run, agent_edit)
+        retain(run, dispatch(run, "mvn compile", suffix="1"))
+    rewrite_during_next_invocation(monkeypatch, run, POLICY_FILES[0])
+    retain(run, dispatch(run, "mvn test", suffix="2"))
+    if edit == "after_command":
+        run.fs.tracked_changes.append(agent_edit)
+    closed = completion(run)
+    assert closed.status == "unavailable" and closed.steps == ()
+    assert closed.reasons[0] == "task_source_changed_or_unverified"
+    assert agent_edit in closed.reasons[1]
+    assert POLICY_FILES[0] not in closed.reasons[1]
+
+
+@pytest.mark.parametrize("recorder", ["absent", "probe_failed"])
+def test_a_dirty_tree_without_boundary_snapshots_stays_unverified(tmp_path, monkeypatch, recorder):
+    run = task_run(tmp_path, "mvn test")
+    if recorder == "probe_failed":
+        record_worktree(run, tmp_path).execute = lambda *args, **kwargs: {
+            "exit_code": -1,
+            "dispatch_status": "timeout",
+            "output": "",
+        }
+    rewrite_during_next_invocation(monkeypatch, run, POLICY_FILES[0])
+    retain(run, dispatch(run, "mvn test"))
+    closed = completion(run)
+    assert closed.status == "unavailable" and closed.steps == ()
+    assert closed.reasons[0] == "task_source_changed_or_unverified"
+    assert POLICY_FILES[0] in closed.reasons[1]
+
+
+def test_a_change_first_written_by_the_second_required_command_completes(tmp_path, monkeypatch):
+    run = task_run(tmp_path, "mvn compile", "mvn test")
+    record_worktree(run, tmp_path)
+    retain(run, dispatch(run, "mvn compile", suffix="1"))
+    rewrite_during_next_invocation(monkeypatch, run, *POLICY_FILES)
+    retain(run, dispatch(run, "mvn test", suffix="2"))
+    closed = completion(run)
+    assert closed.status == "complete", closed
+    assert closed.source_changes_by_task == POLICY_FILES
+
+
+def test_a_retried_required_command_keeps_its_first_runs_rewrites_attributed(tmp_path, monkeypatch):
+    run = task_run(tmp_path, "mvn test")
+    record_worktree(run, tmp_path)
+    rewrite_during_next_invocation(monkeypatch, run, *POLICY_FILES)
+    retain(run, dispatch(run, "mvn test", suffix="1"))
+    retry = retain(run, dispatch(run, "mvn test", suffix="2"))
+    closed = completion(run)
+    assert closed.status == "complete", closed
+    assert closed.steps[0].receipt_id == retry.metadata["receipt_id"]
+    assert closed.source_changes_by_task == POLICY_FILES
+
+
+def test_a_failed_required_command_that_rewrote_a_tracked_file_reads_incomplete(
+    tmp_path, monkeypatch
+):
+    run = task_run(tmp_path, "mvn test")
+    record_worktree(run, tmp_path)
+    reference = "test-references/samples/solidColor.png"
+    rewrite_during_next_invocation(monkeypatch, run, reference)
+    retain(run, red_dispatch(run, "mvn test"))
+    closed = completion(run)
+    assert closed.status == "incomplete", closed
+    assert closed.steps[0].status == "failed"
+    assert closed.source_changes_by_task == (reference,)
 
 
 def test_unsupported_shell_scope_is_retained_instead_of_dropped(tmp_path):

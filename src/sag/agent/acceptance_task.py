@@ -247,6 +247,16 @@ class TaskCompletionSnapshot(BaseModel):
     status: Literal["complete", "incomplete", "unavailable"]
     steps: tuple[TaskStepResult, ...] = Field(default=(), max_length=32)
     reasons: tuple[str, ...] = ()
+    # Tracked files that differ from the task commit only because a required
+    # command rewrote them (a test suite regenerating its own fixtures, say).
+    source_changes_by_task: tuple[str, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _preserve_records_without_source_changes(self, handler):
+        data = handler(self)
+        if not self.source_changes_by_task:
+            data.pop("source_changes_by_task", None)
+        return data
 
     @model_validator(mode="after")
     def _completion_requires_every_step(self):
@@ -310,13 +320,23 @@ def build_task_completion(
         unchanged = execute(f"git -C {shlex.quote(project_root)} diff --quiet HEAD --") or {}
     except Exception:
         unchanged = {}
-    if type(unchanged.get("exit_code")) is not int or unchanged["exit_code"] != 0:
+    # 0: the tracked tree is the task commit. 1: tracked files differ, which
+    # the required commands' own boundary snapshots may still explain below.
+    tracked_differ = unchanged.get("exit_code")
+    if type(tracked_differ) is not int or tracked_differ not in (0, 1):
         return unavailable(TASK_SOURCE_CHANGED_OR_UNVERIFIED)
     receipts = validator._current_scoped_receipts(project_root)
     if receipts is None:
-        return unavailable(TASK_RECEIPT_PUBLICATION_UNAVAILABLE)
+        return unavailable(
+            TASK_SOURCE_CHANGED_OR_UNVERIFIED
+            if tracked_differ
+            else TASK_RECEIPT_PUBLICATION_UNAVAILABLE
+        )
 
     results = []
+    # Every retained invocation of a required command, retries included: the
+    # receipts whose boundary snapshots may explain a tracked change.
+    required_invocations = {}
     previous_sequence = -1
     remaining = Counter((step.runner, step.cwd, step.argv) for step in task.steps)
     retained_outputs = {}
@@ -371,6 +391,7 @@ def build_task_completion(
                 step.argv if tool == "bash" else step.argv[1:]
             ):
                 candidates.append(receipt)
+        required_invocations.update((receipt["receipt_id"], receipt) for receipt in candidates)
         key = (step.runner, step.cwd, step.argv)
         required_occurrences = remaining[key]
         remaining[key] -= 1
@@ -441,6 +462,31 @@ def build_task_completion(
                 reason=reason,
             )
         )
+    source_changes = ()
+    if tracked_differ:
+        from sag.agent.worktree_evidence import current_tracked_paths
+
+        changed = current_tracked_paths(execute, project_root)
+        unattributed = (
+            unattributed_source_changes(
+                orchestrator,
+                run_id=state.run_id,
+                project_root=project_root,
+                commit=task.sha,
+                changed=changed,
+                receipts=required_invocations.values(),
+            )
+            if changed
+            else ()
+        )
+        if not changed or unattributed:
+            return TaskCompletionSnapshot(
+                run_id=state.run_id,
+                task_sha256=expected,
+                status="unavailable",
+                reasons=(TASK_SOURCE_CHANGED_OR_UNVERIFIED, *_unattributed_detail(unattributed)),
+            )
+        source_changes = tuple(sorted(changed))
     status = (
         "complete"
         if all(item.status == "complete" for item in results)
@@ -455,6 +501,52 @@ def build_task_completion(
         task_sha256=expected,
         status=status,
         steps=tuple(results),
+        source_changes_by_task=source_changes,
+    )
+
+
+def unattributed_source_changes(orchestrator, *, run_id, project_root, commit, changed, receipts):
+    """Changed tracked paths that no required invocation was observed writing.
+
+    A path counts as written by a required command when that invocation's
+    boundary snapshot at receipt publication lists it and its snapshot taken
+    before dispatch does not. Both snapshots must be this run's, at the task
+    commit, with verified probe bytes, and the later one must name the receipt.
+    Snapshots record names only, so a later edit to a file the command
+    rewrote is not told apart from the command's own write.
+    """
+    from sag.agent.worktree_evidence import read_worktree_boundaries
+
+    snapshots = read_worktree_boundaries(orchestrator, run_id=run_id, project_root=project_root)
+    written = set()
+    for receipt in receipts:
+        invocation = receipt.get("contract_id")
+        before = snapshots.get(("acceptance_before", invocation))
+        after = snapshots.get(("acceptance_after", invocation))
+        if (
+            not invocation
+            or before is None
+            or after is None
+            or after.get("receipt_id") != receipt.get("receipt_id")
+            or before.get("head") != commit
+            or after.get("head") != commit
+            or before.get("tracked_paths") is None
+            or after.get("tracked_paths") is None
+        ):
+            continue
+        written.update(set(after["tracked_paths"]) - set(before["tracked_paths"]))
+    return tuple(sorted(set(changed) - written))
+
+
+def _unattributed_detail(paths, *, shown=10) -> tuple[str, ...]:
+    if not paths:
+        return ()
+    listed = ", ".join(paths[:shown])
+    if len(paths) > shown:
+        listed += f", and {len(paths) - shown} more"
+    return (
+        "Tracked files differ from the task commit and no required command was "
+        f"observed changing them: {listed}",
     )
 
 

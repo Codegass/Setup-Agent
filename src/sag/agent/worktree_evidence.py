@@ -71,6 +71,34 @@ def probe_worktree(project_root: str) -> dict[str, Any]:
     return result
 
 
+def _container_probes(
+    execute: Callable[..., Any], project_root: str, probes: Mapping[str, list[str]]
+) -> dict[str, Any]:
+    """Run the byte-preserving probe program through the control channel."""
+    command = shlex.join(
+        ["python3", "-c", _PROBE_PROGRAM, project_root, json.dumps(probes, sort_keys=True)]
+    )
+    result = execute(command, truncate_output=False, timeout=100)
+    if (
+        not isinstance(result, Mapping)
+        or result.get("success") is False
+        or type(result.get("exit_code")) is not int
+        or result["exit_code"] != 0
+        or result.get("dispatch_status")
+    ):
+        raise ValueError("worktree probe transport failed")
+    payload = json.loads(result.get("output", ""))
+    if not isinstance(payload, dict) or set(payload) != set(probes):
+        raise ValueError("worktree probe transport incomplete")
+    return payload
+
+
+def _nul_paths(raw: bytes) -> list[str]:
+    if raw and not raw.endswith(b"\x00"):
+        raise ValueError("incomplete NUL path listing")
+    return [p.decode("utf-8", errors="surrogateescape") for p in raw.split(b"\x00") if p]
+
+
 class WorktreeEvidenceRecorder:
     """Record immutable, run-bound observations outside the tested checkout."""
 
@@ -99,28 +127,7 @@ class WorktreeEvidenceRecorder:
     def _probe(self) -> Mapping[str, Any]:
         if self.execute is None:
             return probe_worktree(self.project_root)
-        command = shlex.join(
-            [
-                "python3",
-                "-c",
-                _PROBE_PROGRAM,
-                self.project_root,
-                json.dumps(_PROBES, sort_keys=True),
-            ]
-        )
-        result = self.execute(command, truncate_output=False, timeout=100)
-        if (
-            not isinstance(result, Mapping)
-            or result.get("success") is False
-            or type(result.get("exit_code")) is not int
-            or result["exit_code"] != 0
-            or result.get("dispatch_status")
-        ):
-            raise ValueError("worktree probe transport failed")
-        payload = json.loads(result.get("output", ""))
-        if not isinstance(payload, dict) or set(payload) != set(_PROBES):
-            raise ValueError("worktree probe transport incomplete")
-        return payload
+        return _container_probes(self.execute, self.project_root, _PROBES)
 
     def capture(
         self, boundary: str, *, invocation_id: str | None = None, receipt_id: str | None = None
@@ -201,13 +208,7 @@ class WorktreeEvidenceRecorder:
                                     raise ValueError("invalid HEAD")
                                 row["head"] = head
                             else:
-                                if raw and not raw.endswith(b"\x00"):
-                                    raise ValueError("incomplete NUL path listing")
-                                paths = [
-                                    p.decode("utf-8", errors="surrogateescape")
-                                    for p in raw.split(b"\x00")
-                                    if p
-                                ]
+                                paths = _nul_paths(raw)
                                 row[f"{name}_paths"] = paths
                                 if name == "tracked":
                                     row["tracked_clean"] = not paths
@@ -304,6 +305,107 @@ def record_receipt_worktree(source: Any, receipt: Mapping[str, Any]) -> None:
         except Exception as exc:
             _LOG.warning("Worktree acceptance-after could not be retained: %s", exc)
     _record_requirements(source, "after_receipt", receipt)
+
+
+def current_tracked_paths(execute: Callable[..., Any], project_root: str) -> list[str] | None:
+    """Tracked paths that differ from HEAD now, read as the snapshots read them.
+
+    The same git command and byte-preserving transport as a boundary snapshot,
+    so a path compares equal to its snapshot spelling. None when unknown.
+    """
+    try:
+        probe = _container_probes(execute, project_root, {"tracked": _PROBES["tracked"]})["tracked"]
+        if (
+            not isinstance(probe, Mapping)
+            or probe.get("argv") != ["git", "-C", project_root, *_PROBES["tracked"]]
+            or type(probe.get("exit_code")) is not int
+            or probe["exit_code"] != 0
+        ):
+            return None
+        return _nul_paths(base64.b64decode(probe["stdout"], validate=True))
+    except Exception:
+        return None
+
+
+def _verified_stdout(base: Path, project_root: str, name: str, probe: Any) -> bytes | None:
+    """A probe's stdout bytes, only when the record still binds them exactly."""
+    if (
+        not isinstance(probe, Mapping)
+        or probe.get("argv") != ["git", "-C", project_root, *_PROBES[name]]
+        or type(probe.get("exit_code")) is not int
+        or probe["exit_code"] != 0
+        or not isinstance(probe.get("stdout"), Mapping)
+    ):
+        return None
+    ref = probe["stdout"]
+    relative = ref.get("path")
+    if (
+        not isinstance(relative, str)
+        or Path(relative).is_absolute()
+        or ".." in Path(relative).parts
+    ):
+        return None
+    path = (base / relative).resolve()
+    if not path.is_relative_to(base) or not path.is_file():
+        return None
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != ref.get("sha256"):
+        return None
+    return data
+
+
+def read_worktree_boundaries(
+    source: Any, *, run_id: str, project_root: str
+) -> dict[tuple[str, str | None], dict[str, Any]]:
+    """This run's retained boundary records, keyed by (boundary, invocation_id).
+
+    Each value carries the HEAD and tracked paths re-read from the probe bytes
+    its record names. A record whose probe failed, or whose bytes no longer
+    match their hash, carries None for them; so does a boundary recorded twice,
+    because two observations of one boundary say nothing certain about it.
+    An absent recorder is an empty reading, never a clean one.
+    """
+    recorder = getattr(source, "worktree_evidence_recorder", None)
+    if not isinstance(recorder, WorktreeEvidenceRecorder):
+        recorder = _recorder(source)
+    if recorder is None or recorder.run_id != run_id or recorder.project_root != project_root:
+        return {}
+    base = recorder.directory.parent
+    rows: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for record in sorted(recorder.directory.glob("*.json")):
+        try:
+            row = json.loads(record.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if (
+            not isinstance(row, dict)
+            or row.get("run_id") != run_id
+            or row.get("project_root") != project_root
+            or row.get("boundary") not in _BOUNDARIES
+        ):
+            continue
+        key = (row["boundary"], row.get("invocation_id"))
+        view: dict[str, Any] = {
+            "boundary": row["boundary"],
+            "invocation_id": row.get("invocation_id"),
+            "receipt_id": row.get("receipt_id"),
+            "head": None,
+            "tracked_paths": None,
+        }
+        probes = row.get("probes") if isinstance(row.get("probes"), Mapping) else {}
+        try:
+            head = _verified_stdout(base, project_root, "head", probes.get("head"))
+            tracked = _verified_stdout(base, project_root, "tracked", probes.get("tracked"))
+            if head is not None and tracked is not None:
+                text = head.decode("ascii").strip()
+                if len(text) == 40 and all(c in "0123456789abcdef" for c in text):
+                    view.update(head=text, tracked_paths=_nul_paths(tracked))
+        except (OSError, ValueError, UnicodeError):
+            pass
+        if key in rows:
+            view.update(head=None, tracked_paths=None)
+        rows[key] = view
+    return rows
 
 
 def _record_requirements(source: Any, method: str, payload: Mapping[str, Any]) -> None:
