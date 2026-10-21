@@ -135,6 +135,9 @@ class Config(BaseModel):
     advisor_read_max_chars: int = Field(default=12000, ge=256, le=100000)
     compact_setup_prompt: bool = False
     reuse_verified_test_phase: bool = False
+    # The harness checks out the pinned commit and installs the pinned JDK and
+    # Maven before the first provision-phase model turn when a task is bound.
+    provision_from_task: bool = True
     export_runtime_handoff: bool = False
     # Opt-in M1 candidate. Keep the legacy interface for a one-factor ablation.
     phase_context_policy: Literal["legacy", "retained", "facts", "relevant"] = "legacy"
@@ -231,6 +234,7 @@ class Config(BaseModel):
             phase_handoff_char_budget=int(os.getenv("SAG_PHASE_HANDOFF_CHAR_BUDGET", "6000")),
             reuse_verified_test_phase=os.getenv("SAG_REUSE_VERIFIED_TEST_PHASE", "false").lower()
             == "true",
+            provision_from_task=os.getenv("SAG_PROVISION_FROM_TASK", "true").lower() == "true",
             advisor_summary_context_window=os.getenv("SAG_ADVISOR_SUMMARY_CONTEXT_WINDOW") or None,
             advisor_phase_cap=int(os.getenv("SAG_ADVISOR_PHASE_CAP", "4")),
             build_coverage_threshold=float(

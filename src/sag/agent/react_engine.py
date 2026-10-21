@@ -160,6 +160,15 @@ from .stall_diagnostics import (
     control_stalled_job,
     probe_job_progress,
 )
+from .task_provisioning import (
+    PROVISIONED_CLOSING_LINE,
+    ProvisionAction,
+    assess_provision_result,
+    checkout_path,
+    failed_by_exception_line,
+    plan_task_provision,
+    provision_key_results,
+)
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
     ActualToolExecution,
@@ -3075,6 +3084,14 @@ class ReActEngine:
             inventory_guidance = self._document_inventory_guidance()
             if inventory_guidance:
                 lines.extend(["", inventory_guidance])
+        if phase == "provision":
+            # What the harness already did from the pinned task, right under
+            # the objective. Every line starts with "Provisioned: ", which the
+            # bounded contract keeps whole. Empty until the harness has acted.
+            provisioned = list(getattr(self, "_provisioned_lines", None) or ())
+            if provisioned:
+                anchor = lines.index(f"Objective: {objective}") + 1
+                lines[anchor:anchor] = provisioned
         if phase == "report":
             # The departures the objective refers to, read from the record and
             # placed right under it. Every line starts with "Departure", which
@@ -3182,7 +3199,7 @@ class ReActEngine:
         # The ref is only known after storing the omitted lines, so reserve room
         # for the widest possible count and a store_output-sized ref id.
         reserved_footer = footer_template.format(count=len(candidates), ref="output_" + "x" * 12)
-        important = ("=== PHASE:", "Objective:", "Budget:", "Task ", "Required task", "Runtime observed:", "Receipt source:", "Survey:", "Departure")
+        important = ("=== PHASE:", "Objective:", "Budget:", "Task ", "Required task", "Runtime observed:", "Receipt source:", "Survey:", "Departure", "Provisioned: ")
         ordered = sorted(candidates, key=lambda pair: (not pair[1].startswith(important), pair[0]))
         selected = []
         used = len(reserved_footer)
@@ -4634,6 +4651,12 @@ class ReActEngine:
                     return False
 
                 if phase_entry_advisor_pending:
+                    # The pinned task names the checkout and the toolchain:
+                    # the harness makes those calls before the first provision
+                    # turn, and a close it can grade needs no model turn.
+                    if self._provision_from_task():
+                        phase_entry_advisor_pending = False
+                        continue
                     if self._reuse_verified_test_phase():
                         phase_entry_advisor_pending = False
                         continue
@@ -5003,9 +5026,6 @@ class ReActEngine:
 
     def _write_green_report(self, reason: str) -> None:
         """One controller `report` call, recorded like any dispatched call."""
-        machine = self.phase_machine
-        turn_started = self._turn_stamp()
-        branch_task_id = getattr(getattr(self, "context_manager", None), "current_task_id", None)
         tool, params = self._canonicalize_tool_action(
             "report",
             {
@@ -5015,6 +5035,38 @@ class ReActEngine:
                 "details": reason,
             },
         )
+        self._green_report_counter = int(getattr(self, "_green_report_counter", 0)) + 1
+        self._dispatch_controller_action(
+            tool,
+            params,
+            intent_label="green_report",
+            call_id=f"harness-report-{self._green_report_counter}",
+            action_text=self._GREEN_REPORT_ACTION_TEXT,
+            native_text=self._GREEN_REPORT_NATIVE_TEXT,
+        )
+
+    def _dispatch_controller_action(
+        self,
+        tool: str,
+        params: Dict[str, Any],
+        *,
+        intent_label: str,
+        call_id: str,
+        action_text: str,
+        native_text: str,
+    ) -> ToolResult:
+        """One controller call, recorded like any dispatched call.
+
+        The call takes the path a model call takes — the intent-minting
+        boundary, `_record_tool_execution`, the envelope and its result, the
+        paired observation, the phase history — under a controller intent, and
+        seals a controller turn. A call refused before dispatch raises, leaving
+        an unanswered ACTION step for the caller to take back out of the
+        window. Returns the recorded result.
+        """
+        machine = self.phase_machine
+        turn_started = self._turn_stamp()
+        branch_task_id = getattr(getattr(self, "context_manager", None), "current_task_id", None)
         intent = EngineActionIntentFactory.for_controller().from_submission(
             {
                 "domain_id": self._action_domain_id(params),
@@ -5022,30 +5074,28 @@ class ReActEngine:
                 "params": params,
                 "next_action_kind": str(params.get("action") or tool),
             },
-            tool_call_id=f"controller:{machine.current_attempt_id}:green_report",
+            tool_call_id=f"controller:{machine.current_attempt_id}:{intent_label}",
             predecessor_contract_id=getattr(self, "_last_invocation_contract_id", None),
         )
         call = ToolCall(
             name=tool,
             raw_params=dict(params),
-            raw_action_text=self._GREEN_REPORT_ACTION_TEXT,
+            raw_action_text=action_text,
             source_step_index=getattr(self, "current_iteration", 0),
             model_used="harness",
             action_intent=intent,
         )
-        self._green_report_counter = int(getattr(self, "_green_report_counter", 0)) + 1
-        call_id = f"harness-report-{self._green_report_counter}"
         # The ACTION step goes first: the envelope keys off the newest ACTION
         # identity, exactly as for a model-issued call.
         step = ReActStep(
             step_type=StepType.ACTION,
-            content=self._GREEN_REPORT_ACTION_TEXT,
+            content=action_text,
             tool_name=tool,
             tool_params=dict(params),
             timestamp=self._get_timestamp(),
             model_used="harness",
             tool_call_id=call_id,
-            native_text=self._GREEN_REPORT_NATIVE_TEXT,
+            native_text=native_text,
         )
         self.steps.append(step)
         previous_call_id = getattr(self, "_active_native_tool_call_id", None)
@@ -5054,7 +5104,7 @@ class ReActEngine:
             execution = self._execute_tool_call(call)
             if not execution.attempted_execution:
                 raise RuntimeError(
-                    "the report call was refused before dispatch: "
+                    f"the {tool} call was refused before dispatch: "
                     f"{execution.result.error or execution.result.error_code}"
                 )
             result, execution_id, actual_executions = self._record_execution_bundle(
@@ -5102,6 +5152,162 @@ class ReActEngine:
             iteration=getattr(self, "current_iteration", None),
             tool=tool,
         )
+        return result
+
+    # The harness's own provisioning from the pinned task (2026-10-21). The
+    # task names the repository, the commit, the launcher JDK major and the
+    # Maven version; checking out a commit and installing a runtime execute no
+    # project build or test, so the harness makes those calls itself.
+    _PROVISION_ACTION_TEXT = "HARNESS PROVISION: {label}, from the pinned task"
+    _PROVISION_NATIVE_TEXT = "[harness] provisioning what the pinned task names"
+
+    def _bound_acceptance_task(self):
+        """The pinned task bound to this run, or None."""
+        from .acceptance_task import AcceptanceTask
+
+        orchestrator = getattr(self, "orchestrator", None) or getattr(
+            getattr(self, "context_manager", None), "orchestrator", None
+        )
+        task = getattr(orchestrator, "acceptance_task", None)
+        return task if isinstance(task, AcceptanceTask) else None
+
+    def _provision_from_task(self) -> bool:
+        """Check out the pinned commit and install the pinned toolchain, at loop start.
+
+        Without effect unless `provision_from_task` is on, the first provision
+        attempt is open, a pinned task is bound, the `project` tool is
+        registered and the harness has not attempted this in the run (a
+        one-shot latch). Each call is a controller action, recorded like the
+        harness report call. When the checkout resolved to the pinned commit,
+        every pinned toolchain item installed and the task pins a JDK, the
+        phase closes through the gate and the transition policy with no model
+        turn. Otherwise the provision brief gains one `Provisioned: ` line per
+        call, right under the objective, and the model turn proceeds.
+
+        On an exception the window is put back as it was and the model turn
+        proceeds; a call that ran stays on the record, and the brief lists
+        every call made, the one that raised included. Returns whether the
+        phase was closed.
+        """
+        if not getattr(getattr(self, "config", None), "provision_from_task", True):
+            return False
+        machine = getattr(self, "phase_machine", None)
+        if (
+            machine is None
+            or machine.is_complete
+            or machine.current_phase != "provision"
+            # A closed attempt on record means this run has provisioned before.
+            or machine.records
+            or getattr(self, "_provision_from_task_attempted", False)
+            or "project" not in (getattr(self, "tools", None) or {})
+        ):
+            return False
+        task = self._bound_acceptance_task()
+        if task is None:
+            return False
+        self._provision_from_task_attempted = True
+        plan = plan_task_provision(task)
+        saved_steps = list(self.steps)
+        lines: List[str] = []
+        landed: List[tuple[ProvisionAction, ToolResult]] = []
+        all_ok = True
+        for action in plan.actions:
+            try:
+                tool, params = self._canonicalize_tool_action("project", dict(action.params))
+                self._provision_counter = int(getattr(self, "_provision_counter", 0)) + 1
+                result = self._dispatch_controller_action(
+                    tool,
+                    params,
+                    intent_label=f"provision_{action.kind}",
+                    call_id=f"harness-provision-{self._provision_counter}",
+                    action_text=self._PROVISION_ACTION_TEXT.format(label=action.label),
+                    native_text=self._PROVISION_NATIVE_TEXT,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Harness provisioning stopped at {action.label}; the agent continues: {exc}"
+                )
+                self.steps = saved_steps
+                lines.append(failed_by_exception_line(action, exc))
+                self._show_provisioned_lines([*lines, *plan.notes, PROVISIONED_CLOSING_LINE])
+                return False
+            ok, line = assess_provision_result(action, result)
+            lines.append(line)
+            all_ok = all_ok and ok
+            if ok:
+                landed.append((action, result))
+        if all_ok and plan.closable and self._close_provision_from_task(task, landed):
+            return True
+        self._show_provisioned_lines([*lines, *plan.notes, PROVISIONED_CLOSING_LINE])
+        return False
+
+    def _show_provisioned_lines(self, lines: List[str]) -> None:
+        """Rebuild the provision brief with what the harness already did.
+
+        A brief that cannot be rebuilt leaves the one in the window; the calls
+        and their results are still answered there and on the record.
+        """
+        self._provisioned_lines = list(lines)
+        try:
+            intro = self._phase_intro_step()
+        except Exception as exc:
+            logger.warning(f"Provision brief not rebuilt with the harness's lines: {exc}")
+            return
+        if self.steps and self.steps[0].step_type == StepType.SYSTEM_GUIDANCE:
+            self.steps[0] = intro
+        else:
+            self.steps.insert(0, intro)
+        self._journal_intro_dirty = True
+
+    def _close_provision_from_task(
+        self,
+        task,
+        landed: List[tuple[ProvisionAction, ToolResult]],
+    ) -> bool:
+        """Close provision on the harness's own claim, through the ordinary gate and policy."""
+        machine = self.phase_machine
+        state = getattr(self, "run_evidence_state", None)
+        checkout = next(result for action, result in landed if action.kind == "checkout")
+        path = checkout_path(checkout)
+        refs = [result.output_ref for _action, result in landed]
+        claim = PhaseClaim(
+            phase="provision",
+            signal="done",
+            claimed_outcome=PhaseOutcome.SUCCESS,
+            key_results=provision_key_results(
+                task,
+                path,
+                [action.label for action, _result in landed if action.kind != "checkout"],
+            ),
+            evidence_refs=tuple(self._dedupe_strings([*refs, path])),
+        )
+        try:
+            gate = check_phase_claim(
+                "provision",
+                claim,
+                getattr(self, "physical_validator", None),
+                getattr(self, "orchestrator", None),
+                self._project_name_for_gate(),
+                sealed=bool(getattr(state, "sealed", False)),
+                disclosed_job_ids=sorted(self._disclosed_live_jobs()),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Harness provision close could not be graded; the agent closes it: {exc}"
+            )
+            return False
+        if not gate.accepted or gate.validator_state is not ValidatorState.GREEN:
+            logger.info(f"Harness provision close not accepted; the agent closes it: {gate.reason}")
+            return False
+        self._seal_engine_gate(claim, gate)
+        # The transition policy reads `provision.workspace_ready` from the run
+        # state, exactly as it does after a model-issued close.
+        self._record_gate_facts("provision", gate)
+        record = machine.close_attempt(gate)
+        policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
+        decision = policy.decide(record, state=state, budgets=self._repair_budgets())
+        self._apply_phase_decision(record, decision)
+        return True
 
     def _deliver_runtime_handoff(self) -> None:
         if not getattr(self.config, "export_runtime_handoff", False):
