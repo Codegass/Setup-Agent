@@ -50,8 +50,10 @@ from sag.agent.invocation_contracts import (
     CONTRACT_DIR,
     CONTRACT_MAX_RAW_BYTES,
     CONTRACT_PERSIST_FAILED,
+    CONTRACT_REJECTED,
     CONTRACT_SCHEMA_VERSION,
     ActionContext,
+    ContractRejected,
     action_context,
     authorized_facade_envelope_id,
 )
@@ -75,7 +77,7 @@ from sag.agent.invocation_contracts import (
 )
 from sag.agent.invocation_receipts import RECEIPT_DIR, RECEIPT_HEREDOC, record_invocation
 from sag.tools.base import ToolResult
-from sag.tools.build.build_tool import BuildTool
+from sag.tools.build.build_tool import INVALID_WORKING_DIRECTORY, BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
 DISPATCH = "<<runner dispatch>>"
@@ -730,9 +732,9 @@ def test_oversized_exact_call_is_refused_before_contract_persistence():
     orchestrator = RecordingOrchestrator()
     args = dict(FREEZE_ARGS, params={"action": "test", "args": "x" * 200_000})
 
-    contract = freeze_contract(orchestrator.execute_command, **args)
+    with pytest.raises(ContractRejected, match="exceeds its length limit"):
+        freeze_contract(orchestrator.execute_command, **args)
 
-    assert contract is None
     assert contracts_written(orchestrator.commands) == []
 
 
@@ -964,11 +966,22 @@ def test_freeze_contract_returns_none_when_the_container_is_gone():
 
 
 def test_freeze_contract_refuses_a_call_the_canonical_form_cannot_hold():
-    """An uncommittable call is not dispatched: the freeze fails closed."""
+    """An uncommittable call is not dispatched: the freeze fails closed, and
+    says why, instead of looking like a contract that did not reach disk."""
     orchestrator = RecordingOrchestrator()
     args = dict(FREEZE_ARGS, params={"action": "test", "sink": object()})
 
-    assert freeze_contract(orchestrator.execute_command, **args) is None
+    with pytest.raises(ContractRejected):
+        freeze_contract(orchestrator.execute_command, **args)
+    assert contracts_written(orchestrator.commands) == []
+
+
+def test_freeze_contract_names_the_rule_a_non_canonical_cwd_breaks():
+    orchestrator = RecordingOrchestrator()
+    args = dict(FREEZE_ARGS, expected_cwd="/workspace/proj/core/.")
+
+    with pytest.raises(ContractRejected, match="expected_cwd must be an absolute canonical path"):
+        freeze_contract(orchestrator.execute_command, **args)
     assert contracts_written(orchestrator.commands) == []
 
 
@@ -1489,3 +1502,153 @@ def test_forced_test_attempt_runs_under_a_controller_scope(forced_engine):
     assert context.action_fingerprint and context.action_fingerprint.startswith("act-")
     assert context.repair_context_id is None
     assert current_action_context().envelope_id is None
+
+
+# ---------------------------------------------------------------------------
+# working_directory: one canonical path, or a typed refusal that says why
+# ---------------------------------------------------------------------------
+
+
+def _engine_params(tool, params):
+    """The engine's own normalization, applied before an ActionIntent exists."""
+    from sag.agent.tool_parameters import ToolParameterNormalizer
+
+    fixes = []
+    normalized = ToolParameterNormalizer(
+        tools={tool.name: tool}, successful_states={}, repository_url=None
+    ).validate_and_fix(tool.name, params, fixes)
+    return normalized, fixes
+
+
+def _engine_context(envelope_id, tool_name, params):
+    domain = f"test:{params.get('working_directory')}"
+    return action_context(
+        envelope_id=envelope_id,
+        intent_source="model",
+        intent_id=f"intent-{envelope_id}",
+        intent_domain_id=domain,
+        intent_exact_params=params,
+        action_fingerprint=compute_action_fingerprint(
+            domain_id=domain, tool=tool_name, params=params
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "submitted", ["/workspace/proj/.", "/workspace/proj/", "/workspace/proj/core/.."]
+)
+def test_a_non_canonical_working_directory_dispatches_from_its_canonical_path(submitted):
+    tool, orchestrator, backends = _build_tool({"pom.xml"})
+    params, fixes = _engine_params(tool, {"action": "test", "working_directory": submitted})
+
+    assert params["working_directory"] == "/workspace/proj"
+    assert [
+        (fix.before, fix.after, fix.source) for fix in fixes if fix.field == "working_directory"
+    ] == [(submitted, "/workspace/proj", "safety_fix")]
+    with _engine_context("envelope-canonical-cwd", "build", params):
+        result = tool.execute(**params)
+
+    assert result.error_code != CONTRACT_PERSIST_FAILED, result.output
+    (contract,) = contracts_written(orchestrator.commands)
+    assert contract["expected_cwd"] == "/workspace/proj"
+    assert contract["requested_call"]["params"]["working_directory"] == "/workspace/proj"
+    (call,) = backends["maven_tool"].calls
+    assert call["working_directory"] == "/workspace/proj"
+
+
+def test_a_shell_runner_command_dispatches_from_its_canonical_path(monkeypatch):
+    from sag.tools.bash import BashTool
+
+    tool, orchestrator, backends = _build_tool({"pom.xml"})
+    bash = BashTool(orchestrator, build_tool=tool)
+    monkeypatch.setattr(bash, "_working_directory_available", lambda _: (True, ""))
+    params, _ = _engine_params(
+        bash, {"command": "mvn -B verify", "working_directory": "/workspace/proj/."}
+    )
+
+    assert params["working_directory"] == "/workspace/proj"
+    with _engine_context("envelope-shell-cwd", "bash", params):
+        bash.execute(**params)
+
+    (contract,) = contracts_written(orchestrator.commands)
+    assert contract["expected_cwd"] == "/workspace/proj"
+    assert backends["maven_tool"].calls[0]["working_directory"] == "/workspace/proj"
+
+
+@pytest.mark.parametrize(
+    "submitted", ["../x", "proj", "", "/tmp/proj", "/workspace/../etc", "/workspacex"]
+)
+def test_a_working_directory_outside_the_workspace_is_refused_before_any_contract(submitted):
+    tool, orchestrator, backends = _build_tool({"pom.xml"})
+    params, _ = _engine_params(tool, {"action": "test", "working_directory": submitted})
+    assert params["working_directory"] == submitted  # refused as given, not rewritten
+
+    with _engine_context("envelope-outside-cwd", "build", params):
+        result = tool.execute(**params)
+
+    message = (
+        "working_directory must be an absolute path under /workspace, such as "
+        f"/workspace/<project>; got '{submitted}'"
+    )
+    assert result.error_code == INVALID_WORKING_DIRECTORY
+    assert result.error == message
+    assert message in result.output
+    assert result.metadata["runner_dispatched"] is False
+    assert contracts_written(orchestrator.commands) == []
+    assert backends["maven_tool"].calls == [] and DISPATCH not in orchestrator.commands
+
+
+def test_a_non_canonical_working_directory_that_skipped_normalization_names_its_canonical_form():
+    tool, orchestrator, backends = _build_tool({"pom.xml"})
+
+    with build_action_context(
+        "envelope-raw-cwd", action="test", working_directory="/workspace/proj/."
+    ):
+        result = tool.execute(action="test", working_directory="/workspace/proj/.")
+
+    assert result.error_code == INVALID_WORKING_DIRECTORY
+    assert result.error == (
+        "working_directory must be a canonical absolute path under /workspace, such as "
+        "/workspace/proj; got '/workspace/proj/.'"
+    )
+    assert contracts_written(orchestrator.commands) == []
+    assert backends["maven_tool"].calls == []
+
+
+def test_a_contract_the_validator_rejects_is_reported_as_rejected_not_unpersisted(monkeypatch):
+    import sag.agent.invocation_contracts as contracts
+
+    reason = "invocation contract expected_cwd must be an absolute canonical path"
+
+    def rejecting(**kwargs):
+        raise ValueError(reason)
+
+    monkeypatch.setattr(contracts, "build_contract", rejecting)
+    tool, orchestrator, backends = _build_tool({"pom.xml"})
+
+    with build_action_context(
+        "envelope-rejected", action="test", working_directory="/workspace/proj"
+    ):
+        result = tool.execute(action="test", working_directory="/workspace/proj")
+
+    assert result.error_code == CONTRACT_REJECTED
+    assert result.error == f"CONTRACT_REJECTED: {reason}"
+    assert f"CONTRACT_REJECTED: {reason}" in result.output
+    assert "did not reach disk" not in result.output
+    assert "could not be persisted" not in result.output
+    assert result.metadata["runner_dispatched"] is False
+    assert backends["maven_tool"].calls == [] and DISPATCH not in orchestrator.commands
+    assert contracts_written(orchestrator.commands) == []
+    (assessment,) = assessments_written(orchestrator.commands)
+    assert assessment["stage"] == "materialization"
+    assert assessment["typed_code"] == CONTRACT_REJECTED
+    assert f"CONTRACT_REJECTED: {reason}" in assessment["detail"]
+    assert assessment["event_or_intent_id"] == "envelope-rejected"
+
+
+def test_engine_and_replay_read_a_rejected_contract_as_a_pre_dispatch_refusal():
+    from sag.agent.react_engine import _REPAIR_PREDISPATCH_REFUSAL_CODES as engine_codes
+    from sag.agent.replay import _REPAIR_PREDISPATCH_REFUSAL_CODES as replay_codes
+
+    for codes in (engine_codes, replay_codes):
+        assert {CONTRACT_PERSIST_FAILED, CONTRACT_REJECTED} <= set(codes)

@@ -74,6 +74,7 @@ from .history_state import history_entry_kind_for_tool
 from .invocation_contracts import (
     CONTRACT_AUTHORITY_MISSING,
     CONTRACT_PERSIST_FAILED,
+    CONTRACT_REJECTED,
     action_context,
     clear_action_context,
     set_action_context,
@@ -223,6 +224,7 @@ _REPAIR_PREDISPATCH_REFUSAL_CODES = frozenset(
         "ACTION_PARAMS_UNRECORDABLE",
         CONTRACT_AUTHORITY_MISSING,
         CONTRACT_PERSIST_FAILED,
+        CONTRACT_REJECTED,
         "REPAIR_ACTION_AFFORDANCE_MISMATCH",
         "REPAIR_CONTEXT_NOT_ACTIVE",
         "REPAIR_INTENT_DOMAIN_MISMATCH",
@@ -8482,6 +8484,7 @@ class ReActEngine:
             "ACTION_PARAMS_UNRECORDABLE",
             CONTRACT_AUTHORITY_MISSING,
             "CONTRACT_PERSIST_FAILED",
+            CONTRACT_REJECTED,
             "REPAIR_CONTEXT_NOT_ACTIVE",
             "REPAIR_INTENT_DOMAIN_MISMATCH",
             "REPAIR_INTENT_INVALID_REFS",

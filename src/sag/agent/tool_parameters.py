@@ -2,14 +2,17 @@
 
 The normalizer is deliberately not a repair engine.  It may translate a
 retired public spelling into its current spelling, rename an unambiguous field
-alias, coerce a JSON value to the declared schema type, or apply an explicit
-schema default.  It must never choose an action, working directory, module,
-version, command-line flag, retry, or fallback from runtime state.
+alias, coerce a JSON value to the declared schema type, apply an explicit
+schema default, or write an absolute workspace working directory in canonical
+form (`/workspace/x/.` and `/workspace/x/` are `/workspace/x`).  It must never
+choose an action, working directory, module, version, command-line flag,
+retry, or fallback from runtime state.
 """
 
 from __future__ import annotations
 
 import json
+import posixpath
 from collections.abc import Callable, Mapping
 from typing import Any, Dict, Optional
 
@@ -30,6 +33,11 @@ _MAVEN_COMMAND_TO_BUILD_ACTION = {
     "verify": "test",
 }
 _BUILD_ACTIONS = frozenset({"deps", "compile", "test", "package", "install"})
+_WORKSPACE_ROOT = "/workspace"
+# Tools whose working_directory becomes a frozen contract's expected_cwd (Bash
+# reaches the build facade for runner commands). Contracts accept only the
+# canonical spelling, so it is fixed here, before the ActionIntent exists.
+_CANONICAL_WORKING_DIRECTORY_TOOLS = frozenset({"build", "bash"})
 
 
 def _string_sequence(value: Any) -> str:
@@ -402,6 +410,9 @@ class ToolParameterNormalizer:
                         source="safety_fix",
                     )
 
+        if tool_name in _CANONICAL_WORKING_DIRECTORY_TOOLS:
+            self._canonicalize_working_directory(normalized, fixes)
+
         missing = [
             name
             for name in required
@@ -427,6 +438,34 @@ class ToolParameterNormalizer:
                     f"expected one of {list(allowed)!r}"
                 )
         return normalized
+
+    def _canonicalize_working_directory(
+        self,
+        normalized: Dict[str, Any],
+        fixes: list[ParameterFix],
+    ) -> None:
+        """Spell an absolute workspace directory canonically; never relocate it.
+
+        A relative path, or one whose canonical form leaves /workspace, stays
+        exactly as submitted so the tool refuses it in the caller's own words.
+        """
+
+        value = normalized.get("working_directory")
+        if not isinstance(value, str) or not value.startswith("/"):
+            return
+        canonical = posixpath.normpath(value)
+        if canonical != _WORKSPACE_ROOT and not canonical.startswith(_WORKSPACE_ROOT + "/"):
+            return
+        if canonical != value:
+            normalized["working_directory"] = canonical
+            self._add_parameter_fix(
+                fixes,
+                field="working_directory",
+                before=value,
+                after=canonical,
+                reason="Wrote working_directory in canonical form (the same directory)",
+                source="safety_fix",
+            )
 
     def _materialize_schema_defaults(
         self,

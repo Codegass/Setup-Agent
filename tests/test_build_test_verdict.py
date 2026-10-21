@@ -1746,9 +1746,11 @@ def test_compile_and_package_pass_fail_at_end_for_whole_reactor(
 ):
     for action in ("compile", "package"):
         maven, gradle = FakeBackendTool(), FakeBackendTool()
-        _isolated_tool({"pom.xml"}, maven=maven).execute(action=action, working_directory="/w")
+        _isolated_tool({"pom.xml"}, maven=maven).execute(
+            action=action, working_directory="/workspace/w"
+        )
         _isolated_tool({"build.gradle"}, gradle=gradle).execute(
-            action=action, working_directory="/w"
+            action=action, working_directory="/workspace/w"
         )
         assert maven.calls[0].get("fail_at_end") is True, action
         assert gradle.calls[0].get("fail_at_end") is True, action
@@ -1756,7 +1758,9 @@ def test_compile_and_package_pass_fail_at_end_for_whole_reactor(
 
 def test_deps_does_not_pass_fail_at_end(exact_build_facade_authority):
     maven = FakeBackendTool()
-    _isolated_tool({"pom.xml"}, maven=maven).execute(action="deps", working_directory="/w")
+    _isolated_tool({"pom.xml"}, maven=maven).execute(
+        action="deps", working_directory="/workspace/w"
+    )
     assert "fail_at_end" not in maven.calls[0]
 
 

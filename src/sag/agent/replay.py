@@ -445,6 +445,7 @@ _REPAIR_PREDISPATCH_REFUSAL_CODES = frozenset(
         "ACTION_ENVELOPE_PERSIST_FAILED",
         "ACTION_PARAMS_UNRECORDABLE",
         "CONTRACT_PERSIST_FAILED",
+        "CONTRACT_REJECTED",
         "CONTRACT_AUTHORITY_MISSING",
         "REPAIR_ACTION_AFFORDANCE_MISMATCH",
         "REPAIR_CONTEXT_NOT_ACTIVE",
@@ -1762,7 +1763,8 @@ class ControlReplayRunner:
                         loop_memory.observe_material_action(
                             action_fingerprint,
                             schema_valid=True,
-                            passed_freeze=result.error_code != "CONTRACT_PERSIST_FAILED",
+                            passed_freeze=result.error_code
+                            not in {"CONTRACT_PERSIST_FAILED", "CONTRACT_REJECTED"},
                             dispatched=(result_metadata.get("runner_dispatched") is not False),
                         )
                         if payload.get("output_sha256") and (

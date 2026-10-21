@@ -25,6 +25,8 @@ from sag.agent.invocation_contracts import (
     CONTRACT_AUTHORITY_MISSING,
     CONTRACT_DIR,
     CONTRACT_PERSIST_FAILED,
+    CONTRACT_REJECTED,
+    ContractRejected,
     authorized_facade_envelope_id,
     current_action_context,
     dispatch_contract,
@@ -110,8 +112,49 @@ _EDGE_REFUSALS = {
 }
 RUNTIME_REQUIREMENT_STATE_UNAVAILABLE = "java_runtime_requirement_state_unavailable"
 BUILD_PARAMETER_INVALID = "BUILD_PARAMETER_INVALID"
+INVALID_WORKING_DIRECTORY = "INVALID_WORKING_DIRECTORY"
 BUILD_REQUIREMENTS_UNAVAILABLE = "BUILD_REQUIREMENTS_UNAVAILABLE"
 BUILD_TEST_SYSTEM_CONFLICT = "BUILD_TEST_SYSTEM_CONFLICT"
+
+
+WORKSPACE_ROOT = "/workspace"
+
+
+def working_directory_problem(value: Any) -> Optional[str]:
+    """Why a submitted working_directory cannot be dispatched; None when it can.
+
+    The engine writes an absolute workspace path in canonical form before the
+    ActionIntent is minted, so a non-canonical one here skipped that step and
+    is named with its canonical form instead of being rewritten under the
+    intent that froze it.
+    """
+    if isinstance(value, str) and value.startswith("/") and "\x00" not in value:
+        canonical = posixpath.normpath(value)
+        if canonical == WORKSPACE_ROOT or canonical.startswith(WORKSPACE_ROOT + "/"):
+            if canonical == value:
+                return None
+            return (
+                "working_directory must be a canonical absolute path under /workspace, "
+                f"such as {canonical}; got {value!r}"
+            )
+    return (
+        "working_directory must be an absolute path under /workspace, such as "
+        f"/workspace/<project>; got {value!r}"
+    )
+
+
+def _freeze_or_rejection(
+    execute: Any, **kwargs: Any
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """The frozen contract, or the validation message that refused it.
+
+    (None, None) is the separate case of a valid contract that did not reach
+    disk.
+    """
+    try:
+        return freeze_contract(execute, **kwargs), None
+    except ContractRejected as exc:
+        return None, f"{CONTRACT_REJECTED}: {exc}"
 
 
 def _absolute_root(value: Any) -> Optional[str]:
@@ -272,6 +315,8 @@ class BuildTool(BaseTool):
         verb: str,
         working_directory: str,
         system: Optional[str] = None,
+        error_code: str = BUILD_PARAMETER_INVALID,
+        suggestion: str = "Submit only parameters consumed by the selected public action",
     ) -> ToolResult:
         facts: Dict[str, Any] = {
             "requested_action": verb,
@@ -282,10 +327,10 @@ class BuildTool(BaseTool):
         return ToolResult.completed_failure(
             output=f"[build parameter] {detail}; no project runner was dispatched",
             error=detail,
-            error_code=BUILD_PARAMETER_INVALID,
+            error_code=error_code,
             facts=facts,
             metadata={"runner_dispatched": False},
-            suggestions=["Submit only parameters consumed by the selected public action"],
+            suggestions=[suggestion],
         )
 
     def execute(
@@ -419,6 +464,22 @@ class BuildTool(BaseTool):
                 error_code=CONTRACT_AUTHORITY_MISSING,
                 facts={"requested_action": verb, "working_directory": working_directory},
                 metadata={"runner_dispatched": False},
+            )
+
+        # One directory for the contract, the runner and the receipt: a path
+        # outside the workspace, relative, or not in canonical form is refused
+        # here with its reason, before any contract is frozen.
+        working_directory_refusal = working_directory_problem(working_directory)
+        if working_directory_refusal is not None:
+            return self._parameter_refusal(
+                detail=working_directory_refusal,
+                verb=verb,
+                working_directory=working_directory,
+                error_code=INVALID_WORKING_DIRECTORY,
+                suggestion=(
+                    "Submit working_directory as an absolute path under /workspace, "
+                    "such as /workspace/<project>"
+                ),
             )
 
         source_argv = None
@@ -929,7 +990,7 @@ class BuildTool(BaseTool):
                 "[scope] action=test stops before Failsafe integration-test/verify; -Dit.test does not prove integration tests ran"
             )
 
-        contract = freeze_contract(
+        contract, rejection = _freeze_or_rejection(
             self.docker_orchestrator.execute_command,
             run_id=active_receipt_run_id(),
             envelope_id=envelope_id,
@@ -970,6 +1031,40 @@ class BuildTool(BaseTool):
             effective_jdk=effective_jdk,
             target_sha_value=runtime_target_sha,
         )
+        if rejection is not None:
+            write_assessment(
+                self.docker_orchestrator.execute_command,
+                ControlAssessment(
+                    event_or_intent_id=envelope_id,
+                    stage="materialization",
+                    typed_code=CONTRACT_REJECTED,
+                    detail=(
+                        f"{system} {effective_verb} at {working_directory} was not "
+                        f"dispatched: {rejection}"
+                    ),
+                ),
+            )
+            return ToolResult.completed_failure(
+                output="\n".join(
+                    preamble_lines
+                    + [
+                        f"[contract] {system} {effective_verb} was NOT run: {rejection}. "
+                        "The call as submitted cannot be committed to; nothing was "
+                        "written, built or recorded. Correct the call as this message "
+                        "describes and submit it again."
+                    ]
+                ),
+                error=rejection,
+                error_code=CONTRACT_REJECTED,
+                facts={
+                    "system": system,
+                    "requested_action": verb,
+                    "effective_action": effective_verb,
+                    "working_directory": working_directory,
+                },
+                metadata={"runner_dispatched": False},
+                suggestions=["Correct the call as the rejection message describes"],
+            )
         if contract is None:
             write_assessment(
                 self.docker_orchestrator.execute_command,
@@ -1205,7 +1300,7 @@ class BuildTool(BaseTool):
                                 retry_outcome,
                                 post_runtime,
                             )
-                            retry_contract = freeze_contract(
+                            retry_contract, retry_rejection = _freeze_or_rejection(
                                 self.docker_orchestrator.execute_command,
                                 run_id=active_receipt_run_id(),
                                 envelope_id=envelope_id,
@@ -1240,6 +1335,11 @@ class BuildTool(BaseTool):
                                 effective_jdk=retry_effective_jdk,
                                 target_sha_value=runtime_target_sha,
                             )
+                            if retry_rejection is not None:
+                                preamble_lines.append(
+                                    f"[pre-flight] Java {needed} was provisioned, but the "
+                                    f"retry was not run: {retry_rejection}"
+                                )
                             if retry_contract is not None:
                                 preamble_lines.append(
                                     f"[pre-flight] build error requires Java {needed}, "

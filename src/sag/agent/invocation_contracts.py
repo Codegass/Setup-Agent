@@ -77,6 +77,9 @@ CONTRACT_DIR = "/workspace/.setup_agent/invocation_contracts"
 CONTRACT_HEREDOC = "SAGCONTRACT"
 # The typed refusal a facade returns when the contract did not reach disk.
 CONTRACT_PERSIST_FAILED = "CONTRACT_PERSIST_FAILED"
+# The typed refusal a facade returns when the call, as submitted, cannot be
+# committed to: validation named a rule it breaks, and nothing was written.
+CONTRACT_REJECTED = "CONTRACT_REJECTED"
 # An internal backend without a facade-frozen contract has no authority to
 # perform even its discovery/preflight side effects.
 CONTRACT_AUTHORITY_MISSING = "CONTRACT_AUTHORITY_MISSING"
@@ -107,6 +110,11 @@ ARGV_EXECUTION_BINDING = "argv_v1"
 PYTHON_FACADE_EXECUTION_BINDING = "python_facade_v1"
 EXECUTION_BINDINGS = (ARGV_EXECUTION_BINDING, PYTHON_FACADE_EXECUTION_BINDING)
 EXECUTOR_ALLOWLIST_V1 = frozenset({"maven", "gradle", "python", "bash"})
+
+
+class ContractRejected(ValueError):
+    """The contract for this call failed validation; its message says why."""
+
 
 _V2_REQUIRED_FIELDS = frozenset(
     {
@@ -1004,14 +1012,18 @@ def freeze_contract(
     effective_jdk: Optional[Mapping[str, Any]] = None,
     target_sha_value: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Freeze and persist the contract for ONE dispatch; None when it failed.
+    """Freeze and persist the contract for ONE dispatch.
 
     The pins are read from the manifest the caller ALREADY holds (the survey
     handoff), never from a second manifest probe; only the target sha is
     probed, from the tree this dispatch will run in, because that is the fact
     the contract is a commitment against.
 
-    A None return is not a warning — the caller has no authority to dispatch.
+    Two failures, told apart because they call for different next steps.
+    `ContractRejected` (a ValueError carrying the validation message) means
+    the call as submitted cannot be committed to; nothing was written, and the
+    caller can correct the call. A None return means a valid contract did not
+    reach disk. Either way the caller has no authority to dispatch.
 
     The typed expectations are derived from the PUBLIC verb the model
     submitted, not from the materialized action: `verify`, `assemble` and a
@@ -1061,9 +1073,11 @@ def freeze_contract(
         )
     except (TypeError, ValueError) as exc:
         # A call the canonical form cannot represent cannot be committed to,
-        # and an uncommittable call is not dispatched (fail closed).
+        # and an uncommittable call is not dispatched (fail closed). The rule
+        # it broke travels with the refusal: it is the caller's to correct,
+        # not a storage fault.
         logger.warning(f"invocation contract for {envelope_id} could not be frozen: {exc}")
-        return None
+        raise ContractRejected(str(exc) or type(exc).__name__) from exc
     if not write_contract(execute, contract):
         logger.warning(
             f"invocation contract {contract['contract_id']} did not reach disk; "
@@ -1812,7 +1826,9 @@ __all__ = [
     "CONTRACT_AUTHORITY_MISSING",
     "CONTRACT_HEREDOC",
     "CONTRACT_PERSIST_FAILED",
+    "CONTRACT_REJECTED",
     "CONTRACT_SCHEMA_VERSION",
+    "ContractRejected",
     "DEFAULT_INTENT_SOURCE",
     "DIRECT_FALSIFIERS",
     "EXPECTED_OBSERVATIONS",

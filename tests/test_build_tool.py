@@ -284,7 +284,9 @@ def test_deps_verb_maps_per_ecosystem(marker, backend_name, expected_key, expect
     backend = FakeBackendTool()
     kwargs = {f"{backend_name}_tool": backend}
 
-    BuildTool(MarkerOrchestrator({marker}), **kwargs).execute(action="deps", working_directory="/w")
+    BuildTool(MarkerOrchestrator({marker}), **kwargs).execute(
+        action="deps", working_directory="/workspace/w"
+    )
 
     assert backend.calls[0][expected_key] == expected_value
 
@@ -379,7 +381,7 @@ def test_test_stats_surface_in_facts():
     )
     tool = _tool({"pom.xml"}, maven=maven)
 
-    result = tool.execute(action="test", working_directory="/w")
+    result = tool.execute(action="test", working_directory="/workspace/w")
 
     assert result.facts["executed"] == 214
     assert result.facts["passed"] == 206
@@ -391,7 +393,7 @@ def test_maven_test_preserves_the_maven_test_lifecycle():
     maven = FakeBackendTool()
     tool = _tool({"pom.xml"}, maven=maven)
 
-    tool.execute(action="test", working_directory="/w")
+    tool.execute(action="test", working_directory="/workspace/w")
 
     assert maven.calls[0]["command"] == "test"
     assert maven.calls[0]["fail_at_end"] is True
@@ -403,7 +405,7 @@ def test_maven_requirement_propagates_through_build_backend():
 
     tool.execute(
         action="compile",
-        working_directory="/w",
+        working_directory="/workspace/w",
         maven_version_requirement="[3.9,4.0)",
     )
 
@@ -414,7 +416,7 @@ def test_args_passthrough():
     maven = FakeBackendTool()
     tool = _tool({"pom.xml"}, maven=maven)
 
-    tool.execute(action="test", args="-Dtest=FooTest", working_directory="/w")
+    tool.execute(action="test", args="-Dtest=FooTest", working_directory="/workspace/w")
 
     assert maven.calls[0].get("extra_args") == "-Dtest=FooTest" or "-Dtest=FooTest" in str(
         maven.calls[0]
