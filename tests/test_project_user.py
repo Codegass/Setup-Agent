@@ -26,7 +26,7 @@ from test_maven_gradle_tool_contracts import FakeBuildToolOrchestrator
 from test_venv_repair_ladder import LadderOrch
 
 import sag.agent.stall_diagnostics as stall_diagnostics
-from sag.agent.worktree_evidence import WorktreeEvidenceRecorder
+from sag.agent.worktree_evidence import WorktreeEvidenceRecorder, current_tracked_paths
 from sag.benchmark import compilation_evidence
 from sag.benchmark.sag_observer import _PROGRAM, SAGRequirementObserver
 from sag.config.settings import Config
@@ -763,7 +763,9 @@ def test_harness_worktree_probe_never_takes_the_index_lock(tmp_path, project_use
     )
     with pytest.raises(ValueError):
         recorder._probe()
-    assert seen[0].startswith(prefix + "python3 -c ")
+    # The changed-paths probe used for task completion shares the transport.
+    assert current_tracked_paths(Owner().execute_control_command, "/workspace/p") is None
+    assert [c[: len(prefix) + len("python3 -c ")] for c in seen] == [prefix + "python3 -c "] * 2
 
 
 # --------------------------------------------------------------------------
