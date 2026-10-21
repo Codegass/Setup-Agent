@@ -29,6 +29,7 @@ from sag.evidence import EvidenceAssessment, OperationOutcome, TestStats
 from sag.metrics.maven_reactor import parse_maven_reactor, reactor_scope_issues
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.runtime.env_overlay import EnvOverlayStore
+from sag.runtime.project_user import project_execute, project_user_kwargs
 from sag.utils.container_io import write_container_text_atomic
 
 from ..base import BaseTool, ToolError, ToolResult
@@ -490,7 +491,11 @@ class MavenTool(BaseTool):
                 extra_args=extra_args,
                 maven_executable=maven_executable,
             )
-            result = self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
+            result = self.orchestrator.execute_command(
+                maven_cmd,
+                workdir=working_directory,
+                **project_user_kwargs(self.orchestrator),
+            )
             return self._finalize_main_result(
                 ToolResult.completed(
                     operation_outcome=("success" if result.get("exit_code") == 0 else "failed"),
@@ -613,6 +618,10 @@ class MavenTool(BaseTool):
                 ]
             )
 
+            # The project's own build runs as the project user when one is
+            # configured (one local repository, under that user's home).
+            as_user = project_user_kwargs(self.orchestrator)
+
             def _run_build():
                 if is_long_running and hasattr(
                     self.orchestrator, "execute_command_with_soft_timeout"
@@ -626,6 +635,7 @@ class MavenTool(BaseTool):
                             maven_cmd,
                             workdir=working_directory,
                             hold=dispatch_hold_policy("maven", maven_cmd),
+                            **as_user,
                         )
                     except TypeError as exc:
                         # Small test orchestrators predate the hold parameter.
@@ -634,6 +644,7 @@ class MavenTool(BaseTool):
                         return self.orchestrator.execute_command_with_soft_timeout(
                             maven_cmd,
                             workdir=working_directory,
+                            **as_user,
                         )
                 if is_long_running and hasattr(
                     self.orchestrator, "execute_command_with_monitoring"
@@ -646,9 +657,12 @@ class MavenTool(BaseTool):
                         silent_timeout=1200,  # 20 minutes for no output (dependency downloads)
                         absolute_timeout=3600,  # 60 minutes total
                         optimize_for_maven=True,
+                        **as_user,
                     )
                 # Use regular version for quick commands like help, version, etc.
-                return self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
+                return self.orchestrator.execute_command(
+                    maven_cmd, workdir=working_directory, **as_user
+                )
 
             # A live v2 contract is not a bearer token: it authorizes one exact
             # executor/action/cwd/vector. Refuse a cross-ecosystem or drifted
@@ -681,7 +695,9 @@ class MavenTool(BaseTool):
                         self.orchestrator.execute_command, [working_directory]
                     )
                     toolchain = toolchain_fingerprint(
-                        self.orchestrator.execute_command,
+                        # `./mvnw --version` may download the wrapper's Maven:
+                        # into the project user's home, where the build uses it.
+                        project_execute(self.orchestrator, self.orchestrator.execute_command),
                         executable=runner_executable(maven_cmd, "maven"),
                         version_flag="--version",
                         working_directory=working_directory,

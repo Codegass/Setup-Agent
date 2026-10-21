@@ -46,6 +46,7 @@ from sag.agent.project_execution_plan import sealed_test_disposition_status
 from sag.agent.receipt_test_rows import diagnostic_testcase_outcomes
 from sag.evidence import EvidenceAssessment, TestStats
 from sag.runtime.container_io import resolve_control_execute
+from sag.runtime.project_user import project_execute, project_user_kwargs
 from sag.utils.container_io import write_container_text_atomic
 
 from ..base import BaseTool, ToolError, ToolResult
@@ -1181,6 +1182,10 @@ class GradleTool(BaseTool):
             quick_markers = ("help", "tasks", "projects", "properties", "--version")
             is_long_running = not any(marker in gradle_cmd for marker in quick_markers)
 
+            # The project's own build runs as the project user when one is
+            # configured (its Gradle home is that user's).
+            as_user = project_user_kwargs(self.orchestrator)
+
             def _run_build():
                 if is_long_running and hasattr(
                     self.orchestrator, "execute_command_with_soft_timeout"
@@ -1194,6 +1199,7 @@ class GradleTool(BaseTool):
                             gradle_cmd,
                             workdir=working_directory,
                             hold=dispatch_hold_policy("gradle", gradle_cmd),
+                            **as_user,
                         )
                     except TypeError as exc:
                         # Small test orchestrators predate the hold parameter.
@@ -1202,6 +1208,7 @@ class GradleTool(BaseTool):
                         return self.orchestrator.execute_command_with_soft_timeout(
                             gradle_cmd,
                             workdir=working_directory,
+                            **as_user,
                         )
                 if is_long_running and hasattr(
                     self.orchestrator, "execute_command_with_monitoring"
@@ -1214,10 +1221,11 @@ class GradleTool(BaseTool):
                         silent_timeout=1200,  # 20 minutes for no output (dependency downloads)
                         absolute_timeout=3600,  # 60 minutes total
                         optimize_for_maven=True,  # Use Maven optimization (works for both Maven and Gradle)
+                        **as_user,
                     )
                 # Use regular version for quick commands like help, tasks, etc.
                 return self.orchestrator.execute_command(
-                    gradle_cmd, workdir=working_directory, timeout=timeout
+                    gradle_cmd, workdir=working_directory, timeout=timeout, **as_user
                 )
 
             # One contract authorizes one executor/action/cwd/vector. A valid
@@ -1250,7 +1258,9 @@ class GradleTool(BaseTool):
                         self.orchestrator.execute_command, [working_directory]
                     )
                     toolchain = toolchain_fingerprint(
-                        self.orchestrator.execute_command,
+                        # `./gradlew --version` may download the distribution:
+                        # into the project user's Gradle home, where the build uses it.
+                        project_execute(self.orchestrator, self.orchestrator.execute_command),
                         executable=runner_executable(gradle_cmd, "gradle"),
                         version_flag="--version",
                         working_directory=working_directory,

@@ -16,6 +16,7 @@ from loguru import logger
 from sag.coverage.jacoco_parser import parse_jacoco_xml
 from sag.coverage.merge import merge_coverage_into_metrics
 from sag.runtime.container_io import read_container_text, resolve_control_execute
+from sag.runtime.project_user import project_user_kwargs
 from sag.tools.module_metrics import MODULE_METRICS_PATH
 from sag.utils.container_io import compare_publish_container_text_atomic
 
@@ -226,7 +227,10 @@ def _maven_report_only(orchestrator: Any, project_dir: str) -> None:
         f"cd {shlex.quote(project_root)} && mvn -B {plugin}:report "
         "-Dmaven.test.failure.ignore=true"
     )
-    orchestrator.execute_command(cmd, timeout=COVERAGE_TIMEOUT_SEC)
+    # The project's own Maven run: as the project user when one is configured.
+    orchestrator.execute_command(
+        cmd, timeout=COVERAGE_TIMEOUT_SEC, **project_user_kwargs(orchestrator)
+    )
 
 
 def _inject_and_run(orchestrator: Any, project_dir: str, build_system: str) -> None:
@@ -256,7 +260,10 @@ def _inject_and_run(orchestrator: Any, project_dir: str, build_system: str) -> N
             f"{plugin}:report "
             f"-Dmaven.test.failure.ignore=true"
         )
-    orchestrator.execute_command(cmd, timeout=COVERAGE_TIMEOUT_SEC)
+    # The project's own build: as the project user when one is configured.
+    orchestrator.execute_command(
+        cmd, timeout=COVERAGE_TIMEOUT_SEC, **project_user_kwargs(orchestrator)
+    )
 
 
 def run_coverage(
