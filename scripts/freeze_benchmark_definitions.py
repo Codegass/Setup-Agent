@@ -562,7 +562,8 @@ def metadata_status(preparation, plan, *, script_name, image):
 
 # ------------------------------------------------------------- CI target
 
-LOG_TOTAL = re.compile(r"^\[(?:INFO|WARNING|ERROR)\] Tests run: (\d+), Failures: (\d+), Errors: (\d+), "
+# Surefire 3 prefixes its Results lines with a log level; Surefire 2.x prints them bare.
+LOG_TOTAL = re.compile(r"^(?:\[(?:INFO|WARNING|ERROR)\] )?Tests run: (\d+), Failures: (\d+), Errors: (\d+), "
                        r"Skipped: (\d+)(?:, Flakes: \d+)?\s*$", re.M)
 COUNT_FIELDS = ("reported_total", "failures", "errors", "skipped")
 

@@ -433,6 +433,16 @@ def test_ci_target_uses_dataset_counts_when_the_archived_log_agrees():
     assert (record.repo, record.sha) == ("apache/commons-pool", POOL_SHA)
 
 
+def test_older_surefire_summaries_without_a_log_level_are_counted():
+    # apache/xmlgraphics-fop job 96208253680: Surefire 2.x prints its Results lines bare.
+    raw = ("2026-08-19T20:03:40.1480528Z Tests run: 2, Failures: 0, Errors: 0, Skipped: 0\n"
+           "2026-08-19T20:04:00.0000000Z Tests run: 26, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.043 sec"
+           " - in org.apache.fop.SomeTestCase\n"
+           "2026-08-19T20:05:14.8530956Z Tests run: 3655, Failures: 0, Errors: 0, Skipped: 4\n")
+    assert freeze.log_test_totals(raw) == {"summary_lines": 2, "reported_total": 3657, "failures": 0, "errors": 0,
+                                           "skipped": 4}
+
+
 @pytest.mark.parametrize("log_counts", [
     {"summary_lines": 1, "reported_total": 380, "failures": 0, "errors": 0, "skipped": 11},
     None,
