@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.runtime import EnvOverlayStore
+from sag.runtime.project_user import configured_project_user
 
 from ..base import BaseTool, ToolError, ToolResult
 from .java_versions import JAVA_VERIFICATION_SEPARATOR, java_major, parse_java_verification
@@ -536,10 +537,16 @@ class SystemTool(BaseTool):
         channel = "latest" if java_version == major else "archive"
         url = f"https://download.oracle.com/graalvm/{major}/{channel}/graalvm-jdk-{java_version}_linux-{architecture}_bin.tar.gz"
         # All paths are private staging paths. Never replace another installed
-        # JDK, and never activate an unchecked download.
+        # JDK, and never activate an unchecked download. `mktemp -d` makes the
+        # stage 0700; the project user's builds must be able to run this JDK.
+        readable = (
+            'chmod 755 "$sag_graal_stage"\n'
+            if configured_project_user(self.docker_orchestrator)
+            else ""
+        )
         script = f"""set -eu
 sag_graal_stage=$(mktemp -d /opt/.sag-graalvm.XXXXXX)
-trap 'rm -f "$sag_graal_stage/archive.tar.gz" "$sag_graal_stage/archive.sha256"' EXIT
+{readable}trap 'rm -f "$sag_graal_stage/archive.tar.gz" "$sag_graal_stage/archive.sha256"' EXIT
 curl --fail --location --retry 2 --max-time 600 {shlex.quote(url)} -o "$sag_graal_stage/archive.tar.gz"
 curl --fail --location --retry 2 --max-time 60 {shlex.quote(url + '.sha256')} -o "$sag_graal_stage/archive.sha256"
 sag_graal_sha=$(awk '{{print $1}}' "$sag_graal_stage/archive.sha256")
