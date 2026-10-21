@@ -75,7 +75,10 @@ def _container_probes(
     execute: Callable[..., Any], project_root: str, probes: Mapping[str, list[str]]
 ) -> dict[str, Any]:
     """Run the byte-preserving probe program through the control channel."""
-    command = shlex.join(
+    from sag.runtime.project_user import harness_git_prefix
+
+    # Root's `git diff` must not rewrite a project user's .git/index.
+    command = harness_git_prefix(getattr(execute, "__self__", None)) + shlex.join(
         ["python3", "-c", _PROBE_PROGRAM, project_root, json.dumps(probes, sort_keys=True)]
     )
     result = execute(command, truncate_output=False, timeout=100)

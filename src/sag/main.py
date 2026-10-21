@@ -41,6 +41,7 @@ from sag.console.result_block import render_result_block
 from sag.console.turn_stream import TurnStreamRenderer
 from sag.coverage.runner import apply_coverage
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.runtime.project_user import harness_git_prefix
 from sag.report_document import render_setup_report, report_name, setup_report_name
 from sag.result_card import build_result_card
 from sag.result_card.models import RunResultCard
@@ -716,7 +717,7 @@ def _run_coverage_pass(orchestrator, project_name: str, *, validator=None) -> bo
         # Pollution guard (warn-only): tracked source files must be unchanged.
         dirty = _execute_control(
             orchestrator,
-            f"cd {project_dir} && git status --porcelain 2>/dev/null "
+            f"cd {project_dir} && {harness_git_prefix(orchestrator)}git status --porcelain 2>/dev/null "
             f"| grep -vE 'target/|build/|\\.setup_agent' | head -5",
         )
         if (dirty.get("output") or "").strip():

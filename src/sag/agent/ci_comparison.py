@@ -39,6 +39,7 @@ from sag.agent.evidence_assessments import receipt_assessment_bundle_complete as
 from sag.agent.receipt_structure import single_maven_module_proven as _single_maven_module
 from sag.metrics.module_keys import module_key
 from sag.metrics.target_record import TargetRecord
+from sag.runtime.project_user import harness_git_prefix
 
 # The reason strings this module publishes, named so consumers can enumerate
 # them. Extracted verbatim from their raise/return sites; the strings are
@@ -674,7 +675,8 @@ def _jenkins_report_namespaces(orchestrator, parsed_reads, project_root, cell):
             )
             clean = (
                 execute(
-                    f"git -C {shlex.quote(project_root)} diff --quiet HEAD -- {shlex.quote(relative)}"
+                    f"{harness_git_prefix(orchestrator)}git -C {shlex.quote(project_root)} "
+                    f"diff --quiet HEAD -- {shlex.quote(relative)}"
                 )
                 or {}
             )

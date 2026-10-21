@@ -317,7 +317,15 @@ def build_task_completion(
     if not callable(execute) or target_sha(execute, project_root) != task.sha:
         return unavailable(TASK_CURRENT_CHECKOUT_MISMATCH)
     try:
-        unchanged = execute(f"git -C {shlex.quote(project_root)} diff --quiet HEAD --") or {}
+        from sag.runtime.project_user import harness_git_prefix
+
+        unchanged = (
+            execute(
+                f"{harness_git_prefix(orchestrator)}git -C {shlex.quote(project_root)} "
+                "diff --quiet HEAD --"
+            )
+            or {}
+        )
     except Exception:
         unchanged = {}
     # 0: the tracked tree is the task commit. 1: tracked files differ, which

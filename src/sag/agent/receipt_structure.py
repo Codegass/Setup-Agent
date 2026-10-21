@@ -486,6 +486,7 @@ def single_maven_module_proven(orchestrator, receipt, project_root):
     from sag.agent.forced_build_graph import verify_forced_candidate_build_graph
     from sag.agent.invocation_receipts import _succeeded
     from sag.runtime.container_io import resolve_control_execute
+    from sag.runtime.project_user import harness_git_prefix
 
     if (
         receipt.get("tool") != "maven"
@@ -497,8 +498,8 @@ def single_maven_module_proven(orchestrator, receipt, project_root):
         return False
     unchanged = (
         execute(
-            f"git -C {shlex.quote(project_root)} diff --quiet HEAD -- "
-            "pom.xml .mvn/maven.config .mvn/extensions.xml"
+            f"{harness_git_prefix(orchestrator)}git -C {shlex.quote(project_root)} "
+            "diff --quiet HEAD -- pom.xml .mvn/maven.config .mvn/extensions.xml"
         )
         or {}
     )
