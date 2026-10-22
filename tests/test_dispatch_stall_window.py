@@ -1109,6 +1109,7 @@ def test_gradle_passes_its_hold_tier_to_the_dispatch():
 import base64
 import hashlib
 import json
+import shlex
 import subprocess
 
 from sag.agent import stall_diagnostics
@@ -2010,3 +2011,152 @@ def test_a_kill_after_leader_exit_that_leaves_the_group_live_is_live_at_close(mo
     assert result.code == "job_live_at_close"
     assert (result.term_sent, result.kill_sent, result.group_live) == (True, True, True)
     assert result.process_group_terminal is False
+
+
+# --- Thread dumps for every JVM in the job's group --------------------------
+#
+# commons-vfs's stalled HDFS suite: the bundle dumped the Maven JVM (13195), the
+# first java row, while the hung process was the surefire fork (16255) in the
+# same group. The rows below are that bundle's process section (pid ppid pgid
+# sid etimes pcpu stat wchan comm args), with the args shortened.
+
+COMMONS_VFS_GROUP = "\n".join(
+    [
+        "  13169   13168   13169   13169    1521  0.0 Ss   -      bash            /bin/bash -c export LANG=C.UTF-8; cd /workspace/commons-vfs && mvn",
+        "  13195   13169   13169   13169    1521 13.4 Sl   -      java            /usr/lib/jvm/java-11-openjdk-amd64/bin/java -classpath plexus-classworlds.jar org.codehaus.plexus.classworlds.launcher.Launcher",
+        "  16251   13195   13169   13169     881  0.0 S    -      sh              /bin/sh -c cd /workspace/commons-vfs/commons-vfs2-hdfs && java -jar surefirebooter.jar",
+        "  16255   16251   13169   13169     881  2.0 Sl   -      java            /usr/lib/jvm/java-11-openjdk-amd64/bin/java -Xmx64m -jar surefirebooter.jar",
+        "  16509   16255   13169   13169     873  0.0 Z    -      du              [du] <defunct>",
+    ]
+)
+
+
+def _run_jvm_dumps(tmp_path, process_rows, attach_as=""):
+    """Run the JVM part of the probe on this host with stand-in tools."""
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "process").write_text(process_rows + "\n")
+    calls = tmp_path / "calls"
+    # `timeout --kill-after=2 10 CMD...` runs CMD; jcmd prints a dump naming its pid.
+    (bin_dir / "timeout").write_text(
+        '#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done\nshift\nexec "$@"\n'
+    )
+    (bin_dir / "jcmd").write_text(
+        f'#!/bin/sh\necho "$@" >> {shlex.quote(str(calls))}\n'
+        'printf "%s:\\nFull thread dump of %s\\n" "$1" "$1"\n'
+    )
+    for tool in ("timeout", "jcmd"):
+        (bin_dir / tool).chmod(0o755)
+    script = f"tmp={shlex.quote(str(work))}; " + stall_diagnostics._jvm_dump_script(attach_as)
+    script += "printf 'JVM_ATTEMPTED:%s\\n' \"$jvm_attempted\""
+    done = subprocess.run(
+        ["/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        timeout=30,
+    )
+    assert done.returncode == 0, done.stderr
+    dumped = calls.read_text().split("\n") if calls.exists() else []
+    return done.stdout, work, [line for line in dumped if line]
+
+
+def test_every_jvm_in_the_group_is_dumped_newest_first(tmp_path):
+    stdout, work, calls = _run_jvm_dumps(tmp_path, COMMONS_VFS_GROUP)
+
+    # The surefire fork started last, so it is dumped first.
+    assert calls == ["16255 Thread.print", "13195 Thread.print"]
+    assert (work / "jvm-16255").read_text() == "16255:\nFull thread dump of 16255\n"
+    assert (work / "jvm-13195").read_text() == "13195:\nFull thread dump of 13195\n"
+    assert (work / "jvm").read_text() == (
+        "==> jvm-16255 <==\n16255:\nFull thread dump of 16255\n"
+        "==> jvm-13195 <==\n13195:\nFull thread dump of 13195\n"
+    )
+    assert "JVM_ATTEMPTED:1" in stdout
+
+
+def test_at_most_four_jvms_are_dumped(tmp_path):
+    rows = [
+        f"  {pid}   13169   13169   13169    {etimes}  1.0 Sl   -      java            java -jar x.jar"
+        for pid, etimes in ((20001, 50), (20002, 3000), (20003, 10), (20004, 700), (20005, 20), (20006, 2000))
+    ]
+
+    _stdout, work, calls = _run_jvm_dumps(tmp_path, "\n".join(rows))
+
+    assert [call.split()[0] for call in calls] == ["20003", "20005", "20001", "20004"]
+    assert sorted(path.name for path in work.glob("jvm-*")) == [
+        "jvm-20001",
+        "jvm-20003",
+        "jvm-20004",
+        "jvm-20005",
+    ]
+
+
+def test_a_group_without_a_jvm_dumps_nothing(tmp_path):
+    rows = "  13169   13168   13169   13169    1521  0.0 Ss   -      bash            /bin/bash -c make"
+
+    stdout, work, calls = _run_jvm_dumps(tmp_path, rows)
+
+    assert calls == []
+    assert (work / "jvm").read_text() == ""
+    assert "JVM_ATTEMPTED:0" in stdout
+
+
+def test_each_jvm_dump_is_bounded_and_attached_as_the_project_user():
+    job = {"log_path": "/tmp/sag_jobs/abc.log", "working_directory": "/workspace/p"}
+    drop = "/usr/bin/setpriv --reuid=sag --regid=sag --init-groups"
+    probe = stall_diagnostics._diagnostic_command(
+        job_id="abc", pid=10, pgid=10, job=job, project_user="sag"
+    )
+
+    assert stall_diagnostics._jvm_dump_script(drop + " ") in probe
+    assert "head -n 4 " in probe
+    assert 'for java_pid in $java_pids; do ' in probe
+    assert f'timeout --kill-after=2 10 {drop} jcmd "$java_pid" Thread.print > "$tmp/jvm-$java_pid"' in probe
+    assert f'timeout --kill-after=2 10 {drop} jstack "$java_pid" > "$tmp/jvm-$java_pid"' in probe
+    # Each dump keeps today's 400-line bound; the section keeps its byte cap.
+    assert 'head -n 400 "$tmp/jvm-$java_pid" >> "$tmp/jvm"' in probe
+    assert 'head -c 262144 "$tmp/jvm"' in probe
+    syntax = subprocess.run(["bash", "-n", "-c", probe], capture_output=True, text=True)
+    assert syntax.returncode == 0, syntax.stderr
+
+
+def test_the_probe_budget_covers_four_bounded_dumps(monkeypatch):
+    harness = _DiagnosticHarness()
+    monkeypatch.setattr(stall_diagnostics, "write_container_text_atomic", harness.writer)
+    budgets = []
+    execute = harness.execute
+
+    def recording(command, **kwargs):
+        if "sag-job-diagnostic" in command:
+            budgets.append(kwargs.get("timeout"))
+        return execute(command, **kwargs)
+
+    collect_stall_diagnostic(recording, _stall_job())
+
+    # The single-dump probe had 30s; three more dumps of up to 10s + 2s each.
+    assert budgets == [30 + 3 * 12]
+
+
+def test_the_bundle_keeps_one_jvm_section_holding_every_dump(monkeypatch):
+    jvm = (
+        "==> jvm-4300 <==\n4300:\nat java.lang.Thread.join(Thread.java:1)\n"
+        "   java.lang.Thread.State: WAITING\n"
+        "==> jvm-4242 <==\n4242:\nmain waiting on the fork\n"
+    )
+    harness = _DiagnosticHarness(diagnostic=_diagnostic_output(jvm=jvm))
+    monkeypatch.setattr(stall_diagnostics, "write_container_text_atomic", harness.writer)
+
+    first = collect_stall_diagnostic(harness.execute, _stall_job())
+    again = collect_stall_diagnostic(harness.execute, _stall_job())
+
+    payload = json.loads(harness.files[first.evidence_ref])
+    assert set(payload["raw"]) == set(payload["content_hashes"]) == set(stall_diagnostics._RAW_NAMES)
+    assert payload["raw"]["jvm"] == jvm
+    assert payload["content_hashes"]["jvm"] == _sha(jvm)
+    assert first.observation == "thread_join_wait"
+    # The bundle reader accepts it as it is.
+    assert again.reused is True and again.content_hashes == first.content_hashes

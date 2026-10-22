@@ -70,6 +70,11 @@ _RAW_MAX_BYTES = {
 }
 _MAX_DIAGNOSTIC_OUTPUT_BYTES = 2 * 1024 * 1024
 _MAX_PROGRESS_OUTPUT_BYTES = 65536
+# Every JVM in the job's group is thread-dumped, newest first, up to this many.
+_JVM_DUMP_LIMIT = 4
+# Each dump runs under `timeout --kill-after=2 10`, so up to 12 seconds. The
+# probe's budget was 30 seconds with one dump; it grows by the other three.
+_DIAGNOSTIC_PROBE_SECONDS = 30 + (_JVM_DUMP_LIMIT - 1) * 12
 
 
 @dataclass(frozen=True)
@@ -274,7 +279,9 @@ def collect_stall_diagnostic(
         job=job,
         project_user=configured_project_user(getattr(execute, "__self__", None)),
     )
-    probe = _execute(execute, command, timeout=30, truncate_output=False)
+    probe = _execute(
+        execute, command, timeout=_DIAGNOSTIC_PROBE_SECONDS, truncate_output=False
+    )
     if not _succeeded(probe):
         return _invalid_bundle(job, "diagnostic_probe_failed")
     probe_output = _text(probe.get("output"))
@@ -951,16 +958,8 @@ def _diagnostic_command(
         "-o -path '*/failsafe-reports/*.xml' -o -path '*/test-results/*/*.xml' "
         "-o -path '*/pytest-reports/*.xml' \\) -exec sha256sum {} + 2>/dev/null "
         '| head -n 512 | head -c 131072 > "$tmp/report"; '
-        "java_pid=$(awk '$9 ~ /(^|\\/)java/ {print $1; exit}' \"$tmp/process\"); "
-        'jvm_attempted=0; : > "$tmp/jvm"; '
-        'if [ -n "$java_pid" ]; then if command -v jcmd >/dev/null 2>&1; then '
-        f'jvm_attempted=1; timeout --kill-after=2 10 {attach_as}jcmd "$java_pid" Thread.print '
-        '> "$tmp/jvm" 2>&1; '
-        "elif command -v jstack >/dev/null 2>&1; then jvm_attempted=1; "
-        f'timeout --kill-after=2 10 {attach_as}jstack "$java_pid" > "$tmp/jvm" 2>&1; fi; fi; '
-        'head -n 400 "$tmp/jvm" | head -c 262144 > "$tmp/jvm.bounded"; '
-        'mv "$tmp/jvm.bounded" "$tmp/jvm"; '
-        f'tail -n 120 {log_path} 2>/dev/null | head -c 65536 > "$tmp/log_tail"; '
+        + _jvm_dump_script(attach_as)
+        + f'tail -n 120 {log_path} 2>/dev/null | head -c 65536 > "$tmp/log_tail"; '
         f"printf 'JOB_ID:{job_id}\\nPGID:{pgid}\\n'; "
         "printf 'PROCESS_STATE:%s\\n' \"$process_state\"; "
         "printf 'LOG_SIZE:%s\\n' \"$log_size\"; "
@@ -969,6 +968,38 @@ def _diagnostic_command(
         "printf 'CHILD_COUNT:%s\\n' \"$child_count\"; "
         'printf \'PROCESS_IDENTITY_SHA256:%s\\n\' "$(cat "$tmp/identity.sha")"; '
         "printf 'JVM_ATTEMPTED:%s\\n' \"$jvm_attempted\"; " + hash_emit + raw_emit
+    )
+
+
+def _jvm_dump_script(attach_as: str) -> str:
+    """Thread-dump every java process in the job's group, newest first.
+
+    Reads the group's ``ps`` rows in ``$tmp/process`` (field 5 is the elapsed
+    seconds, field 9 the command name) and dumps at most ``_JVM_DUMP_LIMIT``
+    JVMs, the most recently started first: a build tool's forked test JVM
+    starts after the build tool's own and is the likelier one to be hung. Each
+    dump goes to its own file, ``$tmp/jvm-<pid>``, attached as ``attach_as``
+    (the project user, when one is configured) under the same timeout and
+    400-line bound the single dump had. The files are joined into the one
+    ``jvm`` section, each under a ``==> jvm-<pid> <==`` line, and the section
+    keeps its byte cap, so the bundle's shape and hashes are unchanged.
+    """
+
+    return (
+        "java_pids=$(awk '$9 ~ /(^|\\/)java/ {print $5, $1}' \"$tmp/process\" "
+        f"| sort -k1,1n -k2,2nr | head -n {_JVM_DUMP_LIMIT} | awk '{{print $2}}'); "
+        'jvm_attempted=0; : > "$tmp/jvm"; '
+        "for java_pid in $java_pids; do "
+        "if command -v jcmd >/dev/null 2>&1; then "
+        f'jvm_attempted=1; timeout --kill-after=2 10 {attach_as}jcmd "$java_pid" Thread.print '
+        '> "$tmp/jvm-$java_pid" 2>&1; '
+        "elif command -v jstack >/dev/null 2>&1; then jvm_attempted=1; "
+        f'timeout --kill-after=2 10 {attach_as}jstack "$java_pid" > "$tmp/jvm-$java_pid" 2>&1; '
+        "else break; fi; "
+        "printf '==> jvm-%s <==\\n' \"$java_pid\" >> \"$tmp/jvm\"; "
+        'head -n 400 "$tmp/jvm-$java_pid" >> "$tmp/jvm"; done; '
+        'head -c 262144 "$tmp/jvm" > "$tmp/jvm.bounded"; '
+        'mv "$tmp/jvm.bounded" "$tmp/jvm"; '
     )
 
 
