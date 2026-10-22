@@ -125,6 +125,36 @@ def effective_sag_config(config, environment, directory):
     return actual
 
 
+def claude_arm_environment(seconds):
+    """Let one Claude Code shell command run as long as the whole attempt may.
+
+    Claude Code's Bash tool caps a command at 600 s by default (an agent's larger
+    requested timeout is clipped to that) and then moves it to the background; in
+    `claude -p`, ending the turn ends the session and kills that build. These are
+    the client's documented limits, in milliseconds.
+    """
+    limit = str(int(seconds) * 1000)
+    return {'BASH_DEFAULT_TIMEOUT_MS': limit, 'BASH_MAX_TIMEOUT_MS': limit}
+
+
+def baseline_model_environment(arm, *, token, endpoint, seconds):
+    """The environment a baseline client and its shells receive through `docker exec`."""
+    env = {'BENCH_GATEWAY_TOKEN':token,'OPENAI_API_KEY':token,'ANTHROPIC_AUTH_TOKEN':token,
+           'ANTHROPIC_API_KEY':token,'ANTHROPIC_BASE_URL':endpoint,'ANTHROPIC_MODEL':'gpt-5.4-mini',
+           'ANTHROPIC_DEFAULT_OPUS_MODEL':'gpt-5.4-mini','ANTHROPIC_DEFAULT_SONNET_MODEL':'gpt-5.4-mini',
+           'ANTHROPIC_DEFAULT_HAIKU_MODEL':'gpt-5.4-mini','CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1',
+           'DISABLE_AUTOUPDATER':'1','DISABLE_TELEMETRY':'1','OPENCODE_CONFIG':'/work/opencode.json',
+           'OPENCODE_DISABLE_AUTOUPDATE':'true','OPENCODE_DISABLE_SHARE':'true'}
+    if arm == 'claude':
+        env.update(claude_arm_environment(seconds))
+    return env
+
+
+def launch_environment(model_env):
+    """launch.json's listing of the client environment, without gateway credentials."""
+    return {k: ('<per-attempt gateway credential>' if k.endswith(('TOKEN','KEY')) else v) for k,v in model_env.items()}
+
+
 def prompt(task, checkout, seconds, requirements=None, *, runtime_handoff=False):
     rows = []
     for step in task['steps']:
@@ -356,12 +386,7 @@ def run(args):
             config['plugin']=['file:///opt/benchmark-opencode-observer.mjs']
             write_json(out/'opencode.json',config)
         if args.arm!='sag':call(['docker','cp',str(out/'opencode.json'),container+':/work/opencode.json'])
-        model_env = {'BENCH_GATEWAY_TOKEN':token,'OPENAI_API_KEY':token,'ANTHROPIC_AUTH_TOKEN':token,
-                     'ANTHROPIC_API_KEY':token,'ANTHROPIC_BASE_URL':endpoint,'ANTHROPIC_MODEL':'gpt-5.4-mini',
-                     'ANTHROPIC_DEFAULT_OPUS_MODEL':'gpt-5.4-mini','ANTHROPIC_DEFAULT_SONNET_MODEL':'gpt-5.4-mini',
-                     'ANTHROPIC_DEFAULT_HAIKU_MODEL':'gpt-5.4-mini','CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1',
-                     'DISABLE_AUTOUPDATER':'1','DISABLE_TELEMETRY':'1','OPENCODE_CONFIG':'/work/opencode.json',
-                     'OPENCODE_DISABLE_AUTOUPDATE':'true','OPENCODE_DISABLE_SHARE':'true'}
+        model_env = baseline_model_environment(args.arm, token=token, endpoint=endpoint, seconds=args.seconds)
         child_env = dict(os.environ, **model_env)
         if native_capture:
             model_env.update(native_capture.environment)
@@ -393,7 +418,7 @@ def run(args):
         if args.arm=='opencode':
             call(['docker','cp',str(out/'controller-source/benchmark_opencode_entrypoint.py'),container+':/opt/opencode-experiment-entrypoint.py'])
             agent_command=['docker','exec',*exec_env,'--workdir',checkout,container,'python3','/opt/opencode-experiment-entrypoint.py','--',*cli]
-        write_json(out/'launch.json', {'argv':cli, 'environment':{k: ('<per-attempt gateway credential>' if k.endswith(('TOKEN','KEY')) else v) for k,v in model_env.items()}})
+        write_json(out/'launch.json', {'argv':cli, 'environment':launch_environment(model_env)})
         write_json(out/'provisioning.json', {'seconds':time.monotonic()-started_provision,'finished_at':now(),
                                            'client_version':frozen['snapshot_sha256'] if args.arm=='sag' else dex([args.arm if args.arm=='opencode' else 'claude','--version'])})
         thread = threading.Thread(target=monitor,daemon=True);thread.start()

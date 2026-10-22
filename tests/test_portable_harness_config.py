@@ -6,7 +6,15 @@ from pathlib import Path
 import pytest
 
 from scripts.d3r2_campaign import config_environment
-from scripts.run_portable_harness import checkout_pinned_commit, effective_sag_config, prompt, sag_model_config
+from scripts.run_portable_harness import (
+    baseline_model_environment,
+    checkout_pinned_commit,
+    claude_arm_environment,
+    effective_sag_config,
+    launch_environment,
+    prompt,
+    sag_model_config,
+)
 
 
 def environment(config):
@@ -145,3 +153,35 @@ def test_checkout_at_another_commit_is_refused():
     dex, _ = _fake_dex(fail_first_checkout=False, head='0' * 40)
     with pytest.raises(ValueError):
         checkout_pinned_commit(dex, '/workspace/project', 'db8698e9ea679b8319b9e07716c664788e856b2b')
+
+
+def _baseline_environment(arm, seconds=7200):
+    return baseline_model_environment(
+        arm, token="secret-token", endpoint="http://host.docker.internal:18571", seconds=seconds
+    )
+
+
+def test_claude_shell_may_wait_for_one_command_as_long_as_the_attempt_budget():
+    """Claude Code's Bash tool moved pinned builds to the background at its 600 s default
+    and the session ended before they finished (activemq, cayenne, httpcomponents-client,
+    iotdb); its documented limits are raised to the attempt budget, in milliseconds."""
+    assert claude_arm_environment(7200) == {
+        "BASH_DEFAULT_TIMEOUT_MS": "7200000",
+        "BASH_MAX_TIMEOUT_MS": "7200000",
+    }
+    env = _baseline_environment("claude", seconds=5400)
+    assert env["BASH_DEFAULT_TIMEOUT_MS"] == env["BASH_MAX_TIMEOUT_MS"] == "5400000"
+    listed = launch_environment(env)
+    assert listed["BASH_DEFAULT_TIMEOUT_MS"] == listed["BASH_MAX_TIMEOUT_MS"] == "5400000"
+
+
+def test_opencode_shell_limits_are_left_to_the_client():
+    env = _baseline_environment("opencode")
+    assert "BASH_DEFAULT_TIMEOUT_MS" not in env and "BASH_MAX_TIMEOUT_MS" not in env
+
+
+def test_launch_listing_keeps_redacting_gateway_credentials():
+    listed = launch_environment(_baseline_environment("claude"))
+    assert "secret-token" not in listed.values()
+    assert listed["ANTHROPIC_API_KEY"] == "<per-attempt gateway credential>"
+    assert listed["ANTHROPIC_BASE_URL"] == "http://host.docker.internal:18571"
