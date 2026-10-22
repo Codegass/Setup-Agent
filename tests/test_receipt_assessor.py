@@ -564,7 +564,10 @@ class ContainerFS:
         digest it verifies is the digest of the bytes this container holds, so
         a delta claiming bytes these files do not carry loses them here exactly
         as it would in the container (P-B). A claimed path this double never
-        stored stays absent, and the parser calls it unreadable itself.
+        stored stays absent, and the parser calls it unreadable itself. The
+        copy keeps the claimed path, because the parser's layout rules read a
+        report's own name and directory (`testng-results.xml`,
+        `target/surefire-reports/`).
         """
         claims = json.loads(self.files.get(tokens[3], "") or "[]")
         container_path = {}
@@ -572,9 +575,10 @@ class ContainerFS:
             payload = []
             for claim in claims:
                 path = str(claim.get("path") or "")
-                local = Path(root) / hashlib.sha256(path.encode("utf-8")).hexdigest()
+                local = Path(root, "reports", path.lstrip("/"))
                 body = self.files.get(path)
                 if body is not None:
+                    local.parent.mkdir(parents=True, exist_ok=True)
                     local.write_text(body, encoding="utf-8")
                 container_path[str(local)] = path
                 payload.append({**claim, "path": str(local)})
