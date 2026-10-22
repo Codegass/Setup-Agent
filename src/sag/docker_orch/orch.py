@@ -277,6 +277,17 @@ class DockerOrchestrator:
         """Return locale setup that cannot execute project-writable shell code."""
         return "export LANG=${LANG:-C.UTF-8}; " "export LC_ALL=${LC_ALL:-C.UTF-8}"
 
+    def _dispatch_prefix(self, clean_control_path: bool) -> str:
+        """The prefix for one dispatch: the locale, and umask 022 for project commands.
+
+        ``docker exec`` sessions start with umask 0000, so without this every
+        file a clone or build writes is world-writable. Official CI runs with
+        022, and an unprivileged project user's tools can refuse group- or
+        world-writable files. Host-control commands keep their own handling.
+        """
+        prefix = self._runtime_profile_prefix()
+        return prefix if clean_control_path else f"umask 022; {prefix}"
+
     def _control_exec_environment(self) -> Dict[str, str]:
         """Environment for host-control transport, isolated from runtime overlays."""
 
@@ -611,8 +622,9 @@ class DockerOrchestrator:
 
         # Shell startup files are never sourced. Runtime variables are injected
         # through Docker's environment argument after strict host publication
-        # verification; this prefix carries locale defaults only.
-        runtime_profile_prefix = self._runtime_profile_prefix()
+        # verification; this prefix carries locale defaults and, for project
+        # commands, umask 022.
+        runtime_profile_prefix = self._dispatch_prefix(_clean_control_path)
         if workdir:
             quoted_workdir = shlex.quote(workdir)
             wrapped_command = f"{runtime_profile_prefix}; cd {quoted_workdir} && {command}"
@@ -896,8 +908,9 @@ class DockerOrchestrator:
             logger.info(f"🔧 Applied Maven optimizations to mvn parts of compound command")
 
         # Runtime environment is injected below; shell startup files are never
-        # sourced. The prefix carries locale defaults only.
-        runtime_profile_prefix = self._runtime_profile_prefix()
+        # sourced. The prefix carries locale defaults and, for project
+        # commands, umask 022.
+        runtime_profile_prefix = self._dispatch_prefix(_clean_control_path)
         if workdir:
             quoted_workdir = shlex.quote(workdir)
             base_cmd = f"{runtime_profile_prefix}; cd {quoted_workdir} && {command}"
@@ -1215,7 +1228,10 @@ class DockerOrchestrator:
                 "runner_dispatch_state": "not_accepted",
             }
 
-        runtime_profile_prefix = self._runtime_profile_prefix()
+        # A project command's umask 022 is set here, inside the shell the job
+        # execs into, so it replaces the supervisor's private ``umask 077``
+        # only for the project's own files.
+        runtime_profile_prefix = self._dispatch_prefix(_clean_control_path)
         if workdir:
             inner = f"{runtime_profile_prefix}; cd {shlex.quote(workdir)} && {command}"
         else:

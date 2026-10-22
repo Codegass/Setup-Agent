@@ -6,7 +6,9 @@ ran everything as root, where file permissions are not enforced. Official CI
 runs as an ordinary user. With ``project_user`` set, the orchestrator drops to
 that user for Maven, Gradle, pip, pytest and the bash tool, and keeps root for
 its own control work (apt, alternatives, receipts, probes). Unset, every
-command is byte-for-byte what it was before; the pins below hold that.
+command is byte-for-byte what it was before; the pins below hold that. The one
+intended change to the default path since: every project command (not the
+control path) starts with ``umask 022`` (see tests/test_dispatch_umask.py).
 """
 
 import base64
@@ -47,6 +49,8 @@ from sag.tools.internal.system_tool import SystemTool
 SETPRIV = ["/usr/bin/setpriv", "--reuid=sag", "--regid=sag", "--init-groups"]
 IDENTITY = ["HOME=/home/sag", "USER=sag", "LOGNAME=sag"]
 PROFILE = "export LANG=${LANG:-C.UTF-8}; export LC_ALL=${LC_ALL:-C.UTF-8}"
+# The prefix of every project command; the control path keeps PROFILE alone.
+DISPATCH = f"umask 022; {PROFILE}"
 SUDO_HINT = (
     "This command ran as the unprivileged project user. Installing system "
     "packages or changing files outside the project needs sudo, for example: "
@@ -199,7 +203,7 @@ EXECUTE_ARGV_TODAY = [
     "PATH=/opt/jdk/bin:/usr/bin",
     "/bin/bash",
     "-c",
-    f"{PROFILE}; cd /workspace/p && mvn -v",
+    f"{DISPATCH}; cd /workspace/p && mvn -v",
 ]
 MONITORED_ARGV_TODAY = [
     "/usr/bin/timeout",
@@ -209,7 +213,7 @@ MONITORED_ARGV_TODAY = [
     "PATH=/opt/jdk/bin:/usr/bin",
     "/bin/bash",
     "-c",
-    f"{PROFILE}; cd /workspace/p && mvn -B test",
+    f"{DISPATCH}; cd /workspace/p && mvn -B test",
 ]
 
 
@@ -234,7 +238,7 @@ def test_a_project_command_runs_as_the_user_with_its_login_identity():
         *IDENTITY,
         "/bin/bash",
         "-c",
-        f"{PROFILE}; cd /workspace/p && mvn -v",
+        f"{DISPATCH}; cd /workspace/p && mvn -v",
     ]
     # Docker itself still starts the exec as root under the control environment.
     assert container.calls[0]["environment"] == orchestrator._control_exec_environment()
@@ -288,7 +292,7 @@ def test_monitored_project_command_runs_as_the_user():
         *IDENTITY,
         "/bin/bash",
         "-c",
-        f"{PROFILE}; cd /workspace/p && mvn -B test",
+        f"{DISPATCH}; cd /workspace/p && mvn -B test",
     ]
 
 
@@ -296,10 +300,13 @@ class _FixedUUID:
     hex = "0123456789abcdef0123456789abcdef"
 
 
-# sha256 of the supervisor script the unchanged orchestrator produced for
+# sha256 of the supervisor script the orchestrator produces for
 # execute_command_detached("mvn -B test", workdir="/workspace/demo",
-# environment={"MAVEN_OPTS": "-Xmx1g"}) under the fixed job id below.
-DETACHED_LAUNCHER_TODAY_SHA256 = "1e6b5e88a9983f3de119d4fde25bfeb6d347ff759804dd93f3a8b51a9ade1622"
+# environment={"MAVEN_OPTS": "-Xmx1g"}) under the fixed job id below. It moved
+# once, from 1e6b5e88a9983f3de119d4fde25bfeb6d347ff759804dd93f3a8b51a9ade1622,
+# when project commands gained ``umask 022``: the old script plus exactly one
+# "umask 022; " in front of the job's inner command.
+DETACHED_LAUNCHER_TODAY_SHA256 = "956d6bbe5ecc12e55c916358c82a5f2c76bd33caf1f6f67cef33b615bec12dfd"
 
 
 def _detached_orchestrator(monkeypatch, project_user=None):
@@ -371,7 +378,7 @@ def test_detached_job_keeps_root_supervision_and_drops_privileges_at_the_exec(mo
     assert runtime[:5] == [*SETPRIV, "/usr/bin/env"]
     assert runtime[5:10] == ["PATH=/opt/jdk/bin:/usr/bin", "JAVA_HOME=/opt/jdk", *IDENTITY]
     assert runtime[10:12] == ["/bin/bash", "-c"]
-    assert runtime[12] == f"{PROFILE}; cd /workspace/demo && mvn -B test"
+    assert runtime[12] == f"{DISPATCH}; cd /workspace/demo && mvn -B test"
     assert "--reset-env" not in job_script
     syntax = subprocess.run(["bash", "-n", "-c", supervisor], capture_output=True, text=True)
     assert syntax.returncode == 0, syntax.stderr
