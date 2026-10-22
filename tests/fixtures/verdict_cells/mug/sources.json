@@ -1,0 +1,93 @@
+{
+ "cell": "mug",
+ "copied_on": "2026-10-22",
+ "files": [
+  {
+   "fixture": "verdict.json",
+   "fixture_sha256": "99362434694976b2aebc4e099e01569d67655b54755742e2a3e70fc4b3cf1e19",
+   "kept": {
+    "keys": [
+     "schema_version",
+     "run_id",
+     "finalized_at",
+     "verdict",
+     "build_evidence",
+     "test_stats",
+     "rates",
+     "conflicts",
+     "phase_records",
+     "task_completion"
+    ],
+    "phase_record_keys": [
+     "phase",
+     "attempt_id",
+     "termination",
+     "outcome",
+     "validated_outcome",
+     "reason"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/mug/sag-native/logs/session_20261021_073633_904793_6ec0ae3d43b5_49035/.setup_agent/verdict.json",
+   "source_sha256": "91916d385df39f105544f2f7b9fce3d6253887595ce686bbcb0d5ba753b6e5d4"
+  },
+  {
+   "fixture": "task.json",
+   "fixture_sha256": "9d0c664276d2e94ff2068867f373a2f9761e9e61da343a910fe12caea12372c1",
+   "kept": "whole file",
+   "source": "output/benchmark-fifty-20261021/runs/mug/inputs/task.json",
+   "source_sha256": "9d0c664276d2e94ff2068867f373a2f9761e9e61da343a910fe12caea12372c1"
+  },
+  {
+   "fixture": "ci-target.json",
+   "fixture_sha256": "534cd8d884e9b07553d4bfb2b3e49fa12cbe3af69f72cc9cce93ac15f2c9c280",
+   "kept": "whole file",
+   "source": "output/benchmark-fifty-20261021/runs/mug/inputs/ci-target.json",
+   "source_sha256": "534cd8d884e9b07553d4bfb2b3e49fa12cbe3af69f72cc9cce93ac15f2c9c280"
+  },
+  {
+   "fixture": "build_requirements.json",
+   "fixture_sha256": "04ccd38a2bd39776c24db803f8f06c548a181e9961d334740daf6d99e357b659",
+   "kept": {
+    "keys": [
+     "java_requirements"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/mug/sag-native/logs/session_20261021_073633_904793_6ec0ae3d43b5_49035/.setup_agent/build_requirements.json",
+   "source_sha256": "e1ee22c580179f100bdc5b49c5355784d4b8c5d3a3d7781c41cd08e665861e0c"
+  },
+  {
+   "fixture": "control_events.jsonl",
+   "fixture_sha256": "e6da0cbf1a150ef61365d177d9156a1fe893a357beb2866885de688fcef96d06",
+   "kept": {
+    "event_kinds": [
+     "evidence_close",
+     "job_barrier_integrity_failure",
+     "job_live_at_close"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/mug/sag-native/logs/session_20261021_073633_904793_6ec0ae3d43b5_49035/.setup_agent/control_events.jsonl",
+   "source_sha256": "6194d886e3fb251e553901e4770b28252ef7c44da11adedfae8c0a1e9064216b"
+  },
+  {
+   "fixture": "invocation_receipts/inv-maven-1-63696a79a90e-0001.json",
+   "fixture_sha256": "9b2bef5f846d8984b121fea10e8b528b33ff14eb7c687314b503abb7f603c845",
+   "kept": {
+    "keys": [
+     "receipt_id",
+     "tool",
+     "argv",
+     "actual_cwd",
+     "requested_action",
+     "exit_code",
+     "effective_jdk",
+     "toolchain_fingerprint",
+     "module_outcomes",
+     "testcase_execution_totals"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/mug/sag-native/logs/session_20261021_073633_904793_6ec0ae3d43b5_49035/.setup_agent/invocation_receipts/inv-maven-1-63696a79a90e-0001.json",
+   "source_sha256": "b6795766ad8d74bf90e4b8b046fe05820cbf31f517f80ff7c2b3b25071a9dc34"
+  }
+ ],
+ "note": "Finalizer inputs of one sealed campaign cell, trimmed to the fields the measured dimensions read. source_sha256 is the sealed file's digest; fixture_sha256 is this copy's."
+}

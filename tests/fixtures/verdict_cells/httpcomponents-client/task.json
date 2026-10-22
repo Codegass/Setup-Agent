@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "repo": "apache/httpcomponents-client",
+  "sha": "be07c77297576b08bc01bb93789eca6f5f9bf850",
+  "steps": [
+    {
+      "id": "ci-step-1",
+      "runner": "maven",
+      "argv": [
+        "mvn",
+        "-B",
+        "-f",
+        "pom.xml",
+        "clean",
+        "verify",
+        "install",
+        "-P-use-toolchains,nodoclint"
+      ],
+      "cwd": ".",
+      "java_major": 17,
+      "maven_version": "3.9.16"
+    }
+  ]
+}

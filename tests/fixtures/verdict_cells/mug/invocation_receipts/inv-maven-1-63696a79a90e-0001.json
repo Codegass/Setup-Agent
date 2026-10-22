@@ -1,0 +1,98 @@
+{
+ "actual_cwd": "/workspace/mug",
+ "argv": "/opt/apache-maven-3.9.16/bin/mvn clean test -U",
+ "effective_jdk": {
+  "major": "24",
+  "provenance": {
+   "dispatch_runtime": {
+    "distribution": "openjdk",
+    "executable": "/usr/lib/jvm/temurin-24-jdk-amd64/bin/java",
+    "major": "24",
+    "version": "24.0.2"
+   }
+  },
+  "runtime_authority": "dispatch_probe"
+ },
+ "exit_code": 0,
+ "module_outcomes": [
+  {
+   "module": "mug-root",
+   "status": "success"
+  },
+  {
+   "module": "core",
+   "status": "success"
+  },
+  {
+   "module": "Guava add-ons",
+   "status": "success"
+  },
+  {
+   "module": "Compact Parser Combinators",
+   "status": "success"
+  },
+  {
+   "module": "Compile-time plugins",
+   "status": "success"
+  },
+  {
+   "module": "Mug Bill of Materials",
+   "status": "success"
+  },
+  {
+   "module": "Dot CEL",
+   "status": "success"
+  },
+  {
+   "module": "benchmarks",
+   "status": "success"
+  },
+  {
+   "module": "SafeSql",
+   "status": "success"
+  },
+  {
+   "module": "Examples",
+   "status": "success"
+  },
+  {
+   "module": "Protobuf utils",
+   "status": "success"
+  },
+  {
+   "module": "BigQuery Client Library",
+   "status": "success"
+  },
+  {
+   "module": "Safe Spanner Client",
+   "status": "success"
+  },
+  {
+   "module": "Concurrency Testing Utils",
+   "status": "success"
+  },
+  {
+   "module": "Java 24 Concurrency Utils",
+   "status": "success"
+  },
+  {
+   "module": "Tests for SafeSql that require records",
+   "status": "success"
+  }
+ ],
+ "receipt_id": "inv-maven-1-63696a79a90e-0001",
+ "requested_action": "test",
+ "testcase_execution_totals": {
+  "errors": 0,
+  "failed": 0,
+  "passed": 55861,
+  "report_count": 115,
+  "reported": 56528,
+  "skipped": 667
+ },
+ "tool": "maven",
+ "toolchain_fingerprint": {
+  "executable": "/opt/apache-maven-3.9.16/bin/mvn",
+  "version": "Apache Maven 3.9.16 (2bdd9fddda4b155ebf8000e807eb73fd829a51d5)"
+ }
+}

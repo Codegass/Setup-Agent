@@ -1,0 +1,93 @@
+{
+ "cell": "casbin-jcasbin-r3",
+ "copied_on": "2026-10-22",
+ "files": [
+  {
+   "fixture": "verdict.json",
+   "fixture_sha256": "a63d847de079d7757627fe2c9810c23fa864d6ef468f7fe1d6f046217d9f5fda",
+   "kept": {
+    "keys": [
+     "schema_version",
+     "run_id",
+     "finalized_at",
+     "verdict",
+     "build_evidence",
+     "test_stats",
+     "rates",
+     "conflicts",
+     "phase_records",
+     "task_completion"
+    ],
+    "phase_record_keys": [
+     "phase",
+     "attempt_id",
+     "termination",
+     "outcome",
+     "validated_outcome",
+     "reason"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r3/sag-native/logs/session_20261022_010241_802500_12cdf01508c5_20649/.setup_agent/verdict.json",
+   "source_sha256": "a4da1709fbcd5fc8d9f0b207a345949891fd48a404ed5c7be8453e6cc60cf823"
+  },
+  {
+   "fixture": "task.json",
+   "fixture_sha256": "c902b802d70425a981d906735bf0a704d160acff3cf934eee7ee1cb0c5101101",
+   "kept": "whole file",
+   "source": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r3/inputs/task.json",
+   "source_sha256": "c902b802d70425a981d906735bf0a704d160acff3cf934eee7ee1cb0c5101101"
+  },
+  {
+   "fixture": "ci-target.json",
+   "fixture_sha256": "746eb1afc842d6e7703073efbafbaa1724fa4b5fc0225e7fedf1b36d0efe6b95",
+   "kept": "whole file",
+   "source": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r3/inputs/ci-target.json",
+   "source_sha256": "746eb1afc842d6e7703073efbafbaa1724fa4b5fc0225e7fedf1b36d0efe6b95"
+  },
+  {
+   "fixture": "build_requirements.json",
+   "fixture_sha256": "fdffff155eb8444b6d403d16c0a5601f54030bc3d63dbb93a1823633cdeae770",
+   "kept": {
+    "keys": [
+     "java_requirements"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r3/sag-native/logs/session_20261022_010241_802500_12cdf01508c5_20649/.setup_agent/build_requirements.json",
+   "source_sha256": "d9681d33fd796a12d7e8f2d2e5a3a7993fe7267ba76c12ab9c5b8f3c72d5c901"
+  },
+  {
+   "fixture": "control_events.jsonl",
+   "fixture_sha256": "d597b3970eec44448129b6665a7753d02e941ae313c00765ad31ae94d83932f1",
+   "kept": {
+    "event_kinds": [
+     "evidence_close",
+     "job_barrier_integrity_failure",
+     "job_live_at_close"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r3/sag-native/logs/session_20261022_010241_802500_12cdf01508c5_20649/.setup_agent/control_events.jsonl",
+   "source_sha256": "6b9c1287c34f7f96f8168ccd62c9e655bfac011fb85fdab0c5546ad852fa620d"
+  },
+  {
+   "fixture": "invocation_receipts/inv-maven-1-d44dda9b4c64-0001.json",
+   "fixture_sha256": "f0221f401fa4a73d8f890a6eb3468abe8caf83ebd9be64bcdd3d87b81efb4c30",
+   "kept": {
+    "keys": [
+     "receipt_id",
+     "tool",
+     "argv",
+     "actual_cwd",
+     "requested_action",
+     "exit_code",
+     "effective_jdk",
+     "toolchain_fingerprint",
+     "module_outcomes",
+     "testcase_execution_totals"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r3/sag-native/logs/session_20261022_010241_802500_12cdf01508c5_20649/.setup_agent/invocation_receipts/inv-maven-1-d44dda9b4c64-0001.json",
+   "source_sha256": "bae4cb2b810f45d4095098dfb7e081823c544ae32448979555650bb47fc99247"
+  }
+ ],
+ "note": "Finalizer inputs of one sealed campaign cell, trimmed to the fields the measured dimensions read. source_sha256 is the sealed file's digest; fixture_sha256 is this copy's."
+}

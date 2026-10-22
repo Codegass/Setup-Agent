@@ -1,0 +1,141 @@
+{
+ "build_evidence": {
+  "compiled_classes": 242,
+  "evidence_status": "verified",
+  "green": true,
+  "judgment": "success",
+  "observed": true,
+  "outcome": "success",
+  "reactor_modules_succeeded": 1,
+  "reactor_modules_total": 1,
+  "refs": [
+   "/workspace/casbin-jcasbin/target/classes/org/casbin/jcasbin/config/Config.class",
+   "/workspace/casbin-jcasbin/target/classes/org/casbin/jcasbin/detector/DefaultDetector$DFSState.class",
+   "/workspace/casbin-jcasbin/target/classes/org/casbin/jcasbin/detector/DefaultDetector.class",
+   "/workspace/casbin-jcasbin/target/classes/org/casbin/jcasbin/detector/Detector.class",
+   "/workspace/casbin-jcasbin/target/classes/org/casbin/jcasbin/rbac/RoleManager.class",
+   "/workspace/casbin-jcasbin/target/jcasbin-1.100.0.jar",
+   "/workspace/casbin-jcasbin/target/jcasbin-1.100.0-javadoc.jar",
+   "/workspace/casbin-jcasbin/target/jcasbin-1.100.0-sources.jar",
+   "output_cf8ef23602da",
+   "output_7ea98b368620"
+  ],
+  "source": "physical",
+  "source_files": 80
+ },
+ "conflicts": [],
+ "finalized_at": "2026-10-22T05:11:37.557784Z",
+ "phase_records": [
+  {
+   "attempt_id": "provision-1",
+   "outcome": "success",
+   "phase": "provision",
+   "reason": "workspace /workspace/casbin-jcasbin exists",
+   "termination": "completed",
+   "validated_outcome": "success"
+  },
+  {
+   "attempt_id": "analyze-1",
+   "outcome": "success",
+   "phase": "analyze",
+   "reason": "project analysis validator returned no conclusion",
+   "termination": "completed",
+   "validated_outcome": "success"
+  },
+  {
+   "attempt_id": "build-1",
+   "outcome": "success",
+   "phase": "build",
+   "reason": "JVM compilation evidence observed. Required command receipts determine task completion. Official-CI evidence determines scope attainment separately. \u00b7 Filesystem diagnostic: Module coverage: 1/1 built [.] \u00b7 tests ran in 1/1 test-bearing modules",
+   "termination": "completed",
+   "validated_outcome": "success"
+  },
+  {
+   "attempt_id": "test-1",
+   "outcome": "success",
+   "phase": "test",
+   "reason": "executed 266 of 266 discovered \u00b7 266 passed, 0 failed, 0 skipped",
+   "termination": "completed",
+   "validated_outcome": "success"
+  }
+ ],
+ "rates": {
+  "build": {
+   "classes": {
+    "band": "unavailable",
+    "reason": "terminal reactor receipt is authoritative; filesystem class/source counts are diagnostic and not comparable"
+   },
+   "modules": {
+    "band": "fully",
+    "denominator": 1,
+    "numerator": 1,
+    "rate": 100.0,
+    "reason": "terminal root reactor receipt is authoritative"
+   }
+  },
+  "coverage": {
+   "reason": "coverage pass not run",
+   "status": "unavailable"
+  },
+  "test": {
+   "cases": {
+    "band": "fully",
+    "denominator": 266,
+    "numerator": 266,
+    "rate": 100.0,
+    "reason": "266 static test declarations observed (diagnostic only; not the runtime denominator)"
+   },
+   "modules": {
+    "band": "unavailable",
+    "reason": "test receipts identify execution domains, not module coverage"
+   }
+  }
+ },
+ "run_id": "20261022_010241_802500_12cdf01508c5_20649-7-d9c6d94bfb5e",
+ "schema_version": 5,
+ "task_completion": {
+  "reasons": [],
+  "run_id": "20261022_010241_802500_12cdf01508c5_20649-7-d9c6d94bfb5e",
+  "source_changes_by_task": [
+   "examples/basic_policy.csv",
+   "examples/rbac_policy.csv",
+   "examples/rbac_with_domains_policy.csv"
+  ],
+  "status": "complete",
+  "steps": [
+   {
+    "command": "mvn -B -ntp clean verify cobertura:cobertura -Dgpg.skip=true",
+    "exit_code": 0,
+    "id": "ci-step-1",
+    "reason": null,
+    "receipt_id": "inv-maven-1-d44dda9b4c64-0001",
+    "status": "complete"
+   }
+  ],
+  "task_sha256": "916fc839ec5cee5de0bddbee4a0bb0be40e5f0212d8f3aaa1af8e921c50f85df"
+ },
+ "test_stats": {
+  "collection_errors": 0,
+  "collection_errors_skipped": 0,
+  "denominator_basis": "complete",
+  "discovered": 266,
+  "flaky_count": 0,
+  "judgment": "success",
+  "raw": {
+   "errors": 0,
+   "executed": 798,
+   "failed": 0,
+   "passed": 798,
+   "skipped": 0
+  },
+  "receipt_scoped": true,
+  "unique": {
+   "errors": 0,
+   "executed": 266,
+   "failed": 0,
+   "passed": 266,
+   "skipped": 0
+  }
+ },
+ "verdict": "success"
+}

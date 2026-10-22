@@ -1,0 +1,6 @@
+{
+ "argv": "/opt/apache-maven-3.9.16/bin/mvn --errors --show-version --batch-mode --no-transfer-progress -DtrimStackTrace=false -Djdk.tls.client.protocols=TLSv1.2",
+ "job_id": "18226eceacb1",
+ "tool": "maven",
+ "working_directory": "/workspace/commons-vfs"
+}

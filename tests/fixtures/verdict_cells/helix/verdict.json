@@ -1,0 +1,154 @@
+{
+ "build_evidence": {
+  "compiled_classes": 5461,
+  "evidence_status": "verified",
+  "green": true,
+  "judgment": "success",
+  "observed": true,
+  "outcome": "success",
+  "reactor_modules_succeeded": 18,
+  "reactor_modules_total": 18,
+  "refs": [
+   "/workspace/helix/helix-agent/target/classes/org/apache/helix/agent/AgentStateModel.class",
+   "/workspace/helix/helix-agent/target/classes/org/apache/helix/agent/CommandAttribute.class",
+   "/workspace/helix/helix-agent/target/classes/org/apache/helix/agent/SystemUtil$ProcessStateCode.class",
+   "/workspace/helix/helix-agent/target/classes/org/apache/helix/agent/SystemUtil.class",
+   "/workspace/helix/helix-agent/target/classes/org/apache/helix/agent/CommandConfig$Builder.class",
+   "/workspace/helix/helix-agent/target/helix-agent-2.0.2-SNAPSHOT.jar",
+   "/workspace/helix/helix-agent/target/helix-agent-2.0.2-SNAPSHOT-sources.jar",
+   "/workspace/helix/helix-agent/target/helix-agent-pkg/repo/org/slf4j/slf4j-api/1.7.32/slf4j-api-1.7.32.jar",
+   "/workspace/helix/helix-agent/target/helix-agent-pkg/repo/org/apache/logging/log4j/log4j-slf4j-impl/2.25.4/log4j-slf4j-impl-2.25.4.jar",
+   "/workspace/helix/helix-agent/target/helix-agent-pkg/repo/org/apache/logging/log4j/log4j-api/2.25.4/log4j-api-2.25.4.jar",
+   "output_7925a87ad9ef"
+  ],
+  "source": "physical",
+  "source_files": 901
+ },
+ "conflicts": [
+  "job_live_at_close:be6ae3c023c2",
+  "job_live_at_close:f0abe297f3af",
+  "test_executions_unattributed_to_receipts",
+  "acceptance_task_incomplete"
+ ],
+ "finalized_at": "2026-10-21T13:55:31.427773Z",
+ "phase_records": [
+  {
+   "attempt_id": "provision-1",
+   "outcome": "success",
+   "phase": "provision",
+   "reason": "workspace /workspace/helix exists",
+   "termination": "completed",
+   "validated_outcome": "success"
+  },
+  {
+   "attempt_id": "analyze-1",
+   "outcome": "success",
+   "phase": "analyze",
+   "reason": "project analysis validator returned no conclusion",
+   "termination": "completed",
+   "validated_outcome": "success"
+  },
+  {
+   "attempt_id": "build-1",
+   "outcome": "partial",
+   "phase": "build",
+   "reason": "job be6ae3c023c2 was still live at the report reserve; the controller stopped waiting with 600.0s reserved for the report and no terminal runner receipt",
+   "termination": "blocked",
+   "validated_outcome": "partial"
+  },
+  {
+   "attempt_id": "test-1",
+   "outcome": "failed",
+   "phase": "test",
+   "reason": "job be6ae3c023c2, f0abe297f3af was still live at the report reserve; the controller stopped waiting with 600.0s reserved for the report and no terminal runner receipt",
+   "termination": "blocked",
+   "validated_outcome": "failed"
+  }
+ ],
+ "rates": {
+  "build": {
+   "classes": {
+    "band": "unavailable",
+    "reason": "terminal reactor receipt is authoritative; filesystem class/source counts are diagnostic and not comparable"
+   },
+   "modules": {
+    "band": "fully",
+    "denominator": 18,
+    "numerator": 18,
+    "rate": 100.0,
+    "reason": "terminal root reactor receipt is authoritative"
+   }
+  },
+  "coverage": {
+   "reason": "coverage pass not run",
+   "status": "unavailable"
+  },
+  "test": {
+   "cases": {
+    "band": "unavailable",
+    "reason": "no receipt-scoped runtime outcomes were accounted; 1,923 static test declarations observed (diagnostic only; not the runtime denominator); 618 executions visible on disk but bound to no receipt"
+   },
+   "modules": {
+    "band": "unavailable",
+    "reason": "test receipts identify execution domains, not module coverage"
+   }
+  }
+ },
+ "run_id": "20261021_075941_347916_8562e521bb9c_50617-7-4f40a14af6b3",
+ "schema_version": 5,
+ "task_completion": {
+  "reasons": [],
+  "run_id": "20261021_075941_347916_8562e521bb9c_50617-7-4f40a14af6b3",
+  "status": "incomplete",
+  "steps": [
+   {
+    "command": "mvn clean install -Dmaven.test.skip.exec=true -DretryFailedDeploymentCount=5",
+    "exit_code": 0,
+    "id": "ci-step-1",
+    "reason": null,
+    "receipt_id": "inv-maven-1-ef19b02e549f-0001",
+    "status": "complete"
+   },
+   {
+    "command": "mvn -q -fae test",
+    "exit_code": null,
+    "id": "ci-step-2",
+    "reason": "No retained invocation matches this command and directory.",
+    "receipt_id": null,
+    "status": "missing"
+   }
+  ],
+  "task_sha256": "beaa6c372475931ada06e710f504d6c97dd2ce725063da012b1be0aae512e2ca"
+ },
+ "test_stats": {
+  "auxiliary_test_stats": {
+   "errors": 0,
+   "executed": 618,
+   "failed": 0,
+   "passed": 618,
+   "skipped": 0
+  },
+  "collection_errors": 0,
+  "collection_errors_skipped": 0,
+  "denominator_basis": "complete",
+  "discovered": 1923,
+  "flaky_count": 0,
+  "judgment": "unknown",
+  "raw": {
+   "errors": 0,
+   "executed": 0,
+   "failed": 0,
+   "passed": 0,
+   "skipped": 0
+  },
+  "receipt_scoped": true,
+  "unique": {
+   "errors": 0,
+   "executed": 0,
+   "failed": 0,
+   "passed": 0,
+   "skipped": 0
+  }
+ },
+ "verdict": "partial"
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "repo": "google/mug",
+  "sha": "42460eb1f8ae8c7ddcbd3f13763261b60b101066",
+  "steps": [
+    {
+      "id": "ci-step-1",
+      "runner": "maven",
+      "argv": [
+        "mvn",
+        "clean",
+        "test",
+        "-U"
+      ],
+      "cwd": ".",
+      "java_major": 24,
+      "maven_version": "3.9.16"
+    }
+  ]
+}

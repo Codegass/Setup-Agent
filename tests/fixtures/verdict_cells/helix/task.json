@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "repo": "apache/helix",
+  "sha": "6d548b61195ee2a7fb5eb47e409eadc447fa820a",
+  "steps": [
+    {
+      "id": "ci-step-1",
+      "runner": "maven",
+      "argv": [
+        "mvn",
+        "clean",
+        "install",
+        "-Dmaven.test.skip.exec=true",
+        "-DretryFailedDeploymentCount=5"
+      ],
+      "cwd": ".",
+      "java_major": 11
+    },
+    {
+      "id": "ci-step-2",
+      "runner": "maven",
+      "argv": [
+        "mvn",
+        "-q",
+        "-fae",
+        "test"
+      ],
+      "cwd": ".",
+      "java_major": 11
+    }
+  ]
+}

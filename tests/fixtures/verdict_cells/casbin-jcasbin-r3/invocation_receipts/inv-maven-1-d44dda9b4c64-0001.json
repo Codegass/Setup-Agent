@@ -1,0 +1,32 @@
+{
+ "actual_cwd": "/workspace/casbin-jcasbin",
+ "argv": "/opt/apache-maven-3.9.9/bin/mvn -B -ntp clean verify cobertura:cobertura -Dgpg.skip=true",
+ "effective_jdk": {
+  "major": "8",
+  "provenance": {
+   "dispatch_runtime": {
+    "distribution": "openjdk",
+    "executable": "/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java",
+    "major": "8",
+    "version": "1.8.0_504"
+   }
+  },
+  "runtime_authority": "dispatch_probe"
+ },
+ "exit_code": 0,
+ "receipt_id": "inv-maven-1-d44dda9b4c64-0001",
+ "requested_action": "verify",
+ "testcase_execution_totals": {
+  "errors": 0,
+  "failed": 0,
+  "passed": 266,
+  "report_count": 35,
+  "reported": 266,
+  "skipped": 0
+ },
+ "tool": "maven",
+ "toolchain_fingerprint": {
+  "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+  "version": "Apache Maven 3.9.9 (8e8579a9e76f7d015ee5ec7bfcdc97d260186937)"
+ }
+}

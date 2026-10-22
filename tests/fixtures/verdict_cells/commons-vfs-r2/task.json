@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "repo": "apache/commons-vfs",
+  "sha": "13cd0e478211b6a92b2a57a82c8f19c13376daff",
+  "steps": [
+    {
+      "id": "ci-step-1",
+      "runner": "maven",
+      "argv": [
+        "mvn",
+        "--errors",
+        "--show-version",
+        "--batch-mode",
+        "--no-transfer-progress",
+        "-DtrimStackTrace=false",
+        "-Djdk.tls.client.protocols=TLSv1.2"
+      ],
+      "cwd": ".",
+      "java_major": 11,
+      "maven_version": "3.9.16"
+    }
+  ]
+}

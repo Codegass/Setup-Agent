@@ -1,0 +1,87 @@
+{
+ "cell": "commons-vfs-r2",
+ "copied_on": "2026-10-22",
+ "files": [
+  {
+   "fixture": "verdict.json",
+   "fixture_sha256": "d08375076205fb38f2f541ee7cd8eca13d59e6413b63df4142d06daaba327938",
+   "kept": {
+    "keys": [
+     "schema_version",
+     "run_id",
+     "finalized_at",
+     "verdict",
+     "build_evidence",
+     "test_stats",
+     "rates",
+     "conflicts",
+     "phase_records",
+     "task_completion"
+    ],
+    "phase_record_keys": [
+     "phase",
+     "attempt_id",
+     "termination",
+     "outcome",
+     "validated_outcome",
+     "reason"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/commons-vfs-r2/sag-native/logs/session_20261021_210541_276338_a58201ece54a_8133/.setup_agent/verdict.json",
+   "source_sha256": "23385f34640ce4879bc5c92e2232a8967c151a88c148c3cad014854364b55a4f"
+  },
+  {
+   "fixture": "task.json",
+   "fixture_sha256": "ef2b93e3bebfe2d407d9c6c1a51ac42406b95955a379cec626b9fb87df7a833b",
+   "kept": "whole file",
+   "source": "output/benchmark-fifty-20261021/runs/commons-vfs-r2/inputs/task.json",
+   "source_sha256": "ef2b93e3bebfe2d407d9c6c1a51ac42406b95955a379cec626b9fb87df7a833b"
+  },
+  {
+   "fixture": "ci-target.json",
+   "fixture_sha256": "d7e67dd777c9ea8d91f56e9d730589aca647b552ef1cda6c0ee14e92f94c1e55",
+   "kept": "whole file",
+   "source": "output/benchmark-fifty-20261021/runs/commons-vfs-r2/inputs/ci-target.json",
+   "source_sha256": "d7e67dd777c9ea8d91f56e9d730589aca647b552ef1cda6c0ee14e92f94c1e55"
+  },
+  {
+   "fixture": "build_requirements.json",
+   "fixture_sha256": "b59642c1a8b830b479d2d6e0a1d91a7bac68987ffef85641b6918d7f1b8eafe8",
+   "kept": {
+    "keys": [
+     "java_requirements"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/commons-vfs-r2/sag-native/logs/session_20261021_210541_276338_a58201ece54a_8133/.setup_agent/build_requirements.json",
+   "source_sha256": "c339098c635864746eef59d8e1b2969f7dda7f55f87d1030e203e06c8a07a873"
+  },
+  {
+   "fixture": "control_events.jsonl",
+   "fixture_sha256": "f49c9b1bbc714d0799105ffcaa94bd5995faac590a77a2ff583b616b174d7dab",
+   "kept": {
+    "event_kinds": [
+     "evidence_close",
+     "job_barrier_integrity_failure",
+     "job_live_at_close"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/commons-vfs-r2/sag-native/logs/session_20261021_210541_276338_a58201ece54a_8133/.setup_agent/control_events.jsonl",
+   "source_sha256": "174466858382463bb510203a06b7d45cbd752b0aa2949bf2f93ad7bc26dd0c60"
+  },
+  {
+   "fixture": "job_obligations/18226eceacb1.json",
+   "fixture_sha256": "05292ecfb5f999810a6a0aa320c22879d8ef61aa2fa68e9ace4261d6001f12e0",
+   "kept": {
+    "keys": [
+     "job_id",
+     "tool",
+     "argv",
+     "working_directory"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/commons-vfs-r2/sag-native/logs/session_20261021_210541_276338_a58201ece54a_8133/.setup_agent/job_obligations/18226eceacb1.json",
+   "source_sha256": "d37e6074095b9f74d1d17b64bd2df4a33bfc7cdaacd1ec0c47e2d56a22ac8e84"
+  }
+ ],
+ "note": "Finalizer inputs of one sealed campaign cell, trimmed to the fields the measured dimensions read. source_sha256 is the sealed file's digest; fixture_sha256 is this copy's."
+}

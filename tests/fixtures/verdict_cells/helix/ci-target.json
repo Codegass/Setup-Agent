@@ -1,0 +1,37 @@
+{
+  "schema_version": 2,
+  "repo": "apache/helix",
+  "sha": "6d548b61195ee2a7fb5eb47e409eadc447fa820a",
+  "harvested_at": "2026-10-21T08:07:50.097746+00:00",
+  "cells": [
+    {
+      "cell_id": "Merge_PR_CI",
+      "build": "ok",
+      "executed_count": 0,
+      "executed_ids": [],
+      "red_count": 0,
+      "red_ids": [],
+      "flaky_count": 0,
+      "flaky_ids": [],
+      "skipped": 0,
+      "modules": [],
+      "modules_basis": null,
+      "command": "mvn -q -fae test",
+      "grade": "B",
+      "laundered_conclusion": false,
+      "evidence_refs": [
+        "https://api.github.com/repos/apache/helix/actions/runs/29045674717/attempts/1/logs",
+        "https://github.com/apache/helix/actions/runs/29045674717/job/86213623121"
+      ]
+    }
+  ],
+  "matched_cell": "Merge_PR_CI",
+  "notes": [
+    "Review-required tier: prepared offline from the archived official job log and the acquired dataset. harvested_at records this offline construction, not a new CI download.",
+    "Dataset counts for the selected Maven invocation: reported 2003, failures 0, errors 0, skipped 5.",
+    "Archived job log aggregate Tests run summaries: none found.",
+    "The dataset and the log disagree, so no count is asserted: zero here means unavailable, not an observed zero-test run. The schema has no grade below B, so the cell keeps grade B.",
+    "Grade B: only aggregate console summaries are archived; there is no JUnit XML or complete case pool.",
+    "The command field names the final frozen step; all steps: mvn clean install -Dmaven.test.skip.exec=true -DretryFailedDeploymentCount=5 then mvn -q -fae test."
+  ]
+}

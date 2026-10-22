@@ -1,0 +1,98 @@
+{
+ "actual_cwd": "/workspace/helix",
+ "argv": "/usr/local/bin/mvn clean install -Dmaven.test.skip.exec=true -DretryFailedDeploymentCount=5",
+ "effective_jdk": {
+  "major": "11",
+  "provenance": {
+   "dispatch_runtime": {
+    "distribution": "openjdk",
+    "executable": "/usr/lib/jvm/java-11-openjdk-amd64/bin/java",
+    "major": "11",
+    "version": "11.0.32.1"
+   }
+  },
+  "runtime_authority": "dispatch_probe"
+ },
+ "exit_code": 0,
+ "module_outcomes": [
+  {
+   "module": "Apache Helix",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Metrics Common",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Metadata Store Directory Common",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: ZooKeeper API",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Helix Common",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Core",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Restful Interface",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Distributed Lock",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: HelixAgent",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Recipes",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Recipes :: Rabbitmq Consumer Group",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Recipes :: Rsync Replicated File Store",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Recipes :: distributed lock manager",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Recipes :: distributed task execution",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Recipes :: service discovery",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: View Aggregator",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Meta Client",
+   "status": "success"
+  },
+  {
+   "module": "Apache Helix :: Helix Gateway",
+   "status": "success"
+  }
+ ],
+ "receipt_id": "inv-maven-1-ef19b02e549f-0001",
+ "requested_action": "install",
+ "tool": "maven",
+ "toolchain_fingerprint": {
+  "executable": "/usr/local/bin/mvn",
+  "version": "Apache Maven 3.8.7"
+ }
+}

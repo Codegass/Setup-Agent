@@ -1,0 +1,9 @@
+{
+ "java_requirements": {
+  "compiler_release": "8",
+  "compiler_source": "/workspace/casbin-jcasbin/pom.xml:target",
+  "compiler_toolchain": false,
+  "runtime": [],
+  "unresolved": []
+ }
+}

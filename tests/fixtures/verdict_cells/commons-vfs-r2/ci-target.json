@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "repo": "apache/commons-vfs",
+  "sha": "13cd0e478211b6a92b2a57a82c8f19c13376daff",
+  "harvested_at": "2026-10-21T07:49:30.925170+00:00",
+  "cells": [
+    {
+      "cell_id": "build (ubuntu-latest, 11, false)",
+      "build": "ok",
+      "executed_count": 3537,
+      "executed_ids": [],
+      "red_count": 0,
+      "red_ids": [],
+      "flaky_count": 0,
+      "flaky_ids": [],
+      "skipped": 779,
+      "modules": [],
+      "modules_basis": null,
+      "command": "mvn --errors --show-version --batch-mode --no-transfer-progress -DtrimStackTrace=false -Djdk.tls.client.protocols=TLSv1.2",
+      "grade": "B",
+      "laundered_conclusion": false,
+      "evidence_refs": [
+        "https://api.github.com/repos/apache/commons-vfs/actions/runs/34156593299/attempts/1/logs",
+        "https://github.com/apache/commons-vfs/actions/runs/34156593299/job/101849600749"
+      ]
+    }
+  ],
+  "matched_cell": "build (ubuntu-latest, 11, false)",
+  "notes": [
+    "Review-required tier: prepared offline from the archived official job log and the acquired dataset. harvested_at records this offline construction, not a new CI download.",
+    "Dataset counts for the selected Maven invocation: reported 3537, failures 0, errors 0, skipped 779.",
+    "Archived job log aggregate Tests run summaries: reported 3537, failures 0, errors 0, skipped 779 over 4 summary line(s).",
+    "The dataset and the log agree. executed_count is the native reported total including skipped records.",
+    "Grade B: only aggregate console summaries are archived; there is no JUnit XML or complete case pool."
+  ]
+}

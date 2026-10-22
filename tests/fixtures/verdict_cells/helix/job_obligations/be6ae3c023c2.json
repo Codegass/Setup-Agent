@@ -1,0 +1,6 @@
+{
+ "argv": "/usr/local/bin/mvn -q -fae test",
+ "job_id": "be6ae3c023c2",
+ "tool": "maven",
+ "working_directory": "/workspace/helix"
+}

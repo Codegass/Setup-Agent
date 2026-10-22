@@ -1,0 +1,6 @@
+{
+ "argv": "/usr/local/bin/mvn --fail-at-end -Dmaven.test.failure.ignore=true test",
+ "job_id": "f0abe297f3af",
+ "tool": "maven",
+ "working_directory": "/workspace/helix"
+}

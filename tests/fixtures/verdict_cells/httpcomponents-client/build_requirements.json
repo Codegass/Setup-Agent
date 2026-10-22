@@ -1,0 +1,16 @@
+{
+ "java_requirements": {
+  "compiler_release": "8",
+  "compiler_source": "/workspace/httpcomponents-client/pom.xml:maven.compiler.target",
+  "compiler_toolchain": true,
+  "runtime": [
+   {
+    "constraint": "[17,)",
+    "source": "/workspace/httpcomponents-client/pom.xml:requireJavaVersion"
+   }
+  ],
+  "unresolved": [
+   "/workspace/httpcomponents-client/pom.xml:profile_activation:use-toolchains"
+  ]
+ }
+}

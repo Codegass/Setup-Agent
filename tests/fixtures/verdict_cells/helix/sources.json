@@ -1,0 +1,121 @@
+{
+ "cell": "helix",
+ "copied_on": "2026-10-22",
+ "files": [
+  {
+   "fixture": "verdict.json",
+   "fixture_sha256": "19a4dc04a29bd66b6b55362a2ec57dea8305315ce3b3488496d8b27febb72a3a",
+   "kept": {
+    "keys": [
+     "schema_version",
+     "run_id",
+     "finalized_at",
+     "verdict",
+     "build_evidence",
+     "test_stats",
+     "rates",
+     "conflicts",
+     "phase_records",
+     "task_completion"
+    ],
+    "phase_record_keys": [
+     "phase",
+     "attempt_id",
+     "termination",
+     "outcome",
+     "validated_outcome",
+     "reason"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/helix/sag-native/logs/session_20261021_075941_347916_8562e521bb9c_50617/.setup_agent/verdict.json",
+   "source_sha256": "d82ddf42c5e3518a2cdb7bf1a0d7c5b6788e88dcac677ef7466182a7c3fd9e8a"
+  },
+  {
+   "fixture": "task.json",
+   "fixture_sha256": "b9ca6c5003c46987037632ad0a07d25383f1ea6e340e6ed8a6ed1334e5e50620",
+   "kept": "whole file",
+   "source": "output/benchmark-fifty-20261021/runs/helix/inputs/task.json",
+   "source_sha256": "b9ca6c5003c46987037632ad0a07d25383f1ea6e340e6ed8a6ed1334e5e50620"
+  },
+  {
+   "fixture": "ci-target.json",
+   "fixture_sha256": "e494e7df9664895fbff9311a677ced9f1d5fabd7685ad65310b0d79974575cc4",
+   "kept": "whole file",
+   "source": "output/benchmark-fifty-20261021/runs/helix/inputs/ci-target.json",
+   "source_sha256": "e494e7df9664895fbff9311a677ced9f1d5fabd7685ad65310b0d79974575cc4"
+  },
+  {
+   "fixture": "build_requirements.json",
+   "fixture_sha256": "6854b4fda4cf27a2578b70e3565a602f400994fe374481a0ea6fc5d07dd4c402",
+   "kept": {
+    "keys": [
+     "java_requirements"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/helix/sag-native/logs/session_20261021_075941_347916_8562e521bb9c_50617/.setup_agent/build_requirements.json",
+   "source_sha256": "98d1f378d65a2ccb7625bf8c958e205c66f896a51e64670c55104297e67c40d0"
+  },
+  {
+   "fixture": "control_events.jsonl",
+   "fixture_sha256": "5d41a9ff96484af09921572553a8e10f61065a92a8241bb752d100e5b2b4dddd",
+   "kept": {
+    "event_kinds": [
+     "evidence_close",
+     "job_barrier_integrity_failure",
+     "job_live_at_close"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/helix/sag-native/logs/session_20261021_075941_347916_8562e521bb9c_50617/.setup_agent/control_events.jsonl",
+   "source_sha256": "63ad0ee5868dab1fbe3744483acf592aacea38f7363709ab56a20138ebc38192"
+  },
+  {
+   "fixture": "invocation_receipts/inv-maven-1-ef19b02e549f-0001.json",
+   "fixture_sha256": "33043fc0fcbd338fce8292cdd35450fb805e94fc179bb1b413f657b837ca8782",
+   "kept": {
+    "keys": [
+     "receipt_id",
+     "tool",
+     "argv",
+     "actual_cwd",
+     "requested_action",
+     "exit_code",
+     "effective_jdk",
+     "toolchain_fingerprint",
+     "module_outcomes",
+     "testcase_execution_totals"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/helix/sag-native/logs/session_20261021_075941_347916_8562e521bb9c_50617/.setup_agent/invocation_receipts/inv-maven-1-ef19b02e549f-0001.json",
+   "source_sha256": "f6c315c65bfa5b2a9b6b47f8079bebad53088df3817b53e6153337da4b1071e8"
+  },
+  {
+   "fixture": "job_obligations/be6ae3c023c2.json",
+   "fixture_sha256": "a5b77b67fed440733fc62bd854473f7a8c7be53fc57320438421e0d228541d45",
+   "kept": {
+    "keys": [
+     "job_id",
+     "tool",
+     "argv",
+     "working_directory"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/helix/sag-native/logs/session_20261021_075941_347916_8562e521bb9c_50617/.setup_agent/job_obligations/be6ae3c023c2.json",
+   "source_sha256": "fd6b0de47bab69eb5e2b0b3db17ceaad3efc4c1eb82f284fd0bde5ac08484798"
+  },
+  {
+   "fixture": "job_obligations/f0abe297f3af.json",
+   "fixture_sha256": "bc990d1d8898772107aa7491705e2cd957aed4909fc93d0f137de498b3f2c36d",
+   "kept": {
+    "keys": [
+     "job_id",
+     "tool",
+     "argv",
+     "working_directory"
+    ]
+   },
+   "source": "output/benchmark-fifty-20261021/runs/helix/sag-native/logs/session_20261021_075941_347916_8562e521bb9c_50617/.setup_agent/job_obligations/f0abe297f3af.json",
+   "source_sha256": "bcb19e632cce8514f15b4e7d850d9676c31d59157d8dd294ad375c69a61ab504"
+  }
+ ],
+ "note": "Finalizer inputs of one sealed campaign cell, trimmed to the fields the measured dimensions read. source_sha256 is the sealed file's digest; fixture_sha256 is this copy's."
+}

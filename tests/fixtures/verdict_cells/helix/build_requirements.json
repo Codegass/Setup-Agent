@@ -1,0 +1,9 @@
+{
+ "java_requirements": {
+  "compiler_release": "11",
+  "compiler_source": "/workspace/helix/pom.xml:release",
+  "compiler_toolchain": false,
+  "runtime": [],
+  "unresolved": []
+ }
+}

@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "repo": "google/mug",
+  "sha": "42460eb1f8ae8c7ddcbd3f13763261b60b101066",
+  "harvested_at": "2026-10-21T07:49:31.845422+00:00",
+  "cells": [
+    {
+      "cell_id": "build",
+      "build": "ok",
+      "executed_count": 56528,
+      "executed_ids": [],
+      "red_count": 0,
+      "red_ids": [],
+      "flaky_count": 0,
+      "flaky_ids": [],
+      "skipped": 667,
+      "modules": [],
+      "modules_basis": null,
+      "command": "mvn clean test -U",
+      "grade": "B",
+      "laundered_conclusion": false,
+      "evidence_refs": [
+        "https://api.github.com/repos/google/mug/actions/runs/35168167905/attempts/1/logs",
+        "https://github.com/google/mug/actions/runs/35168167905/job/105033840472"
+      ]
+    }
+  ],
+  "matched_cell": "build",
+  "notes": [
+    "Review-required tier: prepared offline from the archived official job log and the acquired dataset. harvested_at records this offline construction, not a new CI download.",
+    "Dataset counts for the selected Maven invocation: reported 56528, failures 0, errors 0, skipped 667.",
+    "Archived job log aggregate Tests run summaries: reported 56528, failures 0, errors 0, skipped 667 over 14 summary line(s).",
+    "The dataset and the log agree. executed_count is the native reported total including skipped records.",
+    "Grade B: only aggregate console summaries are archived; there is no JUnit XML or complete case pool."
+  ]
+}

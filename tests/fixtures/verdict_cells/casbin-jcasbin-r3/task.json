@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "repo": "apache/casbin-jcasbin",
+  "sha": "3ab35f38b088f32ea3f2285474cc98009945e53d",
+  "steps": [
+    {
+      "id": "ci-step-1",
+      "runner": "maven",
+      "argv": [
+        "mvn",
+        "-B",
+        "-ntp",
+        "clean",
+        "verify",
+        "cobertura:cobertura",
+        "-Dgpg.skip=true"
+      ],
+      "cwd": ".",
+      "java_major": 8
+    }
+  ]
+}

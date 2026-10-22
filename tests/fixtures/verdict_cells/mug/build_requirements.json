@@ -1,0 +1,11 @@
+{
+ "java_requirements": {
+  "compiler_release": "8",
+  "compiler_source": "/workspace/mug/pom.xml:maven.compiler.target",
+  "compiler_toolchain": false,
+  "runtime": [],
+  "unresolved": [
+   "/workspace/mug/pom.xml:profile_activation:playground"
+  ]
+ }
+}

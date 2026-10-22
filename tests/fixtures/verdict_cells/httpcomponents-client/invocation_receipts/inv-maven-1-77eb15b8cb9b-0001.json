@@ -1,0 +1,70 @@
+{
+ "actual_cwd": "/workspace/httpcomponents-client",
+ "argv": "/opt/apache-maven-3.9.16/bin/mvn -B -f pom.xml clean verify install -P-use-toolchains,nodoclint",
+ "effective_jdk": {
+  "major": "17",
+  "provenance": {
+   "dispatch_runtime": {
+    "distribution": "openjdk",
+    "executable": "/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
+    "major": "17",
+    "version": "17.0.20.1"
+   }
+  },
+  "runtime_authority": "dispatch_probe"
+ },
+ "exit_code": 1,
+ "module_outcomes": [
+  {
+   "module": "Apache HttpComponents Client",
+   "status": "success"
+  },
+  {
+   "module": "Apache HttpClient",
+   "status": "success"
+  },
+  {
+   "module": "Apache HttpClient sse",
+   "status": "success"
+  },
+  {
+   "module": "Apache HttpClient Cache",
+   "status": "success"
+  },
+  {
+   "module": "Apache HttpClient Observation",
+   "status": "success"
+  },
+  {
+   "module": "Apache HttpClient Fluent",
+   "status": "success"
+  },
+  {
+   "module": "Apache HttpClient WebSocket",
+   "status": "success"
+  },
+  {
+   "module": "Apache HttpClient Integration Tests",
+   "status": "failure"
+  },
+  {
+   "module": "Jakarta REST Client for Apache HttpClient",
+   "status": "skipped"
+  }
+ ],
+ "receipt_id": "inv-maven-1-77eb15b8cb9b-0001",
+ "requested_action": "install",
+ "testcase_execution_totals": {
+  "errors": 4,
+  "failed": 0,
+  "passed": 2675,
+  "report_count": 360,
+  "reported": 2692,
+  "skipped": 13
+ },
+ "tool": "maven",
+ "toolchain_fingerprint": {
+  "executable": "/opt/apache-maven-3.9.16/bin/mvn",
+  "version": "Apache Maven 3.9.16 (2bdd9fddda4b155ebf8000e807eb73fd829a51d5)"
+ }
+}
