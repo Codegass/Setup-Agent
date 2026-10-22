@@ -111,7 +111,10 @@ def shell_names_step(native_input, steps):
     the command or by a shell operator or redirection, so `mvn -version`,
     `mvn verify -DskipTests` and `echo mvn verify` never name a `mvn verify`
     step. The first token may spell the launcher by path (`/opt/maven/bin/mvn`)
-    as long as its basename is the step's.
+    as long as its basename is the step's. Leading `NAME=value` assignments,
+    optionally introduced by `env` (`PATH=/opt/maven/bin:$PATH mvn verify`,
+    `env JAVA_HOME=/jdk mvn verify`), belong to the same simple command, so the
+    boundary is looked for before them.
     """
     command = (native_input or {}).get("command") if isinstance(native_input, dict) else None
     if not isinstance(command, str) or not command.strip():
@@ -131,6 +134,17 @@ def shell_names_step(native_input, steps):
         token = tokens[index]
         return token in {"&&", "||", ";", "|", "&", "(", ")", "{", "}"} or _REDIRECTION.match(token) is not None
 
+    def command_start(index):
+        # Walk back over `[NAME=value ...] [env [NAME=value ...]]` before the launcher.
+        index -= 1
+        while index >= 0 and _ASSIGNMENT.match(tokens[index]):
+            index -= 1
+        if index >= 0 and tokens[index] == "env":
+            index -= 1
+            while index >= 0 and _ASSIGNMENT.match(tokens[index]):
+                index -= 1
+        return boundary(index)
+
     for step in steps:
         argv = list(step.get("argv") or [])
         if not argv or len(tokens) < len(argv):
@@ -141,12 +155,13 @@ def shell_names_step(native_input, steps):
                 continue
             if window[0] != argv[0] and posixpath.basename(window[0]) != posixpath.basename(argv[0]):
                 continue
-            if boundary(start - 1) and boundary(start + len(argv)):
+            if command_start(start) and boundary(start + len(argv)):
                 return True
     return False
 
 
 _REDIRECTION = re.compile(r"^\d*[<>]")
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _OPERATORS = re.compile(r"(\|\||&&|[();|&])")
 
 

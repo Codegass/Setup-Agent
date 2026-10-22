@@ -530,6 +530,17 @@ def test_parallel_probe_shell_does_not_hide_the_shell_that_runs_the_step(fixture
         ("mvn verify > build.log 2>&1", True),
         ("(cd sub; mvn verify)", True),
         ("", False),
+        # Leading variable assignments belong to the same simple command.
+        ("PATH=/tmp/opencode/tools/apache-maven-3.9.11/bin:$PATH mvn verify", True),
+        ("JAVA_HOME=/jdk MAVEN_OPTS='-Xmx4g -Xms1g' mvn verify > build.log 2>&1", True),
+        ("cd /workspace/project && LC_ALL=C.UTF-8 PATH=/opt/maven/bin:$PATH mvn verify", True),
+        ("env PATH=/opt/maven/bin:$PATH mvn verify", True),
+        ("JAVA_HOME=/jdk env PATH=/opt/maven/bin:$PATH mvn verify", True),
+        ("PATH=/opt/maven/bin:$PATH mvn verify -DskipTests", False),
+        ("PATH=/opt/maven/bin:$PATH mvn -version", False),
+        ("echo PATH=/opt/maven/bin mvn verify", False),
+        ("echo env mvn verify", False),
+        ("-DPATH=/opt mvn verify", False),
     ],
 )
 def test_shell_names_step_matches_the_frozen_argv_as_contiguous_tokens(command, expected):
@@ -537,6 +548,36 @@ def test_shell_names_step_matches_the_frozen_argv_as_contiguous_tokens(command, 
 
     steps = [{"argv": ["mvn", "verify"], "cwd": "."}]
     assert shell_names_step({"command": command}, steps) is expected
+
+
+def test_shell_names_step_reads_past_a_leading_path_assignment_commons_net():
+    """commons-net-opencode, events 000010/000011: the version check and the pinned build
+    were open together, each command prefixed with PATH=...; only the build names the step."""
+    from scripts.benchmark_native_observer import shell_names_step
+
+    steps = [{"argv": ["mvn", "-B", "-f", "pom.xml", "-V", "clean", "install",
+                       "--no-transfer-progress", "--batch-mode"], "cwd": "."}]
+    probe = ("PATH=/tmp/opencode/tools/apache-maven-3.9.11/bin:$PATH java -version && "
+             "PATH=/tmp/opencode/tools/apache-maven-3.9.11/bin:$PATH mvn -version")
+    build = ("PATH=/tmp/opencode/tools/apache-maven-3.9.11/bin:$PATH mvn -B -f pom.xml -V "
+             "clean install --no-transfer-progress --batch-mode")
+    assert shell_names_step({"command": probe}, steps) is False
+    assert shell_names_step({"command": build}, steps) is True
+
+
+def test_parallel_probe_with_path_prefix_does_not_hide_the_prefixed_build_shell(fixture, tmp_path):
+    """Both shells carry a PATH= prefix (commons-net-opencode); the launch binds to the build."""
+    observer, _, event, transcript, _ = make_observer(fixture, tmp_path)
+    prefix = "PATH=/tmp/opencode/tools/apache-maven-3.9.11/bin:$PATH "
+    probe = {**event, "tool_use_id": "probe", "tool_input": {
+        "command": prefix + "java -version && " + prefix + "mvn -version"}}
+    build = {**event, "tool_input": {"command": prefix + "mvn verify"}}
+    observer.event(probe)
+    observer.event(build)
+    observer.event(event["launcher_event"])
+    assert observer.errors == []
+    assert observer.calls["native-1"]["selected_step"] is not None
+    assert observer.calls["probe"]["selected_step"] is None
 
 
 def test_unobserved_retry_never_uses_prior_success(fixture, tmp_path):
