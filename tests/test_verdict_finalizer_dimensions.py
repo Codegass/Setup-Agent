@@ -282,3 +282,147 @@ def test_a_sealed_command_result_must_agree_with_the_task_steps():
         validate_verdict_snapshot_v3(_current(ci_command=wrong))
     with pytest.raises(ValueError):
         RunVerdictSnapshot.model_validate(_current(ci_command=good, task_completion=None))
+
+
+# --- Change 2: the word is derived from the project result -----------------
+
+KNOWLEDGE = (
+    "build_requirements_unavailable",
+    "maven_reactor_unverified",
+    "test_census_sources_disagree",
+    "test_primary_coordinate_unresolved",
+    "build_coverage_scope_unverified",
+    "reactor_scope_narrowed",
+    "metrics_conflict",
+)
+
+
+@pytest.mark.parametrize(
+    ("steps", "status", "word"),
+    [
+        ([step()], None, "success"),
+        ([step(status="failed", exit_code=1)], None, "failed"),
+        ([step(status="missing")], None, "partial"),
+        ([], "unavailable", "unknown"),
+    ],
+)
+def test_with_a_bound_task_the_command_result_alone_sets_the_word(monkeypatch, steps, status, word):
+    state = green_state(f"run-word-{word}")
+    completion = (
+        completion_for(state.run_id, *steps)
+        if steps
+        else TaskCompletionSnapshot(
+            run_id=state.run_id,
+            task_sha256=TASK.sha256,
+            status="unavailable",
+            reasons=("task_run_pin_unavailable",),
+        )
+    )
+    bind_task(monkeypatch, completion)
+    snapshot, _ = finalize(state, task=TASK)
+    assert snapshot.verdict == word
+    assert validate_verdict_snapshot_v3(snapshot.model_dump(mode="json")) == snapshot
+
+
+def test_knowledge_conflicts_do_not_lower_a_passed_command(monkeypatch):
+    state = green_state("run-word-knowledge")
+    for conflict in KNOWLEDGE:
+        state.record_conflict(conflict)
+    bind_task(monkeypatch, completion_for(state.run_id, step()))
+    monkeypatch.setattr(verdict_finalizer, "_java_requirement_gaps", lambda *_: ())
+    snapshot, _ = finalize(state, task=TASK)
+    assert snapshot.verdict == "success"
+    assert set(snapshot.knowledge_conflicts) == set(KNOWLEDGE)
+    assert snapshot.project_conflicts == ()
+    # Reported, not folded in: SAG's own gaps stay on the record.
+    assert [check.confirmed for check in snapshot.sag_checks] == [False, False, True, False]
+
+
+def test_test_failures_do_not_lower_a_passed_command(monkeypatch):
+    # A command that runs the tests already exits non-zero when they fail; one
+    # that exits 0 with failures is a command told to ignore them (for example
+    # -Dmaven.test.failure.ignore=true), and then the project's CI passes too.
+    # The failures stay on the record as a project conflict and in the counts.
+    state = RunEvidenceState(run_id="run-word-red")
+    _set_rate_test_rollup(state, passed=90, failed=10, errors=0, driven_modules=["core", "io"])
+    state.record_conflict("test_failures_detected")
+    bind_task(monkeypatch, completion_for(state.run_id, step()))
+    snapshot, _ = finalize(state, task=TASK)
+    assert snapshot.verdict == "success"
+    assert snapshot.project_conflicts == ("test_failures_detected",)
+    assert snapshot.test_stats.unique.failed == 10
+
+
+def test_a_sealed_task_word_must_follow_the_command_not_the_old_fold():
+    payload = _current()
+    payload["task_completion"]["status"] = "incomplete"
+    payload["task_completion"]["steps"][0].update(status="failed", exit_code=1)
+    with pytest.raises(ValueError, match="does not reconcile"):
+        validate_verdict_snapshot_v3({**payload, "verdict": "partial"})
+    assert validate_verdict_snapshot_v3({**payload, "verdict": "failed"}).verdict == "failed"
+    # A v5 record keeps the fold it was sealed under.
+    historical = snapshot_dict(schema_version=5, verdict="partial")
+    historical["task_completion"]["status"] = "incomplete"
+    historical["task_completion"]["steps"][0].update(status="failed", exit_code=1)
+    assert validate_verdict_snapshot_v3(historical).verdict == "partial"
+
+
+class _TerminalReceiptValidator(_ReceiptValidator):
+    def __init__(self, exit_code):
+        super().__init__()
+        self.exit_code = exit_code
+
+    def terminal_build_receipt(self, _project_root):
+        if self.exit_code is None:
+            return None
+        return {"receipt_id": "inv-maven-1-bbbbbbbbbbbb-0003", "exit_code": self.exit_code}
+
+
+@pytest.mark.parametrize(("exit_code", "word"), [(0, "success"), (1, "failed"), (None, "success")])
+def test_without_a_task_the_terminal_build_receipt_decides_the_build(exit_code, word):
+    state = green_state(f"run-free-{exit_code}")
+    snapshot, _ = finalize(state, validator=_TerminalReceiptValidator(exit_code))
+    # Class files on disk say success either way; the build command's own exit
+    # code is what the word reads when there is one.
+    assert snapshot.build_evidence.judgment == "success"
+    assert snapshot.build_evidence.terminal_exit_code == exit_code
+    assert snapshot.verdict == word
+    assert validate_verdict_snapshot_v3(snapshot.model_dump(mode="json")) == snapshot
+
+
+@pytest.mark.parametrize(("exit_code", "word"), [(1, "failed"), (0, "success")])
+def test_without_a_task_counted_test_failures_keep_todays_fold(exit_code, word):
+    # Today's fold reads counted red as a project result, not as missing
+    # execution (test_project_red_does_not_change_runtime_outcome_accounting_
+    # or_setup_verdict), so red alone leaves the word where it was. What
+    # changes is that a test command that failed because of them exited
+    # non-zero, and that exit code is now the build judgment.
+    state = RunEvidenceState(run_id=f"run-free-red-{exit_code}")
+    _set_rate_test_rollup(state, passed=90, failed=10, errors=0, driven_modules=["core", "io"])
+    snapshot, _ = finalize(state, validator=_TerminalReceiptValidator(exit_code))
+    assert snapshot.verdict == word
+
+
+def test_conflicts_split_into_project_and_knowledge_and_stay_whole():
+    payload = _current(
+        conflicts=[
+            "acceptance_task_incomplete",
+            "maven_reactor_unverified",
+            "test_errors_detected",
+            "job_live_at_close:abc",
+            "build_modules_incomplete",
+        ],
+        verdict="partial",
+    )
+    payload["task_completion"]["status"] = "incomplete"
+    payload["task_completion"]["steps"][0] = {
+        "id": "smoke-build-test",
+        "command": "mvn clean verify",
+        "status": "missing",
+    }
+    snapshot = validate_verdict_snapshot_v3(payload)
+    assert snapshot.project_conflicts == ("acceptance_task_incomplete", "test_errors_detected")
+    assert snapshot.knowledge_conflicts == ("maven_reactor_unverified",)
+    assert len(snapshot.conflicts) == 5
+    with pytest.raises(ValueError):
+        validate_verdict_snapshot_v3({**payload, "knowledge_conflicts": []})

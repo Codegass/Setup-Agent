@@ -17,7 +17,12 @@ from sag.case_census import BASIS_COMPLETE, BASIS_PARTIAL, CENSUS_BASES
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.utils.container_io import compare_publish_container_text_atomic
-from sag.verdict import COUNT_DERIVED_CONFLICTS, rescue_blocked_build, run_verdict
+from sag.verdict import (
+    COUNT_DERIVED_CONFLICTS,
+    rescue_blocked_build,
+    run_verdict,
+    split_conflicts,
+)
 from sag.verdict_rates import (
     UNATTRIBUTED_CONFLICT,
     UNREADABLE_REPORT_CONFLICT,
@@ -40,6 +45,7 @@ from .verdict_dimensions import (
     run_control,
     sag_checks,
     validate_sag_checks,
+    verdict_for_ci_command,
 )
 from .evidence_publications import (
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
@@ -251,6 +257,11 @@ class BuildEvidenceSnapshot(BaseModel):
     # None = no multi-domain decomposition was surveyed (single-domain
     # projects), which is why the serializer below drops the key entirely.
     domain_states: dict[str, dict[str, str]] | None = None
+    # v6: the newest finished build command in the project root and its exit
+    # code. For a run with no pinned task the word reads this, not the class
+    # files above; absent when the run left no such receipt.
+    terminal_receipt_id: str | None = None
+    terminal_exit_code: int | None = Field(default=None, strict=True)
 
     @model_serializer(mode="wrap")
     def _omit_unsurveyed_domain_states(self, handler):
@@ -265,6 +276,9 @@ class BuildEvidenceSnapshot(BaseModel):
             data.pop("reactor_modules_total", None)
         if data.get("domain_states") is None:
             data.pop("domain_states", None)
+        for key in ("terminal_receipt_id", "terminal_exit_code"):
+            if data.get(key) is None:
+                data.pop(key, None)
         return data
 
 
@@ -338,6 +352,11 @@ class RunVerdictSnapshot(BaseModel):
     test_stats: SnapshotTestStats = Field(default_factory=SnapshotTestStats)
     rates: dict[str, Any] = Field(default_factory=dict)
     conflicts: tuple[str, ...] = ()
+    # v6: the two named subsets of `conflicts` (`sag.verdict`): what the
+    # project did in this run, and what SAG could not establish. `conflicts`
+    # stays the whole list.
+    project_conflicts: tuple[str, ...] = ()
+    knowledge_conflicts: tuple[str, ...] = ()
     phase_records: tuple[PhaseRecordSnapshot, ...] = ()
     ci_comparison: CIComparisonSnapshot | None = None
     task_completion: TaskCompletionSnapshot | None = None
@@ -362,8 +381,19 @@ class RunVerdictSnapshot(BaseModel):
             or bool(self.sag_checks)
             or self.run_control is not None
         )
+        measured = (
+            measured
+            or bool(self.project_conflicts)
+            or bool(self.knowledge_conflicts)
+            or self.build_evidence.terminal_exit_code is not None
+        )
         if measured and self.schema_version < 6:
             raise ValueError("measured dimensions exist only in verdict schema v6 and later")
+        if self.schema_version >= 6 and (
+            self.project_conflicts,
+            self.knowledge_conflicts,
+        ) != split_conflicts(self.conflicts):
+            raise ValueError("the conflict subsets disagree with the conflict list")
         if self.sag_checks:
             validate_sag_checks(self.sag_checks)
         if self.ci_command is not None:
@@ -389,9 +419,25 @@ class RunVerdictSnapshot(BaseModel):
         for key in ("ci_command", "official_ci", "run_control"):
             if data.get(key) is None:
                 data.pop(key, None)
-        if not self.sag_checks:
-            data.pop("sag_checks", None)
+        for key in ("sag_checks", "project_conflicts", "knowledge_conflicts"):
+            if not data.get(key):
+                data.pop(key, None)
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _classify_conflicts(cls, value: Any) -> Any:
+        """A current record carries its conflict subsets; derive them when absent."""
+        if not isinstance(value, dict):
+            return value
+        version = value.get("schema_version", VERDICT_SCHEMA_VERSION)
+        if type(version) is not int or version < 6:
+            return value
+        upgraded = dict(value)
+        project, knowledge = split_conflicts(upgraded.get("conflicts") or ())
+        upgraded.setdefault("project_conflicts", project)
+        upgraded.setdefault("knowledge_conflicts", knowledge)
+        return upgraded
 
     @model_validator(mode="before")
     @classmethod
@@ -1496,6 +1542,20 @@ def _snapshot_verdict(
     )
 
 
+def _build_judgment_for_word(build: BuildEvidenceSnapshot) -> str:
+    """The build command's own exit code when a finished one exists (v6).
+
+    Class files on disk say a compiler ran at some point; they said `success`
+    in all 52 runs of the 2026-10-21 campaign, including the five whose CI
+    command failed. A record without a terminal build receipt keeps the
+    class-file judgment.
+    """
+
+    if build.terminal_exit_code is not None:
+        return "success" if build.terminal_exit_code == 0 else "failed"
+    return _build_execution_judgment(build)
+
+
 def _execution_verdict_word(
     build: BuildEvidenceSnapshot,
     tests: SnapshotTestStats,
@@ -1506,8 +1566,42 @@ def _execution_verdict_word(
     execution = tests.judgment if tests.judgment != "unknown" else "partial"
     return run_verdict(
         execution,
-        derived_verdict_word(_build_execution_judgment(build), test_cases),
+        derived_verdict_word(_build_judgment_for_word(build), test_cases),
         (),
+    )
+
+
+def _sealed_word(
+    *,
+    schema_version: int,
+    phase_records,
+    build: BuildEvidenceSnapshot,
+    tests: SnapshotTestStats,
+    test_cases: GrainRate,
+    conflicts: tuple[str, ...],
+    completion: TaskCompletionSnapshot | None,
+) -> str:
+    """The run's one word, on write and on read.
+
+    From v6, a run bound to a pinned task takes the pinned CI command's result
+    and nothing else: passed, failed, did not finish, or unknown. SAG's own
+    unconfirmed checks and knowledge-type conflicts are reported beside it,
+    never folded in. A run with no task keeps the fold below.
+    """
+
+    if schema_version >= 6 and completion is not None:
+        return verdict_for_ci_command(ci_command_result(completion))
+    return run_verdict(
+        _phase_machine_verdict(phase_records),
+        _execution_verdict_word(build, tests, test_cases),
+        (
+            *conflicts,
+            *(
+                [f"acceptance_task_{completion.status}"]
+                if completion is not None and completion.status != "complete"
+                else []
+            ),
+        ),
     )
 
 
@@ -1845,18 +1939,14 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
         snapshot.rates,
         conflicts=snapshot.conflicts,
     )
-    expected_verdict = run_verdict(
-        _phase_machine_verdict(snapshot.phase_records),
-        _execution_verdict_word(snapshot.build_evidence, snapshot.test_stats, test_cases),
-        (
-            *snapshot.conflicts,
-            *(
-                [f"acceptance_task_{snapshot.task_completion.status}"]
-                if snapshot.task_completion is not None
-                and snapshot.task_completion.status != "complete"
-                else []
-            ),
-        ),
+    expected_verdict = _sealed_word(
+        schema_version=schema_version,
+        phase_records=snapshot.phase_records,
+        build=snapshot.build_evidence,
+        tests=snapshot.test_stats,
+        test_cases=test_cases,
+        conflicts=snapshot.conflicts,
+        completion=snapshot.task_completion,
     )
     if snapshot.verdict != expected_verdict:
         raise ValueError("verdict word does not reconcile with build execution and test outcomes")
@@ -1929,6 +2019,26 @@ def read_live_verdict_snapshot(orchestrator, *, authority=None) -> RunVerdictSna
     if snapshot is None:
         return _unknown_snapshot("snapshot_live_missing")
     return snapshot
+
+
+def _terminal_build_receipt(validator, project_root: str | None) -> dict[str, Any] | None:
+    """The newest finished build receipt's id and exit code, when one can be read."""
+
+    reader = getattr(validator, "terminal_build_receipt", None)
+    if not callable(reader) or not project_root:
+        return None
+    try:
+        receipt = reader(project_root)
+    except Exception as exc:
+        logger.debug(f"terminal build receipt unavailable at finalize: {exc}")
+        return None
+    if (
+        not isinstance(receipt, Mapping)
+        or not str(receipt.get("receipt_id") or "").strip()
+        or type(receipt.get("exit_code")) is not int
+    ):
+        return None
+    return {"receipt_id": str(receipt["receipt_id"]), "exit_code": receipt["exit_code"]}
 
 
 def _receipts_by_id(validator, project_root: str | None) -> dict[str, Mapping[str, Any]]:
@@ -2123,6 +2233,17 @@ class VerdictFinalizer:
             validator=self.validator,
             project_name=self.project_name,
         )
+        terminal = _terminal_build_receipt(
+            self.validator,
+            f"/workspace/{self.project_name}" if self.project_name else None,
+        )
+        if terminal is not None:
+            build = build.model_copy(
+                update={
+                    "terminal_receipt_id": terminal["receipt_id"],
+                    "terminal_exit_code": terminal["exit_code"],
+                }
+            )
         tests, test_conflicts = _fold_test_stats(state)
         rates, build_modules_rate, test_cases_rate, rate_conflicts = _snapshot_rates(
             state,
@@ -2169,10 +2290,14 @@ class VerdictFinalizer:
             run_id=state.run_id,
             finalized_at=state.finalized_at or "unknown",
             input_refs=input_refs,
-            verdict=run_verdict(
-                _phase_machine_verdict(state.phase_records),
-                _execution_verdict_word(build, tests, test_cases_rate),
-                conflicts,
+            verdict=_sealed_word(
+                schema_version=VERDICT_SCHEMA_VERSION,
+                phase_records=state.phase_records,
+                build=build,
+                tests=tests,
+                test_cases=test_cases_rate,
+                conflicts=conflicts,
+                completion=completion,
             ),
             build_evidence=build,
             test_stats=tests,

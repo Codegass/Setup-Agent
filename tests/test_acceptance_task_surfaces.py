@@ -125,7 +125,10 @@ def test_required_task_result_is_identical_across_sealed_surfaces(snapshot_facto
         {
             **base.model_dump(mode="json"),
             "run_id": "run-1",
-            "verdict": "success" if status == "complete" else "partial",
+            # With a pinned task the word is the task's own result (verdict
+            # schema v6): a missing step did not finish, and a task record
+            # with no step results leaves the result unknown.
+            "verdict": {"complete": "success", "incomplete": "partial"}.get(status, "unknown"),
             "task_completion": completion,
         }
     )

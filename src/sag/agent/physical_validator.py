@@ -93,6 +93,25 @@ def _census_facts(census: TestCensus) -> Dict[str, Any]:
     return facts
 
 
+# The Maven lifecycle phases that compile the project on their way. A receipt
+# whose action is one of these is a build, whichever later phase it stopped at.
+MAVEN_BUILD_ACTIONS = frozenset({"compile", "test", "package", "verify", "install"})
+# Gradle tasks that build the project, named by their last path segment.
+_GRADLE_BUILD_TASKS = frozenset({"build", "assemble", "check", "test", "classes"})
+
+
+def receipt_runs_build(receipt: Mapping[str, Any]) -> bool:
+    """True when a receipt's invocation built the project (not merely ran a goal)."""
+
+    tool = str(receipt.get("tool") or "").strip().lower()
+    action = str(receipt.get("requested_action") or "").strip().lower()
+    if tool == "maven":
+        return action in MAVEN_BUILD_ACTIONS
+    if tool == "gradle":
+        return any(task.rsplit(":", 1)[-1] in _GRADLE_BUILD_TASKS for task in action.split())
+    return False
+
+
 # top_level.txt names that are install tooling, never the project under test —
 # a second deny-list layer under the record selection in
 # _installed_top_level_packages (the project's own record could still list a
@@ -2323,6 +2342,34 @@ class PhysicalValidator:
             )
         ]
 
+    def terminal_build_receipt(self, project_dir: str) -> Optional[Dict[str, Any]]:
+        """The newest finished build receipt in the project root, whatever its exit.
+
+        For a run with no pinned task this is the build's own answer: the
+        command's exit code, where class files on disk can only say that some
+        compiler ran at some point.
+        """
+
+        receipts = self._current_scoped_receipts(project_dir)
+        candidates = [
+            receipt
+            for receipt in receipts or ()
+            if receipt_runs_build(receipt)
+            and posixpath.normpath(
+                str(receipt.get("actual_cwd") or receipt.get("working_directory") or "")
+            )
+            == posixpath.normpath(project_dir)
+            and _dispatch_terminated(receipt)
+            and type(receipt.get("exit_code")) is int
+        ]
+        if not candidates:
+            return None
+        latest = max(candidates, key=self._receipt_sequence)
+        return {
+            "receipt_id": str(latest.get("receipt_id") or ""),
+            "exit_code": latest["exit_code"],
+        }
+
     def _terminal_root_maven_reactor_receipt(
         self,
         project_dir: str,
@@ -2344,12 +2391,11 @@ class PhysicalValidator:
             return None
         # Maven test/verify also compile. Completion still needs a current
         # terminal receipt and actual output, not the lifecycle name alone.
-        build_actions = {"compile", "test", "package", "verify", "install"}
         candidates = [
             receipt
             for receipt in receipts
             if str(receipt.get("tool") or "").strip().lower() == "maven"
-            and str(receipt.get("requested_action") or "").strip().lower() in build_actions
+            and receipt_runs_build(receipt)
             and posixpath.normpath(
                 str(receipt.get("actual_cwd") or receipt.get("working_directory") or "")
             )

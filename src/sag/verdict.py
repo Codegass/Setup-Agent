@@ -90,6 +90,51 @@ ADJUDICATED_CONFLICTS = frozenset(
 )
 
 
+# Since verdict schema v6 (2026-10-22) a run bound to a pinned task takes its
+# word from the pinned CI command alone (`sag.agent.verdict_dimensions`), and the
+# fold below serves the runs with no task. Either way the conflict list stays
+# whole as data, and two named subsets tell a reader whose gap each one is:
+#
+#   * PROJECT_CONFLICTS state something about the project in this run: tests
+#     failed or errored, the pinned task did not complete, the build failed.
+#   * KNOWLEDGE_CONFLICTS state something SAG could not establish about its own
+#     reading of the evidence. In the 52-cell analysis these lowered six runs
+#     whose CI command passed with every test green.
+#
+# A tag in neither (run control, disk-scan diagnostics, census volume) stays in
+# the whole list only.
+PROJECT_CONFLICTS = frozenset(
+    {
+        *COUNT_DERIVED_CONFLICTS,
+        "test_failures_heavy",
+        "acceptance_task_incomplete",
+        "build_validation_failed",
+    }
+)
+
+KNOWLEDGE_CONFLICTS = frozenset(
+    {
+        "build_requirements_unavailable",
+        "maven_reactor_unverified",
+        CENSUS_CONFLICT,
+        "test_primary_coordinate_unresolved",
+        "build_coverage_scope_unverified",
+        "reactor_scope_narrowed",
+        "metrics_conflict",
+    }
+)
+
+
+def split_conflicts(conflicts: Iterable[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The project and knowledge subsets of one conflict list, in its order."""
+
+    ordered = tuple(dict.fromkeys(str(conflict) for conflict in conflicts))
+    return (
+        tuple(conflict for conflict in ordered if conflict in PROJECT_CONFLICTS),
+        tuple(conflict for conflict in ordered if conflict in KNOWLEDGE_CONFLICTS),
+    )
+
+
 def combine_verdicts(*verdicts: Optional[str]) -> str:
     """Minimum of the known verdicts; non-verdicts (None/unknown) abstain."""
     known = [v for v in verdicts if v in _RANK]
