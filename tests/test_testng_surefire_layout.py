@@ -28,7 +28,8 @@ from pathlib import Path
 
 import pytest
 
-from sag.agent import invocation_receipts
+from sag.agent import invocation_receipts, receipt_test_rows
+from sag.agent.evidence_assessments import test_outcome_diagnostics_complete as diagnostics_complete
 from sag.agent.receipt_test_rows import DELTA_REPORT_MAX_BYTES, _row_parser_program
 
 FIXTURES = Path(__file__).parent / "fixtures/casbin_testng"
@@ -267,3 +268,56 @@ def test_a_surefire_report_inside_the_bound_stating_a_red_testng_did_not_record_
     assert parsed["status"] == "complete"
     assert ("org.casbin.jcasbin.main.LogUtilTest", "setUp", "failed") in carried(parsed)
     assert parsed["execution_totals"]["failed"] == 1
+
+
+@pytest.fixture
+def snapshots(tmp_path, monkeypatch):
+    monkeypatch.setattr(receipt_test_rows, "REPORT_SNAPSHOT_DIR", str(tmp_path / "snapshots"))
+
+
+def bound_test_receipt(run):
+    return next(
+        json.loads(raw)
+        for path, raw in run.fs.files.items()
+        if "/invocation_receipts/" in path
+        and path.endswith(".json")
+        and json.loads(raw).get("effective_action") == "test"
+    )
+
+
+def test_the_casbin_layout_closes_the_test_gate(snapshots):
+    """The run's failure end to end: runner, receipt, then the test gate."""
+
+    from test_ci_comparison import ROOT, setup_run
+
+    reports = ROOT + "/target/surefire-reports/"
+    files = casbin_files(logged_bytes=DELTA_REPORT_MAX_BYTES)
+    run = setup_run(report_files={reports + name: body for name, body in files.items()})
+    receipt = bound_test_receipt(run)
+
+    assert receipt["testcase_execution_totals"] == {
+        "report_count": 6,
+        "reported": 10,
+        "passed": 10,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+    assert receipt["testcase_execution_rows"]["status"] == "complete"
+    assert len(receipt["testcase_execution_rows"]["rows"]) == 10
+    assert "testcase_row_disclosure" not in receipt
+    assert diagnostics_complete(receipt) is True
+    summary = run.validator._test_execution_receipt_summary(ROOT)
+    assert summary["state"] == "completed", summary
+    assert summary["reported_executions"] == 10
+
+    # The receipt the run recorded: the copy disclosed as a dropped file and no
+    # totals beside the rows. That shape still cannot be graded; the change is
+    # in what the reader can now say, not in what the gate accepts.
+    recorded = {key: value for key, value in receipt.items() if key != "testcase_execution_totals"}
+    recorded["testcase_row_disclosure"] = {
+        "rows_source": "delta_xml",
+        "red_rows_complete": False,
+        "rows_truncated": {"dropped_files": 1, "dropped_green": 0},
+    }
+    assert diagnostics_complete(recorded) is False
