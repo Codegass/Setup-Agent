@@ -13,7 +13,7 @@ def timestamp(value):
 
 def read_usage(directory, run_id, *, inference_started_at=None, inference_finished_at=None):
     directory = Path(directory)
-    calls, missing, errors, outside_window = [], [], [], []
+    calls, missing, errors, outside_window, never_reached = [], [], [], [], []
     read = lambda path: json.loads(path.read_bytes())
     lower = upper = None
     try:
@@ -44,6 +44,11 @@ def read_usage(directory, run_id, *, inference_started_at=None, inference_finish
                 outside_window.append(path.name)
                 errors.append('Provider request lies outside the declared inference window')
             usage = response.get('usage')
+            if usage is None and response.get('status') == 'transport_error' and response.get('provider_reached') is False:
+                # The gateway failed while connecting, before the request was sent: nothing reached the
+                # provider and nothing was billed. The call is counted apart and leaves the total defined.
+                never_reached.append(path.name)
+                continue
             if not isinstance(usage, dict):
                 raise ValueError('Provider usage is unavailable')
             a, b = usage['input_tokens'], usage['output_tokens']
@@ -57,8 +62,9 @@ def read_usage(directory, run_id, *, inference_started_at=None, inference_finish
             complete = False; missing.append(path.name); errors.append(str(exc))
     return {'model_calls': calls, 'model_calls_complete': complete,
             'known_tokens': sum(c['input_tokens'] + c['output_tokens'] for c in calls),
-            'request_counts': {'started': len(folders), 'with_usage': len(calls), 'missing_usage': len(missing)},
-            'missing_usage_request_ids': missing, 'usage_errors': errors,
+            'request_counts': {'started': len(folders), 'with_usage': len(calls), 'missing_usage': len(missing),
+                               'never_reached_provider': len(never_reached)},
+            'missing_usage_request_ids': missing, 'never_reached_provider_request_ids': never_reached, 'usage_errors': errors,
             'outside_inference_window_request_ids': outside_window,
             'usage_limitations': [] if complete else ['At least one provider request or ledger boundary lacks complete usage.'],
             'token_accounting': 'provider input plus output; cached input and reasoning each included once'}

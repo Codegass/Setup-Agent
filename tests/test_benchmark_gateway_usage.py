@@ -43,7 +43,7 @@ def test_missing_provider_usage_never_becomes_free_retry(tmp_path):
     result=read_usage(directory,'r1')
     assert result['model_calls_complete'] is False
     assert result['known_tokens']==120
-    assert result['request_counts']=={'started':2,'with_usage':1,'missing_usage':1}
+    assert result['request_counts']=={'started':2,'with_usage':1,'missing_usage':1,'never_reached_provider':0}
 
 
 def test_unclosed_empty_or_foreign_ledger_is_not_complete(tmp_path):
@@ -52,3 +52,26 @@ def test_unclosed_empty_or_foreign_ledger_is_not_complete(tmp_path):
     assert read_usage(directory,'r2')['model_calls_complete'] is False
     (directory/'close.json').unlink()
     assert read_usage(directory,'r1')['model_calls_complete'] is False
+
+
+def test_a_request_that_never_reached_the_provider_leaves_the_total_defined(tmp_path):
+    directory=tmp_path/'gateway';save=ledger(directory)
+    save('call2/started.json', {'id': 'call2', 'run_id': 'r1', 'at': '2026-09-23T10:04:00+00:00'})
+    save('call2/finished.json', {'at': '2026-09-23T10:04:00.2+00:00', 'usage': None, 'status': 'transport_error',
+                                 'error_type': 'SSLError', 'provider_reached': False, 'requested_model': 'gpt-5.4-mini'})
+    result=read_usage(directory,'r1')
+    assert result['model_calls_complete'] is True
+    assert result['known_tokens']==120
+    assert result['request_counts']=={'started':2,'with_usage':1,'missing_usage':0,'never_reached_provider':1}
+    assert result['never_reached_provider_request_ids']==['call2']
+    assert [c['request_id'] for c in result['model_calls']]==['call1']
+
+
+def test_a_transport_error_after_the_request_was_sent_still_voids_the_total(tmp_path):
+    directory=tmp_path/'gateway';save=ledger(directory)
+    save('call2/started.json', {'id': 'call2', 'run_id': 'r1', 'at': '2026-09-23T10:04:00+00:00'})
+    save('call2/finished.json', {'at': '2026-09-23T10:05:00+00:00', 'usage': None, 'status': 'transport_error',
+                                 'error_type': 'ReadTimeout', 'provider_reached': None})
+    result=read_usage(directory,'r1')
+    assert result['model_calls_complete'] is False
+    assert result['request_counts']['missing_usage']==1

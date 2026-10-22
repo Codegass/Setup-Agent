@@ -64,3 +64,26 @@ def test_route_rejects_wrong_credentials_and_model_before_provider(tmp_path):
         assert client.post('/v1/messages', headers={'x-api-key': 'test-token'}, json={'model': 'gpt-4o'}).status_code == 400
     assert not list((tmp_path/'ledger').glob('*/started.json'))
     assert json.loads((tmp_path/'ledger/close.json').read_text())['unfinished_requests'] == []
+
+
+def test_a_connect_failure_is_recorded_as_never_having_reached_the_provider(tmp_path, monkeypatch):
+    import httpx
+
+    async def refuse(self, request, **kwargs):
+        raise httpx.ConnectError("TLS handshake failed", request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, 'send', refuse)
+    app = create_app(directory=tmp_path/'ledger', run_id='qualification', arm='claude',
+                     token='test-token', api_key='test-key-not-real', api_base='https://invalid.example/v1')
+    with TestClient(app) as client:
+        response = client.post('/v1/messages', headers={'x-api-key': 'test-token'},
+                               json={'model': 'gpt-5.4-mini', 'max_tokens': 16, 'messages': [{'role': 'user', 'content': 'hi'}]})
+    assert response.status_code == 502
+    finished = [json.loads(p.read_text()) for p in (tmp_path/'ledger').glob('*/finished.json')]
+    assert len(finished) == 1
+    assert finished[0]['status'] == 'transport_error'
+    assert finished[0]['error_type'] == 'ConnectError'
+    assert finished[0]['provider_reached'] is False
+    assert finished[0]['usage'] is None
+    assert finished[0]['requested_model'] == 'gpt-5.4-mini'
+    assert json.loads((tmp_path/'ledger/close.json').read_text())['unfinished_requests'] == []

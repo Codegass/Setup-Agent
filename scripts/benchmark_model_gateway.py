@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import ssl
 import uuid
 from fastapi import Request
 
@@ -195,7 +196,13 @@ def create_app(*, directory, run_id, arm, token, api_key, api_base):
             return JSONResponse(response)
         except Exception as exc:
             if not (folder / "finished.json").exists():
-                save(folder / "finished.json", {"at": now(), "status": "transport_error", "error_type": type(exc).__name__, "usage": None})
+                # A failure while connecting (DNS, TCP or the TLS handshake) happens before any byte of the
+                # request leaves this process, so the provider never saw it and billed nothing: that is a
+                # fact the ledger can state. Anything after the request was sent stays unknown.
+                never_sent = upstream is None and isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, ssl.SSLError))
+                save(folder / "finished.json", {"at": now(), "status": "transport_error", "error_type": type(exc).__name__,
+                     "usage": None, "provider_reached": False if never_sent else None,
+                     "requested_model": body.get("model")})
             active.discard(ident)
             return JSONResponse({"error": "Gateway " + type(exc).__name__}, status_code=502)
         finally:
