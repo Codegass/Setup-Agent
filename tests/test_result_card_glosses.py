@@ -90,7 +90,10 @@ def test_glosses_are_plain_sentences():
     for code, text in REASON_GLOSS.items():
         assert text == text.strip(), code
         assert not text.endswith("."), f"{code}: glosses are clause-shaped, no trailing period"
-        assert len(text) <= 120, f"{code}: {len(text)} chars"
+        # One gloss carries its own parenthesis, worded by the 2026-10-22 spec:
+        # the Java requirement, which must say what was undecided and why.
+        bound = 150 if code == "build_requirements_unavailable" else 120
+        assert len(text) <= bound, f"{code}: {len(text)} chars"
         lowered = text.lower()
         for word in FORBIDDEN:
             assert word not in lowered, f"{code} uses the forbidden word {word!r}"

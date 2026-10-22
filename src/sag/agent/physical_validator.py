@@ -95,17 +95,33 @@ def _census_facts(census: TestCensus) -> Dict[str, Any]:
 
 # The Maven lifecycle phases that compile the project on their way. A receipt
 # whose action is one of these is a build, whichever later phase it stopped at.
-MAVEN_BUILD_ACTIONS = frozenset({"compile", "test", "package", "verify", "install"})
+# iotdb's pinned `mvn clean integration-test` built 28 modules and was never
+# confirmed, because `integration-test` (and `deploy`) were not on this list.
+MAVEN_BUILD_ACTIONS = frozenset(
+    {"compile", "test", "package", "integration-test", "verify", "install", "deploy"}
+)
 # Gradle tasks that build the project, named by their last path segment.
 _GRADLE_BUILD_TASKS = frozenset({"build", "assemble", "check", "test", "classes"})
 
 
 def receipt_runs_build(receipt: Mapping[str, Any]) -> bool:
-    """True when a receipt's invocation built the project (not merely ran a goal)."""
+    """True when a receipt's invocation built the project (not merely ran a goal).
+
+    A literal command the agent dispatched whole is recorded with the action
+    `run`; it is a build when the command itself names a build phase.
+    """
 
     tool = str(receipt.get("tool") or "").strip().lower()
     action = str(receipt.get("requested_action") or "").strip().lower()
     if tool == "maven":
+        if action == "run":
+            from sag.metrics.build_scope import parse_ci_command
+
+            try:
+                goals = parse_ci_command(str(receipt.get("argv") or "")).goals
+            except Exception:
+                return False
+            return any(str(goal).lower() in MAVEN_BUILD_ACTIONS for goal in goals)
         return action in MAVEN_BUILD_ACTIONS
     if tool == "gradle":
         return any(task.rsplit(":", 1)[-1] in _GRADLE_BUILD_TASKS for task in action.split())

@@ -92,7 +92,12 @@ REASON_GLOSS: dict[str, str] = {
     "metrics_conflict": "two of the run's own measurements of the same thing disagree",
     "test_primary_coordinate_unresolved": "which project directory the test reports came from could not be worked out",
     "build_validation_failed": "the build did not succeed when its output was checked",
-    "build_requirements_unavailable": "what the project needs in order to build could not be read",
+    # In every one of the six cells it fired in on 2026-10-21 the record was
+    # read; what stayed undecided was whether the Java version met it.
+    "build_requirements_unavailable": (
+        "whether the installed Java version meets the project's requirement could not be "
+        "decided (a Maven profile's activation could not be evaluated)"
+    ),
     "jdk_mismatch": "the Java version this run used is not the one the project asks for",
     "build_receipt_module_scope_unavailable": "a build record did not say which modules it covered",
     "build_receipt_scope_unavailable": "the run's build records could not be tied to the checkout it ran on",
