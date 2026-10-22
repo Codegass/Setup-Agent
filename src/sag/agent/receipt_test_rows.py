@@ -83,7 +83,9 @@ DELTA_ROW_MAX_JSON_BYTES = 1024
 # container an order of magnitude more, for rows that cannot fit the sample
 # anyway. Its digest is still streamed and verified — the file is disclosed as
 # a dropped file (P-B: what we counted is bound to bytes we read), never as an
-# absence and never as a hash failure.
+# absence and never as a hash failure. One kind of file is read past it:
+# surefire's copy of a TestNG run beside TestNG's own record, read for its
+# markup only and bounded by that record (`restated_testng_run` below).
 DELTA_REPORT_MAX_BYTES = 8 * 1024 * 1024
 # What sealing adds to one parsed row: the receipt-scoped identity material
 # (run/receipt/target/domain/module/framework/disposition/execution_id). Stated
@@ -288,6 +290,69 @@ def native_testng(root):
     return methods
 
 
+# Surefire's TestNG provider reports the run it hosted once more, as
+# `TEST-TestSuite.xml`, with every test's logged output inside it. Beside
+# TestNG's native record that is another copy of executions the record already
+# holds, not a second run, and it is checked against the record exactly as
+# TestNG's own JUnit copies are.
+def surefire_testng_copy(path):
+    return PurePosixPath(path).name == "TEST-TestSuite.xml" and report_group(path) in native
+
+
+class MarkupOnly(ET.TreeBuilder):
+    # Identities, outcomes and reasons are tags and attributes. Character data
+    # is the logged output around them, and it is never kept.
+    def __init__(self, testcase_limit):
+        super().__init__()
+        self.testcases = 0
+        self.testcase_limit = testcase_limit
+
+    def start(self, tag, attrs):
+        if tag.rsplit("}", 1)[-1] == "testcase":
+            self.testcases += 1
+            if self.testcases > self.testcase_limit:
+                raise ValueError("more_testcases_than_native_record")
+        return super().start(tag, attrs)
+
+    def data(self, data):
+        pass
+
+
+# A surefire copy over REPORT_MAX_BYTES (casbin's carried ~19 MB of logged
+# output) is read for its markup only, and only to establish that it restates
+# the native record beside it. That record holds at most TOTAL_ROW_CAP
+# identities and a restatement cannot hold more testcases than the record
+# does, so the read stops at the first one past it: what it keeps grows with
+# the record, never with the output that made the file large. The digest is
+# taken over the same bytes in the same pass. Anything short of a verified,
+# self-consistent restatement returns None, and the file stays the dropped
+# file the bound makes it.
+def restated_testng_run(path, expected):
+    methods = native[report_group(path)]
+    hasher = sha256()
+    parser = ET.XMLParser(target=MarkupOnly(sum(methods.values())))
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                parser.feed(chunk)
+        root = parser.close()
+        if hasher.hexdigest() != expected or local_name(root) != "testsuite":
+            return None
+        if not declarations_agree(root, surefire_retries(root)):
+            return None
+    except Exception:
+        return None
+    runtime = [case for case in root.iter()
+               if local_name(case) == "testcase" and not collection_node(case)]
+    if Counter(test_key(case) for case in runtime) - methods:
+        return None
+    return root
+
+
 def row_bytes(row):
     return len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
@@ -488,18 +553,21 @@ for report in reports:
     # afterwards is a disclosure, never an unavailability: a bound that
     # emptied the envelope would be the burst it exists to prevent.
     result["report_count"] += 1
-    if body is None:
-        bounds["unparsed_reports"] += 1
-        unparsed_files.add(path)
-        continue
-    try:
-        root = ET.fromstring(body)
-    except Exception:
-        result["status"] = "unavailable"
-        result["reasons"].append("report_unreadable")
-        continue
-    kind = local_name(root)
     group = report_group(path)
+    if body is None:
+        root = restated_testng_run(path, expected) if surefire_testng_copy(path) else None
+        if root is None:
+            bounds["unparsed_reports"] += 1
+            unparsed_files.add(path)
+            continue
+    else:
+        try:
+            root = ET.fromstring(body)
+        except Exception:
+            result["status"] = "unavailable"
+            result["reasons"].append("report_unreadable")
+            continue
+    kind = local_name(root)
     if kind in ("testng-results", "failsafe-summary"):
         if path not in verified_auxiliary_paths:
             result["status"] = "unavailable"
@@ -521,7 +589,13 @@ for report in reports:
         result["reasons"].append("declared_testcase_count_mismatch")
         continue
     runtime = [element for element in testcases if not collection_node(element)]
-    if b"Generated by org.testng.reporters.JUnit" in body:
+    testng_copy = body is not None and b"Generated by org.testng.reporters.JUnit" in body
+    if not testng_copy and surefire_testng_copy(path):
+        # Surefire's copy restates the record only when every execution it
+        # states is one the record holds. One that states more (a configuration
+        # failure surefire reports as a test, say) is read as its own report.
+        testng_copy = not (Counter(test_key(case) for case in runtime) - native[group])
+    if testng_copy:
         represented = Counter(test_key(case) for case in runtime)
         if group not in native or represented - native[group]:
             result["status"] = "unavailable"

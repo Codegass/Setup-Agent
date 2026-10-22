@@ -1,0 +1,52 @@
+[
+  {
+    "fixture": "testng-results.xml",
+    "archive": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r2/sag-container-evidence/test-report-snapshots",
+    "member": "/workspace/casbin-jcasbin/target/surefire-reports/testng-results.xml",
+    "source_bytes": 108587,
+    "source_sha256": "c0c6325d84dcfe6723ef87ffc6e784228c8835934ac59d9772f29bbbe57483de",
+    "fixture_bytes": 6714,
+    "fixture_sha256": "f9c56d55776b6fd38fe77e0e13c171400dcbf1f847ecee2940ff754baa849a94",
+    "extraction": "whole <class> blocks for 3 classes; root total/passed restated as 10"
+  },
+  {
+    "fixture": "Surefire suite/Surefire test.xml",
+    "archive": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r2/sag-container-evidence/test-report-snapshots",
+    "member": "/workspace/casbin-jcasbin/target/surefire-reports/Surefire suite/Surefire test.xml",
+    "source_bytes": 31180,
+    "source_sha256": "dd41d7298a4ebd98f29e7c8576c43f4b5389b53e3023585acbb70366766a506a",
+    "fixture_bytes": 1416,
+    "fixture_sha256": "7728b01e228d6bede12302dc039b4d94b62dbf8edd179c8544481bde0d2ffbd9",
+    "extraction": "the 10 <testcase> lines of the same classes; root tests restated as 10"
+  },
+  {
+    "fixture": "junitreports/TEST-org.casbin.jcasbin.main.AbacAPIUnitTest.xml",
+    "archive": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r2/sag-container-evidence/test-report-snapshots",
+    "member": "/workspace/casbin-jcasbin/target/surefire-reports/junitreports/TEST-org.casbin.jcasbin.main.AbacAPIUnitTest.xml",
+    "source_bytes": 695,
+    "source_sha256": "bb169781d1486a613abe1037e9ea462e60fafb40a048e9c4d0650cc49101e2e7",
+    "fixture_bytes": 695,
+    "fixture_sha256": "bb169781d1486a613abe1037e9ea462e60fafb40a048e9c4d0650cc49101e2e7",
+    "extraction": "verbatim"
+  },
+  {
+    "fixture": "junitreports/TEST-org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest.xml",
+    "archive": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r2/sag-container-evidence/test-report-snapshots",
+    "member": "/workspace/casbin-jcasbin/target/surefire-reports/junitreports/TEST-org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest.xml",
+    "source_bytes": 1214,
+    "source_sha256": "68cd9a5a10fdc4a827f774177064ec29a17e03bd7abb6d8be8e4983225886928",
+    "fixture_bytes": 1214,
+    "fixture_sha256": "68cd9a5a10fdc4a827f774177064ec29a17e03bd7abb6d8be8e4983225886928",
+    "extraction": "verbatim"
+  },
+  {
+    "fixture": "junitreports/TEST-org.casbin.jcasbin.main.LogUtilTest.xml",
+    "archive": "output/benchmark-fifty-20261021/runs/casbin-jcasbin-r2/sag-container-evidence/test-report-snapshots",
+    "member": "/workspace/casbin-jcasbin/target/surefire-reports/junitreports/TEST-org.casbin.jcasbin.main.LogUtilTest.xml",
+    "source_bytes": 444,
+    "source_sha256": "12e634eb85e0a743ec62e9faa86b5ef5998d172c79b40d12347fe769b956c0e9",
+    "fixture_bytes": 444,
+    "fixture_sha256": "12e634eb85e0a743ec62e9faa86b5ef5998d172c79b40d12347fe769b956c0e9",
+    "extraction": "verbatim"
+  }
+]

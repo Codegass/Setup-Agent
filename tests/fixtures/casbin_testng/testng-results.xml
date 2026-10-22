@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testng-results skipped="0" failed="0" ignored="0" total="10" passed="10">
+  <reporter-output>
+  </reporter-output>
+  <suite name="Surefire suite" duration-ms="54997" started-at="2026-10-22T00:17:25 UTC" finished-at="2026-10-22T00:18:20 UTC">
+    <groups>
+    </groups>
+    <test name="Surefire test" duration-ms="54997" started-at="2026-10-22T00:17:25 UTC" finished-at="2026-10-22T00:18:20 UTC">
+      <class name="org.casbin.jcasbin.main.AbacAPIUnitTest">
+        <test-method status="PASS" signature="testABACMapRequest()[pri:0, instance:org.casbin.jcasbin.main.AbacAPIUnitTest@1ffaf86]" name="testABACMapRequest" duration-ms="24" started-at="2026-10-22T00:18:14 UTC" finished-at="2026-10-22T00:18:14 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testABACMapRequest -->
+        <test-method status="PASS" signature="testEval()[pri:0, instance:org.casbin.jcasbin.main.AbacAPIUnitTest@1ffaf86]" name="testEval" duration-ms="23" started-at="2026-10-22T00:18:14 UTC" finished-at="2026-10-22T00:18:14 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testEval -->
+        <test-method status="PASS" signature="testEvalWithDomain()[pri:0, instance:org.casbin.jcasbin.main.AbacAPIUnitTest@1ffaf86]" name="testEvalWithDomain" duration-ms="22" started-at="2026-10-22T00:18:14 UTC" finished-at="2026-10-22T00:18:14 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testEvalWithDomain -->
+      </class> <!-- org.casbin.jcasbin.main.AbacAPIUnitTest -->
+      <class name="org.casbin.jcasbin.main.LogUtilTest">
+        <test-method status="PASS" signature="testLogUtil()[pri:0, instance:org.casbin.jcasbin.main.LogUtilTest@470734c3]" name="testLogUtil" duration-ms="208" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testLogUtil -->
+      </class> <!-- org.casbin.jcasbin.main.LogUtilTest -->
+      <class name="org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest">
+        <test-method status="PASS" signature="setUp()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="setUp" is-config="true" duration-ms="1" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- setUp -->
+        <test-method status="PASS" signature="testAddPolicies()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="testAddPolicies" duration-ms="1" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testAddPolicies -->
+        <test-method status="PASS" signature="testAddPolicy()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="testAddPolicy" duration-ms="0" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testAddPolicy -->
+        <test-method status="PASS" signature="testRemovePolicies()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="testRemovePolicies" duration-ms="0" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testRemovePolicies -->
+        <test-method status="PASS" signature="setUp()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="setUp" is-config="true" duration-ms="0" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- setUp -->
+        <test-method status="PASS" signature="setUp()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="setUp" is-config="true" duration-ms="0" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- setUp -->
+        <test-method status="PASS" signature="setUp()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="setUp" is-config="true" duration-ms="0" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- setUp -->
+        <test-method status="PASS" signature="testRemoveFilteredPolicy()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="testRemoveFilteredPolicy" duration-ms="0" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testRemoveFilteredPolicy -->
+        <test-method status="PASS" signature="setUp()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="setUp" is-config="true" duration-ms="1" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- setUp -->
+        <test-method status="PASS" signature="testRemovePolicy()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="testRemovePolicy" duration-ms="0" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testRemovePolicy -->
+        <test-method status="PASS" signature="testUpdatePolicy()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="testUpdatePolicy" duration-ms="0" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- testUpdatePolicy -->
+        <test-method status="PASS" signature="setUp()[pri:0, instance:org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest@3c77d488]" name="setUp" is-config="true" duration-ms="0" started-at="2026-10-22T00:18:17 UTC" finished-at="2026-10-22T00:18:17 UTC">
+          <reporter-output>
+          </reporter-output>
+        </test-method> <!-- setUp -->
+      </class> <!-- org.casbin.jcasbin.main.InternalEnforcerWithDispatcherTest -->
+    </test> <!-- Surefire test -->
+  </suite> <!-- Surefire suite -->
+</testng-results>
