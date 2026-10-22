@@ -33,6 +33,8 @@ _TONES = {
     "connected": StatusTone.BLUE,
     "active": StatusTone.BLUE,
     "partial": StatusTone.AMBER,
+    # The result card's CI command line: a command that never finished.
+    "did-not-finish": StatusTone.AMBER,
     "stopped": StatusTone.AMBER,
     "exited": StatusTone.RED,
     "failure": StatusTone.RED,

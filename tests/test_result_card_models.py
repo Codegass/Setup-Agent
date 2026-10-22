@@ -30,13 +30,24 @@ def _card(**overrides) -> RunResultCard:
 
 
 def test_row_order_is_the_reading_order():
-    assert ROW_ORDER == ("setup", "task", "build", "tests", "coverage", "ci", "report")
+    assert ROW_ORDER == (
+        "ci_command",
+        "official_ci",
+        "unconfirmed",
+        "run",
+        "summary",
+        "coverage",
+        "report",
+    )
 
 
 def test_every_row_key_has_a_label():
-    assert set(ROW_LABELS) == set(ROW_ORDER)
-    assert ROW_LABELS["task"] == "Required task"
-    assert ROW_LABELS["ci"] == "Official CI"
+    # The fact rows (setup, task, build, tests, ci) keep their labels: their
+    # builders still state one measurement each, folded into the card's rows.
+    assert set(ROW_ORDER) <= set(ROW_LABELS)
+    assert ROW_LABELS["ci_command"] == "CI command"
+    assert ROW_LABELS["unconfirmed"] == "Not confirmed by SAG"
+    assert ROW_LABELS["official_ci"] == "Official CI"
 
 
 def test_card_requires_exactly_the_seven_rows_in_order():
@@ -58,13 +69,13 @@ def test_card_rejects_rows_out_of_order():
 
 def test_row_finder_returns_the_named_row():
     card = _card()
-    assert card.row("tests").key == "tests"
+    assert card.row("official_ci").key == "official_ci"
 
 
-def test_card_tone_is_the_setup_rows_tone():
+def test_card_tone_is_the_summary_rows_tone():
     rows = list(_row(key) for key in ROW_ORDER)
-    rows[0] = ResultRow(
-        key="setup", label="Setup", status="partial", tone="attention", headline="—"
+    rows[ROW_ORDER.index("summary")] = ResultRow(
+        key="summary", label="Summary", status="partial", tone="attention", headline="—"
     )
     assert _card(rows=tuple(rows)).tone == "attention"
 

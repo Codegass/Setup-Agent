@@ -200,7 +200,9 @@ def test_java_gap_and_live_jobs_reach_the_sealed_checks(monkeypatch):
     monkeypatch.setattr(
         verdict_finalizer,
         "_java_requirement_gaps",
-        lambda orchestrator, validator: ("/workspace/project/pom.xml:profile_activation:playground",),
+        lambda orchestrator, validator: (
+            "/workspace/project/pom.xml:profile_activation:playground",
+        ),
     )
     monkeypatch.setattr(
         verdict_finalizer,

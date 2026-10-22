@@ -220,6 +220,8 @@ def _toolchain(task: Any, completion: Any, receipts: Mapping[str, Mapping[str, A
     if not pinned_java and not pinned_maven:
         return "unavailable", (), (), "the task pins no Java or Maven version"
     results = {str(step.id): step for step in getattr(completion, "steps", ()) or ()}
+    if not results:
+        return "unavailable", pinned_java, pinned_maven, "no step of the task was evaluated"
     mismatch: str | None = None
     unchecked: str | None = None
     for step in steps:
@@ -245,13 +247,19 @@ def _toolchain(task: Any, completion: Any, receipts: Mapping[str, Mapping[str, A
             jdk = receipt.get("effective_jdk")
             major = _major(jdk) if isinstance(jdk, Mapping) else None
             if major is None:
-                unchecked = unchecked or f"the Java version step {step.id} ran with was not recorded"
+                unchecked = (
+                    unchecked or f"the Java version step {step.id} ran with was not recorded"
+                )
             elif major != str(step.java_major):
-                mismatch = mismatch or f"step {step.id} ran Java {major}, not Java {step.java_major}"
+                mismatch = (
+                    mismatch or f"step {step.id} ran Java {major}, not Java {step.java_major}"
+                )
         if step.maven_version:
             actual = _maven_version(receipt)
             if actual is None:
-                unchecked = unchecked or f"the Maven version step {step.id} ran with was not recorded"
+                unchecked = (
+                    unchecked or f"the Maven version step {step.id} ran with was not recorded"
+                )
             elif actual != step.maven_version:
                 mismatch = mismatch or (
                     f"step {step.id} ran Maven {actual}, not Maven {step.maven_version}"
@@ -354,7 +362,10 @@ def _agent_modules(step_receipts, ci_modules: tuple[str, ...] | None) -> tuple[s
         built = set()
         for receipt in listed:
             for entry in receipt.get("module_outcomes") or ():
-                if not isinstance(entry, Mapping) or _text(entry.get("status")).lower() != "success":
+                if (
+                    not isinstance(entry, Mapping)
+                    or _text(entry.get("status")).lower() != "success"
+                ):
                     continue
                 try:
                     built.add(module_key(entry.get("module")))
@@ -466,7 +477,7 @@ def _java_gap(unresolved: Sequence[str] | None) -> str:
 
 
 _MODULES_GAP = (
-    "no successful build of the whole project recorded its module list, "
+    "no successful build of the whole project listed its modules, "
     "and the project's own module list could not be read in full"
 )
 _REPORTS_GAP = (
@@ -567,9 +578,7 @@ def run_control(
         project_root,
         [obligations[job] for job in live if isinstance(obligations.get(job), Mapping)],
     )
-    cleanup_failed = any(
-        _text(live_job_reasons.get(job)) == _CLEANUP_FAILED for job in live
-    )
+    cleanup_failed = any(_text(live_job_reasons.get(job)) == _CLEANUP_FAILED for job in live)
     if "job_barrier_integrity_failure" in tags or cleanup_failed:
         return RunControl(ended="job_control_failure", commands_still_running=still_running)
     if live:

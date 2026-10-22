@@ -50,46 +50,52 @@ def test_block_opens_with_the_run_identity():
 
 def test_every_row_appears_once_in_reading_order():
     lines = [line for line in _plain(_card()).splitlines() if line.startswith(" ")]
-    labels = [line[1:15].strip() for line in lines if line[1:15].strip()]
+    labels = [line[1:23].strip() for line in lines if line[1:23].strip()]
     assert labels[:7] == [
-        "Setup",
-        "Required task",
-        "Build",
-        "Tests",
-        "Coverage",
+        "CI command",
         "Official CI",
+        "Not confirmed by SAG",
+        "Run",
+        "Summary",
+        "Coverage",
         "Report",
     ]
 
 
 def test_headline_and_detail_are_stacked_under_one_label():
     text = _plain(_card())
-    assert " Tests         executed       994 executed · 933 passed · 0 failed" in text
-    assert "                              100% of non-skipped passed" in text
+    assert (
+        " CI command            passed          1 of 1 steps passed\n"
+        "                                       toolchain not checked: the pinned Java\n"
+    ) in text
 
 
 def test_a_reason_carries_its_code_in_parentheses():
-    text = _plain(_card())
+    payload = snapshot_dict(verdict="unknown")
+    payload["task_completion"].update(
+        status="unavailable", steps=[], reasons=["task_run_pin_unavailable"]
+    )
+    text = " ".join(_plain(_card(snapshot=payload)).split())
     assert (
-        " Official CI   not compared   no CI job on this commit matches the run's JDK\n"
-        "                              and OS (official_ci_cell_not_matched)\n"
+        "sources not checked: the record that fixes this run's inputs could not be read "
+        "(task_run_pin_unavailable)"
     ) in text
 
 
 def test_a_row_never_restates_its_status_as_its_headline():
     text = _plain(_card())
-    assert " Coverage      not collected  not collected" not in text
-    assert " Official CI   not compared   not compared" not in text
+    assert " Coverage              not collected   not collected" not in text
+    assert " Run                   ended normally  ended normally" not in text
     # The third column carries the explanation instead, and carries it once.
-    assert " Coverage      not collected  fixture coverage not collected\n" in text
+    assert " Coverage              not collected   fixture coverage not collected\n" in text
     assert text.count("fixture coverage not collected") == 1
 
 
 def test_task_steps_are_listed_under_their_row():
     text = _plain(_card())
     assert (
-        "                              · smoke-build-test: complete — mvn clean verify\n"
-        "                                → exit 0\n"
+        "                                       · smoke-build-test: complete — mvn\n"
+        "                                         clean verify → exit 0\n"
     ) in text
 
 
@@ -101,7 +107,7 @@ def test_a_wrapped_item_hangs_under_its_own_text():
     # The bullet groups what follows it, rather than the continuation starting
     # under the glyph as if it were a new item.
     assert len(continuation) - len(continuation.lstrip()) == indent + 2
-    assert continuation.strip() == "→ exit 0"
+    assert continuation.strip() == "clean verify → exit 0"
 
 
 def test_a_reconstructed_result_says_so_and_a_current_one_does_not():
@@ -180,7 +186,7 @@ def test_a_long_container_name_leaves_the_rule_one_line_wide():
     assert len(lines[0]) == 78
     # The rule is one line: the row block starts immediately after it, and the
     # project and the commit survive intact because the container gave way.
-    assert lines[1].startswith(" Setup")
+    assert lines[1].startswith(" CI command")
 
 
 def test_a_clean_run_says_nothing_after_the_block():

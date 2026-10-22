@@ -915,7 +915,7 @@ def _evidence_accounting(
     The seven lines are the ones the in-loop report already printed, from the
     same formatter. The eighth is the static declaration count, moved here out
     of the diagnostics table this document drops: it was the one fact that
-    table carried which the Tests row does not, and it belongs beside the
+    table carried which the card's test counts do not, and it belongs beside the
     denominators it is explicitly not one of.
     """
 

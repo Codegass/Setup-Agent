@@ -1193,14 +1193,14 @@ def test_card_states_the_run_counts_its_own_ledger_recorded(tmp_path, snapshot_f
     # had been recorded.
     assert card.stats.phases_completed == 0
     assert card.stats.phases_total == 1
-    assert card.row("setup").headline == "0/1 phases · 2 turns · 2 tool calls · 27.7s"
+    assert card.row("run").detail == "0/1 phases · 2 turns · 2 tool calls · 27.7s"
 
 
 def test_a_session_without_a_ledger_still_gets_a_card_that_says_so(tmp_path, snapshot_factory):
     """An absent count is stated as absent; it never blanks the card.
 
     A directory holding no control ledger can answer nothing about turns, and
-    the Setup row says the counts are unavailable rather than printing zeros —
+    the Run row says the counts are unavailable rather than printing zeros —
     every other row still states what the run's own record holds.
     """
     snapshot = snapshot_factory()
@@ -1212,19 +1212,19 @@ def test_a_session_without_a_ledger_still_gets_a_card_that_says_so(tmp_path, sna
     assert card.stats.wall_clock_seconds is None
     # The run pin sits beside the ledger, not inside it, so it still answers.
     assert card.stats.model == "test-action-model"
-    assert card.row("setup").headline == "run counts unavailable"
+    assert card.row("run").detail == "run counts unavailable"
     # The rest of the card is untouched by the missing ledger.
     assert card.verdict == snapshot.verdict
     assert [row.key for row in card.rows] == [
-        "setup",
-        "task",
-        "build",
-        "tests",
+        "ci_command",
+        "official_ci",
+        "unconfirmed",
+        "run",
+        "summary",
         "coverage",
-        "ci",
         "report",
     ]
-    assert card.row("tests").headline.startswith("328 executed")
+    assert "328 executed" in card.row("official_ci").detail
 
 
 def test_a_broken_card_call_raises_while_a_broken_record_only_costs_the_card(

@@ -39,6 +39,7 @@ from sag.console.result_block import (
     _MAX_ITEMS,
     GUTTER,
     LABEL_WIDTH,
+    ROW_LABEL_WIDTH,
     STATUS_WIDTH,
     render_result_block,
 )
@@ -312,10 +313,10 @@ def _verdict_from_text(text):
 
 
 def _markdown_verdict_from_text(text):
-    """The report states the run's verdict as the Result table's Setup row."""
+    """The report states the run's verdict as the Result table's Summary row."""
 
     match = re.search(
-        r"^\| \*\*Setup\*\* \| (success|partial|failed|unknown) \|",
+        r"^\| \*\*Summary\*\* \| (success|partial|failed|unknown) \|",
         text,
         re.MULTILINE,
     )
@@ -344,10 +345,10 @@ def _condensed_tests(text):
 
 
 def _cli_verdict_from_text(text):
-    """The block states the run's verdict as the Setup row's own status word."""
+    """The block states the run's verdict as the Summary row's own status word."""
 
     match = re.search(
-        r"^ Setup\s+\[[a-z]+\](success|partial|failed|unknown)\[",
+        r"^ Summary\s+\[[a-z]+\](success|partial|failed|unknown)\[",
         text,
         re.MULTILINE,
     )
@@ -355,9 +356,16 @@ def _cli_verdict_from_text(text):
     return match.group(1)
 
 
+def _flat(text):
+    """The block wraps its body column; read it back as the sentences it prints."""
+
+    return " ".join(text.split())
+
+
 def _cli_tests(text):
     """The block names the raw execution grain; it prints it only when it differs."""
 
+    text = _flat(text)
     match = re.search(r"([\d,]+) raw executions", text) or re.search(r"([\d,]+) executed", text)
     assert match, text
     return int(match.group(1).replace(",", ""))
@@ -456,7 +464,7 @@ def test_report_states_its_own_delivery_and_the_counts_it_cannot_reach(
 
     assert "| **Report** | delivered | /workspace/setup-report-test.md |" in markdown
     assert "no report was recorded" not in markdown
-    assert "| **Setup** | partial | run counts unavailable |" in markdown
+    assert "| **Run** | ended normally | run counts unavailable |" in markdown
     assert "no run counts were recorded" not in markdown
 
 
@@ -483,8 +491,8 @@ def test_all_surfaces_keep_failures_and_errors_distinct(tvm_snapshot, surface_ha
         assert "987 errors" in surface.text
     # The block reports the run's own execution grain, and keeps the two counts
     # side by side there rather than summing them into one red number.
-    assert "0 failed · 328 errors" in rendered.cli.text
-    assert "987 raw executions" in rendered.cli.text
+    assert "0 failed · 328 errors" in _flat(rendered.cli.text)
+    assert "987 raw executions" in _flat(rendered.cli.text)
     assert "fail_count=0" in rendered.web.text
     assert "errors=328" in rendered.web.text
 
@@ -600,9 +608,9 @@ def test_renderers_keep_observation_execution_grain_explicit(surface_harness, sn
     assert any("not verdict-bearing" in line and "987" in line for line in condensed_lines)
     # The block keeps the grains apart by naming the larger one as raw, so 987
     # is never offered as the number of tests this run has.
-    assert "328 executed" in rendered.cli.text
-    assert "987 raw executions" in rendered.cli.text
-    assert "987 executed" not in rendered.cli.text
+    assert "328 executed" in _flat(rendered.cli.text)
+    assert "987 raw executions" in _flat(rendered.cli.text)
+    assert "987 executed" not in _flat(rendered.cli.text)
 
 
 def test_all_surfaces_preserve_visible_flaky_count(surface_harness, snapshot_factory):
@@ -622,7 +630,7 @@ def test_all_surfaces_preserve_visible_flaky_count(surface_harness, snapshot_fac
     assert "3 flaky" not in rendered.cli.text
     # The block does not drop the retry signal silently: it states the wider
     # execution grain instead of a flaky count it would have to name itself.
-    assert "7 raw executions" in rendered.cli.text
+    assert "7 raw executions" in _flat(rendered.cli.text)
     # The report prints the same result card, so it keeps the retry signal the
     # same way the block does rather than in a second, differently-worded line.
     assert "3 flaky" not in rendered.markdown.text
@@ -683,7 +691,7 @@ def test_web_valid_snapshot_owns_verdict_and_primary_counts(tvm_snapshot):
     assert detail.test.raw_executions == 987
     assert detail.result_card is not None
     assert detail.result_card.verdict == tvm_snapshot.verdict
-    assert detail.result_card.row("tests").headline.startswith("328 executed")
+    assert "328 executed" in detail.result_card.row("official_ci").detail
     assert detail.report_delivery_status is None
 
 
@@ -709,7 +717,7 @@ def test_web_serves_a_result_for_a_seal_written_under_an_older_schema(tvm_snapsh
 
     assert detail.result_card is not None, "the card the terminal prints from these bytes"
     assert detail.result_card.verdict == tvm_snapshot.verdict
-    assert detail.result_card.row("tests").headline.startswith("328 executed")
+    assert "328 executed" in detail.result_card.row("official_ci").detail
     # Served, but never as a reading: the seal reader could not re-read it.
     assert detail.result_card.verdict_source == "legacy"
     assert detail.snapshot_status == "legacy"
@@ -739,8 +747,8 @@ def test_web_card_keeps_the_mutable_module_rollup_out_of_the_build_word(snapshot
     """The rollup is a report diagnostic and the record is the result.
 
     Four failed modules beside a build the run recorded as successful must not
-    turn the Build row's own word around; the count is still worth showing, so
-    it is shown where a reader can see what it is."""
+    turn the run's word around; the count is still worth showing, so it is
+    shown among this run's own counts on the Official CI row."""
 
     snapshot = snapshot_factory(
         verdict="success",
@@ -770,12 +778,10 @@ def test_web_card_keeps_the_mutable_module_rollup_out_of_the_build_word(snapshot
     card = detail.result_card
     assert card is not None
     assert card.verdict == "success"
-    build = card.row("build")
-    assert build.status == "success"
-    assert build.headline == "success"
-    assert build.detail == ("4 modules failed · counts are diagnostic, CI defines scope")
-    assert card.row("tests").headline == (
-        "328 executed · 328 passed · 0 failed · 0 errors · 0 skipped"
+    assert card.row("summary").status == "success"
+    assert card.row("official_ci").detail == (
+        "this run: 328 executed · 328 passed · 0 failed · 0 errors · 0 skipped · "
+        "4 modules failed · 987 raw executions"
     )
 
 
@@ -832,10 +838,9 @@ def test_web_terminal_snapshot_overrides_stale_trunk_and_marks_unreached_phases_
     assert detail.test.execution_rate is None
     card = detail.result_card
     assert card is not None
-    assert card.row("setup").headline == "0/1 phases"
-    assert card.row("setup").detail == "blocked at analyze: iteration budget exhausted"
-    assert card.row("tests").headline == "no test results were recorded"
-    assert card.row("tests").reason == "the run recorded no test outcomes"
+    assert card.row("run").headline == "aborted: the analyze phase was aborted: iteration budget exhausted"
+    assert card.row("run").detail == "0/1 phases · blocked at analyze: iteration budget exhausted"
+    assert "no test results were recorded" in card.row("official_ci").detail
 
 
 def test_web_treats_policy_skipped_build_and_test_as_not_run():
@@ -873,8 +878,9 @@ def test_web_treats_policy_skipped_build_and_test_as_not_run():
     assert detail.test.state == "not_attempted"
     card = detail.result_card
     assert card is not None
-    assert card.row("build").reason == "no build result was recorded for this run"
-    assert card.row("tests").headline == "no test results were recorded"
+    assert card.row("official_ci").detail == (
+        "this run: no build result was recorded · no test results were recorded"
+    )
     assert [item.title for item in card.attention] == [
         "The build phase did not finish",
         "The test phase did not finish",
@@ -1039,7 +1045,11 @@ _TERMINAL_BULLET = "· "
 #: What the report heads a row's findings with, restated here so a failure can
 #: name the row whose findings went missing rather than pointing at a heading
 #: (cf. `_ITEM_HEADINGS` in sag/result_card/markdown.py).
-_REPORT_ITEM_HEADINGS = {"task": "Required task steps", "ci": "Official CI findings"}
+_REPORT_ITEM_HEADINGS = {
+    "ci_command": "CI command steps",
+    "official_ci": "Official CI findings",
+    "unconfirmed": "Not confirmed by SAG",
+}
 
 #: The two trailing lists, under the name each surface gives them. The heading
 #: differs by design; the lines under it must not.
@@ -1298,7 +1308,7 @@ def _printed_rows(card) -> dict[str, _PrintedRow]:
     """Read the block back: every row it printed, in the order it printed them."""
 
     by_label = {ROW_LABELS[key]: key for key in ROW_ORDER}
-    head = GUTTER + LABEL_WIDTH
+    head = GUTTER + ROW_LABEL_WIDTH
     body = head + STATUS_WIDTH
     status: dict[str, str] = {}
     said: dict[str, list[str]] = {}
@@ -1628,14 +1638,16 @@ def test_no_surface_invents_a_verdict_the_run_did_not_record(record):
     assert card.verdict == recorded, _disagrees(
         "the card", record, "verdict", card.verdict, recorded
     )
-    assert card.row("setup").status == recorded, _disagrees(
-        "the card", record, "setup", card.row("setup").status, recorded
+    # The word the run recorded is the Summary row's, derived from the lines
+    # above it and printed last on every surface.
+    assert card.row("summary").status == recorded, _disagrees(
+        "the card", record, "summary", card.row("summary").status, recorded
     )
-    assert _printed_rows(card)["setup"].status == recorded, _disagrees(
-        _TERMINAL, record, "setup", _printed_rows(card)["setup"].status, recorded
+    assert _printed_rows(card)["summary"].status == recorded, _disagrees(
+        _TERMINAL, record, "summary", _printed_rows(card)["summary"].status, recorded
     )
-    served = _report_cells(card)[ROW_LABELS["setup"]][0]
-    assert served == recorded, _disagrees(_REPORT, record, "setup", served, recorded)
+    served = _report_cells(card)[ROW_LABELS["summary"]][0]
+    assert served == recorded, _disagrees(_REPORT, record, "summary", served, recorded)
 
 
 def test_every_ci_verdict_the_record_can_hold_has_a_word_a_reader_can_read():
@@ -1684,15 +1696,12 @@ def test_no_surface_spells_a_comparison_it_could_not_make_the_way_the_record_doe
 
     card = _fence_card("a comparison the run could not make")
 
-    assert card.row("ci").status == NOT_SCORED
-    assert _printed_rows(card)["ci"].status == NOT_SCORED
-    assert _report_cells(card)[ROW_LABELS["ci"]][0] == NOT_SCORED
-
-    # And it says it once. Every `invalid` record under `logs/` carries no
-    # score, so a headline reporting the missing score beside the status word
-    # states the same absence twice in one row.
-    assert card.row("ci").headline == NOT_SCORED
-    assert _printed_rows(card)["ci"].said == ('cell "maven-compile (ubuntu-latest, JDK-8)"',)
+    # The scored comparison is filed under the Official CI row, first among its
+    # findings, and says `not scored` once on every surface.
+    score = 'CI comparison score: not scored · cell "maven-compile (ubuntu-latest, JDK-8)"'
+    assert card.row("official_ci").items[0] == score
+    assert _printed_rows(card)["official_ci"].items[0] == score
+    assert _report_lists(card)["Official CI findings"][0] == score
 
     block = _fence_block(card).lower()
     written = "\n".join(render_result_card_markdown(card)).lower()
@@ -1710,13 +1719,14 @@ def test_a_comparison_that_happened_does_not_read_as_one_that_did_not():
     cell at all, because one word covered 269 of 373 archived rows.
     """
 
-    made = _fence_card("a comparison the run could not make").row("ci")
-    unmatched = _fence_card("a clean run").row("ci")
+    made = _fence_card("a comparison the run could not make").row("official_ci")
+    unmatched = _fence_card("a clean run").row("official_ci")
 
-    assert made.status != unmatched.status
-    assert made.status == NOT_SCORED
-    assert unmatched.status == NOT_COMPARED
-    assert made.detail and "cell " in made.detail, "it names the CI job it reached"
+    # A comparison that reached a CI job is filed under the row with its word
+    # and the job it reached; one that reached none adds nothing to the row.
+    assert made.items and made.items[0].startswith(f"CI comparison score: {NOT_SCORED}")
+    assert "cell " in made.items[0], "it names the CI job it reached"
+    assert not unmatched.items
 
 
 
@@ -1733,30 +1743,27 @@ def test_a_reason_without_a_sentence_reaches_a_reader_once():
     unglossed = "A_CODE_THAT_SHIPPED_BEFORE_ITS_SENTENCE"
     assert unglossed not in REASON_GLOSS
 
-    card = build_result_card(
-        snapshot_dict(
-            ci_comparison=dict(
-                snapshot_dict()["ci_comparison"], status="unavailable", reasons=[unglossed]
-            )
-        ),
-        termination=_DELIVERED,
-    )
-    assert card.row("ci").reason == unglossed
-    assert _printed_rows(card)["ci"].said == (unglossed,)
-    assert _report_cells(card)[ROW_LABELS["ci"]][1] == unglossed
+    def unavailable_task(reason):
+        payload = snapshot_dict(verdict="unknown")
+        payload["task_completion"] = {
+            "run_id": payload["run_id"],
+            "task_sha256": "a" * 64,
+            "status": "unavailable",
+            "steps": [],
+            "reasons": [reason],
+        }
+        return build_result_card(payload, termination=_DELIVERED)
 
-    glossed = build_result_card(
-        snapshot_dict(
-            ci_comparison=dict(
-                snapshot_dict()["ci_comparison"],
-                status="unavailable",
-                reasons=["official_ci_cell_not_matched"],
-            )
-        ),
-        termination=_DELIVERED,
-    )
-    assert glossed.row("ci").reason == (
-        "no CI job on this commit matches the run's JDK and OS (official_ci_cell_not_matched)"
+    # The CI command row is where a task's reason code reaches a reader now.
+    card = unavailable_task(unglossed)
+    assert card.row("ci_command").detail.endswith(f"sources not checked: {unglossed}")
+    assert _flat(_fence_block(card)).count(unglossed) == 1
+    assert "\n".join(render_result_card_markdown(card)).count(unglossed) == 1
+
+    glossed = unavailable_task("task_run_pin_unavailable")
+    assert glossed.row("ci_command").detail.endswith(
+        "sources not checked: the record that fixes this run's inputs could not be read "
+        "(task_run_pin_unavailable)"
     )
 
 
@@ -2025,7 +2032,7 @@ def test_the_header_states_the_length_the_setup_row_states(tmp_path, tvm_snapsho
     assert detail.result_card is not None
     assert detail.result_card.stats.wall_clock_seconds == pytest.approx(368.43)
     assert detail.duration == duration_text(368.43) == "6m 08s"
-    assert detail.result_card.row("setup").headline.endswith("6m 08s")
+    assert "6m 08s" in detail.result_card.row("run").detail
 
 
 def test_the_run_ends_when_its_ledger_ends_in_the_reader_s_own_clock(tmp_path, tvm_snapshot):

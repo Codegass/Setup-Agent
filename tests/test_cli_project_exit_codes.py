@@ -295,14 +295,14 @@ def test_project_command_success_ignores_report_delivery_failure(monkeypatch, tm
     assert result.exit_code == 0
     # Success still says the word: the block states it in the Setup row, and
     # only the closing trailer is what a successful run does without.
-    assert " Setup         success" in result.output
+    assert " Summary               success" in result.output
     assert "Setup verdict" not in result.output
     # The report phase's own deliverable failed, and the host wrote the
     # reader's report at the end of the run regardless. The row is read back
     # off the disk, so it states the document that is there rather than the
     # one the loop failed to write.
     assert "the setup report was not written" not in result.output
-    assert " Report        delivered      setup-report-" in result.output
+    assert " Report                delivered       setup-report-" in result.output
     assert "WARNING" not in result.output
 
 
@@ -385,7 +385,7 @@ def test_block_states_the_verdict_once_and_exits_one(monkeypatch, tmp_path):
     assert text.count("Setup verdict: partial") == 1
     assert "Claimed latest subjects" not in text
     assert "Verdict (derived)" not in text
-    assert "Required task" in text
+    assert "CI command" in text
 
 
 def test_success_exits_zero_and_adds_no_trailer():

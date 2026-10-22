@@ -139,16 +139,16 @@ def test_session_endpoint_returns_session_detail():
     assert "verdict" not in payload
     card = payload["resultCard"]
     assert [row["key"] for row in card["rows"]] == [
-        "setup",
-        "task",
-        "build",
-        "tests",
+        "ci_command",
+        "official_ci",
+        "unconfirmed",
+        "run",
+        "summary",
         "coverage",
-        "ci",
         "report",
     ]
     assert card["verdict"] == "partial"
-    assert card["rows"][2]["headline"] == "3/3 modules built"
+    assert card["rows"][1]["detail"].startswith("this run: 3/3 modules built")
 
 
 def test_dashboard_stream_emits_sse_snapshot():

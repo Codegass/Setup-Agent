@@ -186,7 +186,9 @@ def test_workspace_result_reads_its_verdict_and_ci_off_the_card():
     result = _workspace_result(card, snapshot)
 
     assert result.verdict == card["verdict"]
-    assert result.ci.status == card["rows"][5]["status"]
+    assert result.ci.status == card["rows"][1]["status"]
+    assert result.ci_command.status == card["rows"][0]["status"]
+    assert result.ci_command.headline == card["rows"][0]["headline"]
 
 
 def test_workspace_result_counts_steps_and_tests_from_the_record():
@@ -233,7 +235,8 @@ def test_workspace_result_serializes_the_whole_strip():
 
     dumped = result.model_dump(mode="json", by_alias=True)
 
-    assert set(dumped) == {"verdict", "task", "tests", "ci"}
+    assert set(dumped) == {"verdict", "ciCommand", "task", "tests", "ci"}
+    assert set(dumped["ciCommand"]) == {"status", "headline"}
     assert set(dumped["task"]) == {"status", "completed", "required"}
     assert set(dumped["tests"]) == {"executed", "passed", "failed", "errors", "skipped"}
     assert set(dumped["ci"]) == {"status"}

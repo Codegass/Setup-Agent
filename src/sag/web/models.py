@@ -556,6 +556,13 @@ class WorkspaceCIResult(WebModel):
     status: str
 
 
+class WorkspaceCICommandResult(WebModel):
+    """The card's first line: whether the project's pinned CI command passed."""
+
+    status: str
+    headline: str
+
+
 class WorkspaceResult(WebModel):
     """The cells the dashboard rail shows for one workspace.
 
@@ -564,7 +571,14 @@ class WorkspaceResult(WebModel):
     record declined to measure is absent, not zero.
     """
 
+    #: The card's Summary word, derived from the card's lines above it.
     verdict: str
+    #: The card's first line. None when the record has no card to copy it from.
+    ci_command: WorkspaceCICommandResult | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ci_command", "ciCommand"),
+        serialization_alias="ciCommand",
+    )
     task: WorkspaceTaskResult | None = None
     tests: WorkspaceTestResult | None = None
     ci: WorkspaceCIResult | None = None

@@ -52,6 +52,7 @@ from sag.web.models import (
     ReceiptSummary,
     ReportDocument,
     TestSummary,
+    WorkspaceCICommandResult,
     WorkspaceCIResult,
     WorkspaceResult,
     WorkspaceSummary,
@@ -703,9 +704,18 @@ def _workspace_result(card: Any, snapshot: Any) -> WorkspaceResult | None:
     if not isinstance(card, dict):
         return None
     rows = {row.get("key"): row for row in card.get("rows") or () if isinstance(row, dict)}
-    ci_status = _optional_text((rows.get("ci") or {}).get("status"))
+    ci_status = _optional_text((rows.get("official_ci") or {}).get("status"))
+    command = rows.get("ci_command") or {}
+    command_status = _optional_text(command.get("status"))
     return WorkspaceResult(
         verdict=_text(card.get("verdict"), default="unknown"),
+        ci_command=(
+            WorkspaceCICommandResult(
+                status=command_status, headline=_text(command.get("headline"), default="")
+            )
+            if command_status is not None
+            else None
+        ),
         task=_task_cell(snapshot),
         tests=_tests_cell(snapshot),
         ci=WorkspaceCIResult(status=ci_status) if ci_status is not None else None,
@@ -1215,7 +1225,7 @@ def _setup_artifact_item(
     # when it began and ended — and it is what the card already measured its
     # wall clock from. Subtracting the trunk's `created_at` from the report's
     # `**Generated:**` line answered something else: on the archived commons-cli
-    # run that read 5m 56s while the card's Setup row, an inch below it on the
+    # run that read 5m 56s while the card's Run row, an inch below it on the
     # same page, read 6m 08s. One run cannot last two lengths, so the ledger
     # answers for all three fields or for none of them.
     started, ended, ran_for = _ledger_times(run_dir, result_card)
@@ -2156,7 +2166,7 @@ def _ledger_times(
     print two times that do not reach back to each other.
 
     The length is the card's own `wall_clock_seconds`, formatted by the
-    function the Setup row formats it with, so the header line and the row an
+    function the Run row formats it with, so the header line and the row an
     inch below it cannot state different lengths. The card measures that number
     from this same ledger's two ends, which is why asking the file for the ends
     and the card for the length is one reading rather than two.

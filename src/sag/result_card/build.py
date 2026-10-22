@@ -18,13 +18,13 @@ from sag.result_card.models import (
     RunResultCard,
 )
 from sag.result_card.rows import (
-    build_row,
-    ci_row,
+    ci_command_row,
     coverage_row,
+    official_ci_row,
     report_row,
-    setup_row,
-    task_row,
-    tests_row,
+    run_row,
+    summary_row,
+    unconfirmed_row,
 )
 from sag.trajectory.phases import band_finished
 
@@ -203,11 +203,11 @@ def _attention(
             )
         )
 
-    # The Setup row already states the first blocked phase's reason, in full.
+    # The Run row already states the first blocked phase's reason, in full.
     # Restating it here printed the same paragraph twice on one screen — 450
     # characters of it on a real run — so the item names the phase and leaves
     # the words to the row. A reason no row carries is still stated.
-    said_by_setup = rows["setup"].detail or ""
+    said_by_setup = rows["run"].detail or ""
     for record in getattr(snapshot, "phase_records", ()) or ():
         termination = str(getattr(record, "termination", ""))
         if termination in {"completed", ""}:
@@ -222,7 +222,7 @@ def _attention(
             )
         )
 
-    # The run's own red count, from the numbers the Tests row prints. The
+    # The run's own red count, from the numbers the card's test counts print. The
     # module walk below names WHICH module, and is the better item when it can
     # be built — but `module_metrics.json` occurs in none of the 792 archived
     # campaign directories, so for every real run so far it built nothing, and
@@ -302,6 +302,58 @@ def _attention(
     return tuple(items)
 
 
+#: Said where a record does not carry a line the current finalizer seals.
+_UNRECORDED_OFFICIAL_CI = "this run record does not carry them"
+
+
+def _dimensions(snapshot: Any) -> tuple[Any, Any, Any, Any]:
+    """The four measured lines: as sealed, or read off an older record's fields.
+
+    A record sealed before verdict schema v6 has the facts these lines are made
+    of — its task steps, its conflicts, its phase records — but not the lines
+    themselves. The same derivations the finalizer runs read them here, with
+    what the older record never kept (receipts, the CI record, the job ledger)
+    stated as unavailable. The word on the Summary row is still the one the
+    record sealed.
+    """
+
+    from sag.agent.verdict_dimensions import (
+        OfficialCI,
+        ci_command,
+        run_control,
+        sag_checks,
+    )
+
+    completion = getattr(snapshot, "task_completion", None)
+    command = snapshot.ci_command
+    if command is None and completion is not None:
+        command = ci_command(completion, task=None, receipts={})
+    official = snapshot.official_ci or OfficialCI(
+        basis="unavailable", reason=_UNRECORDED_OFFICIAL_CI
+    )
+    checks = snapshot.sag_checks
+    if not checks:
+        tests = [
+            record
+            for record in getattr(snapshot, "phase_records", ()) or ()
+            if str(getattr(record, "phase", "")) == "test"
+        ]
+        checks = sag_checks(
+            conflicts=snapshot.conflicts,
+            test_judgment=snapshot.test_stats.judgment,
+            test_reason=(str(tests[-1].reason or "") or None) if tests else None,
+            java_unresolved=(),
+        )
+    control = snapshot.run_control or run_control(
+        conflicts=snapshot.conflicts,
+        close_reason=None,
+        phase_records=getattr(snapshot, "phase_records", ()) or (),
+        live_job_reasons={},
+        obligations={},
+    )
+    return command, official, checks, control
+
+
 def _notes(snapshot: Any) -> tuple[str, ...]:
     seen: list[str] = []
     for conflict in getattr(snapshot, "conflicts", ()) or ():
@@ -346,13 +398,16 @@ def build_result_card(
         tool_calls=tool_calls,
         tool_failures=tool_failures,
     )
+    command, official, checks, control = _dimensions(sealed)
     rows = {
-        "setup": setup_row(sealed, stats=stats, termination=termination),
-        "task": task_row(sealed),
-        "build": build_row(sealed, module_metrics=module_metrics),
-        "tests": tests_row(sealed, report_metrics=report_metrics),
+        "ci_command": ci_command_row(sealed, command),
+        "official_ci": official_ci_row(
+            sealed, official, module_metrics=module_metrics, report_metrics=report_metrics
+        ),
+        "unconfirmed": unconfirmed_row(checks),
+        "run": run_row(sealed, control, stats=stats, termination=termination),
+        "summary": summary_row(sealed),
         "coverage": coverage_row(sealed),
-        "ci": ci_row(sealed),
         "report": report_row(termination, report_path=report_path),
     }
 

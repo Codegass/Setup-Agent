@@ -39,7 +39,9 @@ def _cell(name: str) -> dict:
     receipts = {
         path.stem: _json(path) for path in sorted((root / "invocation_receipts").glob("*.json"))
     }
-    obligations = {path.stem: _json(path) for path in sorted((root / "job_obligations").glob("*.json"))}
+    obligations = {
+        path.stem: _json(path) for path in sorted((root / "job_obligations").glob("*.json"))
+    }
     events = [json.loads(line) for line in (root / "control_events.jsonl").read_text().splitlines()]
     live_reasons = {
         event["payload"]["job_id"]: event["payload"].get("close_reason")

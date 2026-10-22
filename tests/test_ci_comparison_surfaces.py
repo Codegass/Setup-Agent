@@ -69,7 +69,9 @@ def _block_ci_fragments(comparison):
 
     result = comparison.attainment
     if result is None:
-        return ["not compared", *comparison.reasons]
+        # A comparison that produced no score adds nothing to the Official CI
+        # row; the row says what the official CI numbers are instead.
+        return ["not compared"]
     score = (
         f"{result.alpha.numerator:,}/{result.alpha.denominator:,}"
         if result.alpha is not None
@@ -101,8 +103,9 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     # comparison itself rather than against the condensed log's phrasing.
     for surface in (surfaces.markdown, surfaces.cli):
         assert surface.verdict == "success"
+        said = " ".join(surface.text.split())
         for fragment in _block_ci_fragments(comparison):
-            assert fragment in surface.text
+            assert fragment in said
     files = {
         VERDICT_PATH: snapshot.model_dump_json(),
         "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
@@ -119,27 +122,28 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     # each from the field that is supposed to carry it. Joining the five fields
     # into one string and matching substrings let a fragment that had landed in
     # the wrong field pass, which is most of what this fence is for.
-    ci = next(row for row in first["resultCard"]["rows"] if row["key"] == "ci")
+    # The scored comparison is filed under the Official CI row, first among its
+    # findings.
+    ci = next(row for row in first["resultCard"]["rows"] if row["key"] == "official_ci")
     result = comparison.attainment
     if result is None:
         assert ci["status"] == "not compared"
-        assert ci["headline"] == "not compared"
-        for reason in comparison.reasons[:1]:
-            assert ci["reason"] and reason in ci["reason"]
+        assert not ci["items"]
     else:
         word = {"not_met": "not met", "invalid": "not scored"}.get(
             str(result.verdict), str(result.verdict)
         )
-        assert ci["status"] == word
+        score = ci["items"][0]
         if result.alpha is not None:
-            assert ci["headline"] == (
-                f"{word} {result.alpha.numerator:,}/{result.alpha.denominator:,}"
+            assert score.startswith(
+                f"CI comparison score: {word} "
+                f"{result.alpha.numerator:,}/{result.alpha.denominator:,} · "
             )
         elif word == "not scored":
-            assert ci["headline"] == word
+            assert score.startswith(f"CI comparison score: {word} · ")
         else:
-            assert ci["headline"] == f"{word} · scope score unavailable"
-        assert ci["detail"] and f'cell "{result.cell_id}"' in ci["detail"]
+            assert score.startswith(f"CI comparison score: {word} · scope score unavailable · ")
+        assert f'cell "{result.cell_id}"' in score
     if status == "met":
         assert comparison.attainment.verdict == "met"
         assert comparison.attainment.alpha is not None

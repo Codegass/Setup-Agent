@@ -279,7 +279,10 @@ def test_the_document_counts_evidence_instead_of_listing_it():
     """The old report joined 81 paths into one 6,215-character line."""
 
     document = render_setup_report(FIXTURE)
-    over_long = [line for line in document.splitlines() if len(line) > 200]
+    # The Result table's rows are whole sentences now (the Official CI row
+    # states this run's own counts beside the official ones), so the bound sits
+    # above a table row and still far below a joined list of paths.
+    over_long = [line for line in document.splitlines() if len(line) > 300]
 
     assert not over_long, over_long
     assert (
@@ -514,7 +517,7 @@ def test_the_web_tab_reads_the_documents_own_timestamp():
     assert rendered.generated == "2026-09-17 18:38:14"
     # The Result table still reaches the tab as a table, not as prose.
     tables = [block for block in rendered.blocks if block.get("type") == "table"]
-    assert any(any(row and row[0] == "Setup" for row in table["rows"]) for table in tables), tables
+    assert any(any(row and row[0] == "Summary" for row in table["rows"]) for table in tables), tables
 
 
 def test_the_document_counts_the_phases_the_run_ran():
@@ -528,7 +531,7 @@ def test_the_document_counts_the_phases_the_run_ran():
 
     document = render_setup_report(FIXTURE)
 
-    assert "| **Setup** | success | 5/5 phases · 19 turns · 19 tool calls · 6m 08s |" in document
+    assert "| **Run** | ended normally | 5/5 phases · 19 turns · 19 tool calls · 6m 08s |" in document
     assert "4/4 phases" not in document
 
 
@@ -560,7 +563,7 @@ def test_a_session_directory_that_is_gone_costs_the_run_nothing(monkeypatch, tmp
 
     assert result.exit_code == 0, result.output
     assert "Setup failed" not in result.output
-    assert " Setup         success" in result.output
+    assert " Summary               success" in result.output
 
 
 def test_the_block_names_the_document_only_when_it_was_written(monkeypatch, tmp_path):
@@ -602,7 +605,7 @@ def test_both_surfaces_say_delivered_and_name_the_same_file(monkeypatch, tmp_pat
     document = written[0].read_text(encoding="utf-8")
 
     assert f"| **Report** | delivered | {written[0].name} |" in document
-    assert f"Report        delivered      {written[0].name}" in result.output
+    assert f"Report                delivered       {written[0].name}" in result.output
 
 
 def test_the_writer_and_the_web_mean_the_same_container_report():

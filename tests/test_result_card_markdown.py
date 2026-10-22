@@ -24,23 +24,30 @@ def test_section_opens_with_a_result_heading_and_a_table_head():
 def test_every_row_is_one_table_row_in_order():
     labels = [line.split("|")[1].strip() for line in _lines() if line.startswith("| **")]
     assert labels == [
-        "**Setup**",
-        "**Required task**",
-        "**Build**",
-        "**Tests**",
-        "**Coverage**",
+        "**CI command**",
         "**Official CI**",
+        "**Not confirmed by SAG**",
+        "**Run**",
+        "**Summary**",
+        "**Coverage**",
         "**Report**",
     ]
 
 
 def test_detail_and_reason_are_joined_in_the_third_column():
-    # The reason joins like any other part. The row builder already names the
-    # code inside it, so a second pair of parentheses would only nest them.
-    row = next(line for line in _lines() if "**Official CI**" in line)
+    # Every part joins like any other. The row builder already names the code
+    # inside its sentence, so a second pair of parentheses would only nest them.
+    payload = snapshot_dict(verdict="unknown")
+    payload["task_completion"].update(status="unavailable", steps=[], reasons=["task_run_pin_unavailable"])
+    row = next(line for line in _lines(snapshot=payload) if "**CI command**" in line)
     assert row == (
-        "| **Official CI** | not compared | no CI job on this commit matches "
-        "the run's JDK and OS (official_ci_cell_not_matched) |"
+        "| **CI command** | unavailable | no step result was recorded · toolchain not "
+        "checked: the pinned Java and Maven versions are not in this record · sources not "
+        "checked: the record that fixes this run's inputs could not be read "
+        "(task_run_pin_unavailable) |"
+    )
+    assert next(line for line in _lines() if "**Coverage**" in line) == (
+        "| **Coverage** | not collected | fixture coverage not collected |"
     )
 
 
@@ -75,9 +82,10 @@ def test_pipes_inside_a_command_do_not_break_the_table():
                 }
             ],
             "reasons": [],
+            "source_changes_by_task": ["out|log.txt"],
         }
     )
-    row = next(line for line in _lines(snapshot=snapshot) if "**Required task**" in line)
+    row = next(line for line in _lines(snapshot=snapshot) if "**CI command**" in line)
     # An escaped pipe is still a `|` character, so count the column separators:
     # every pipe that is not preceded by a backslash.
     assert len(re.findall(r"(?<!\\)\|", row)) == 4
@@ -120,7 +128,7 @@ def test_a_rows_items_are_listed_under_a_heading_naming_that_row():
     # Loose in one list, an item reads as a finding from nowhere; the table is
     # the only thing that could have said which measurement it belongs to.
     lines = _lines()
-    assert lines[lines.index("### Required task steps") + 2] == (
+    assert lines[lines.index("### CI command steps") + 2] == (
         "- smoke-build-test: complete — mvn clean verify → exit 0"
     )
 
@@ -137,9 +145,9 @@ def test_the_comparisons_findings_are_listed_under_their_own_heading():
             )
         )
     )
-    assert lines[lines.index("### Official CI findings") + 2] == (
-        "- NEW_RED_BEYOND_TARGET: tests failed here that pass in CI"
-    )
+    heading = lines.index("### Official CI findings")
+    assert lines[heading + 2].startswith("- CI comparison score: not met")
+    assert lines[heading + 3] == "- NEW_RED_BEYOND_TARGET: tests failed here that pass in CI"
 
 
 def test_a_row_with_no_items_gets_no_heading_of_its_own():

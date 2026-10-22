@@ -11,7 +11,10 @@ import textwrap
 from sag.result_card.models import RunResultCard, Tone
 
 LABEL_WIDTH = 14
-STATUS_WIDTH = 15
+#: The row labels' column. "Not confirmed by SAG" is the longest label, and a
+#: label wider than its column would push its status out of line.
+ROW_LABEL_WIDTH = 22
+STATUS_WIDTH = 16
 GUTTER = 1
 MIN_WIDTH = 60
 _COMMIT_CHARS = 7
@@ -128,7 +131,7 @@ def render_result_block(card: RunResultCard, *, width: int = 78, exit_hint: bool
     """
 
     width = max(MIN_WIDTH, width)
-    body_indent = " " * (GUTTER + LABEL_WIDTH + STATUS_WIDTH)
+    body_indent = " " * (GUTTER + ROW_LABEL_WIDTH + STATUS_WIDTH)
     body_width = width - len(body_indent)
 
     lines: list[str] = [_rule(width, _identity(card, width - _RULE_CHROME))]
@@ -142,7 +145,7 @@ def render_result_block(card: RunResultCard, *, width: int = 78, exit_hint: bool
         style = _TONE_STYLE[row.tone]
         status = row.status[: STATUS_WIDTH - 1]
         head = (
-            f"{' ' * GUTTER}{row.label:<{LABEL_WIDTH}}"
+            f"{' ' * GUTTER}{row.label:<{ROW_LABEL_WIDTH}}"
             f"[{style}]{status}[/{style}]{' ' * (STATUS_WIDTH - len(status))}"
         )
 

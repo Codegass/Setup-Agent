@@ -38,9 +38,11 @@ def _completion(*steps, status=None, reasons=(), source_changes=()):
         status = (
             "complete"
             if complete
-            else "incomplete"
-            if any(row["status"] in {"failed", "missing", "out_of_order"} for row in rows)
-            else "unavailable"
+            else (
+                "incomplete"
+                if any(row["status"] in {"failed", "missing", "out_of_order"} for row in rows)
+                else "unavailable"
+            )
         )
     return TaskCompletionSnapshot(
         run_id=RUN,
@@ -66,7 +68,12 @@ def _done(step_id, receipt_id, exit_code=0, status=None, reason=None):
 
 
 def _missing(step_id):
-    return {"id": step_id, "command": "mvn test", "status": "missing", "reason": "No retained invocation."}
+    return {
+        "id": step_id,
+        "command": "mvn test",
+        "status": "missing",
+        "reason": "No retained invocation.",
+    }
 
 
 def _receipt(receipt_id, *, java="17", maven="3.9.16", exit_code=0, modules=None, totals=None):
@@ -102,7 +109,14 @@ def _receipt(receipt_id, *, java="17", maven="3.9.16", exit_code=0, modules=None
         ([_done("a", "r1", exit_code=2), _missing("b")], "failed", "failed"),
         # A step that ran but could not be proven is not a passing step.
         (
-            [_done("a", "r1", status="unavailable", reason="Invocation contract binding is unavailable.")],
+            [
+                _done(
+                    "a",
+                    "r1",
+                    status="unavailable",
+                    reason="Invocation contract binding is unavailable.",
+                )
+            ],
             "not_finished",
             "partial",
         ),
@@ -121,6 +135,8 @@ def test_a_task_record_without_steps_is_unavailable_and_reads_unknown():
     dimension = ci_command(completion, task=None, receipts={})
     assert dimension.result == "unavailable"
     assert (dimension.steps_passed, dimension.steps_total) == (0, 0)
+    pinned = ci_command(completion, task=_task(_step("build", java_major=17)), receipts={})
+    assert pinned.toolchain_reason == "no step of the task was evaluated"
     assert dimension.first_unpassed_step is None
     assert dimension.source_unchanged == "unavailable"
     assert dimension.source_detail == "task_run_pin_unavailable"
@@ -147,12 +163,18 @@ def test_passed_command_at_the_pinned_toolchain_with_sources_unchanged():
 
 
 def test_first_unpassed_step_names_its_status_and_exit_code():
-    task = _task(_step("one"), _step("two", argv=("mvn", "test")), _step("three", argv=("mvn", "install")))
+    task = _task(
+        _step("one"), _step("two", argv=("mvn", "test")), _step("three", argv=("mvn", "install"))
+    )
     completion = _completion(_done("one", "r1"), _done("two", "r2", exit_code=1), _missing("three"))
     dimension = ci_command(completion, task=task, receipts={})
     assert dimension.result == "failed"
     assert (dimension.steps_passed, dimension.steps_total) == (1, 3)
-    assert dimension.first_unpassed_step.model_dump() == {"id": "two", "status": "failed", "exit_code": 1}
+    assert dimension.first_unpassed_step.model_dump() == {
+        "id": "two",
+        "status": "failed",
+        "exit_code": 1,
+    }
 
 
 def test_toolchain_not_as_pinned_says_what_ran():
@@ -182,10 +204,15 @@ def test_toolchain_unchecked_when_a_pinned_step_did_not_finish_or_nothing_is_pin
         receipts={"r1": _receipt("r1", java="11")},
     )
     assert dimension.toolchain_as_pinned == "unavailable"
-    assert dimension.toolchain_reason == "step two did not finish, so its Java version was not recorded"
+    assert (
+        dimension.toolchain_reason
+        == "step two did not finish, so its Java version was not recorded"
+    )
 
     unpinned = ci_command(
-        _completion(_done("build", "r1")), task=_task(_step("build")), receipts={"r1": _receipt("r1")}
+        _completion(_done("build", "r1")),
+        task=_task(_step("build")),
+        receipts={"r1": _receipt("r1")},
     )
     assert unpinned.toolchain_as_pinned == "unavailable"
     assert unpinned.toolchain_reason == "the task pins no Java or Maven version"
@@ -250,7 +277,9 @@ def test_official_ci_from_a_matched_cell_and_the_pinned_receipts():
             totals={"reported": 4906, "skipped": 22, "passed": 4884, "failed": 0, "errors": 0},
         )
     }
-    dimension = official_ci(_target(), completion=_completion(_done("build", "r1")), receipts=receipts)
+    dimension = official_ci(
+        _target(), completion=_completion(_done("build", "r1")), receipts=receipts
+    )
     assert dimension.basis == "ci-target cell summary"
     assert dimension.reason is None
     assert dimension.cell == "Build on JDK 21 (jdk)"
@@ -265,7 +294,11 @@ def test_official_ci_from_a_matched_cell_and_the_pinned_receipts():
 
 def test_official_ci_without_a_record_or_a_matched_cell_states_why():
     completion = _completion(_done("build", "r1"))
-    receipts = {"r1": _receipt("r1", totals={"reported": 5, "skipped": 0, "passed": 4, "failed": 1, "errors": 0})}
+    receipts = {
+        "r1": _receipt(
+            "r1", totals={"reported": 5, "skipped": 0, "passed": 4, "failed": 1, "errors": 0}
+        )
+    }
     absent = official_ci(None, completion=completion, receipts=receipts)
     assert absent.basis == "unavailable"
     assert absent.reason == "no official CI record was supplied for this run"
@@ -305,7 +338,9 @@ def test_a_cell_with_no_test_count_states_none_rather_than_zero():
 
 def test_a_one_module_build_counts_its_exit_code_as_the_module():
     target = _target(modules=(".",))
-    built = official_ci(target, completion=_completion(_done("build", "r1")), receipts={"r1": _receipt("r1")})
+    built = official_ci(
+        target, completion=_completion(_done("build", "r1")), receipts={"r1": _receipt("r1")}
+    )
     assert built.agent_modules_built == (".",)
     failed = official_ci(
         target,
@@ -349,7 +384,9 @@ def test_java_requirement_undecided_names_the_profile_it_could_not_evaluate():
             "/w/pom.xml:profile_activation:jspecify",
         ),
     )
-    assert two[0].reason == "the 'java17' and 'jspecify' profiles' activations could not be evaluated"
+    assert (
+        two[0].reason == "the 'java17' and 'jspecify' profiles' activations could not be evaluated"
+    )
 
     unread = sag_checks(
         conflicts=("build_requirements_unavailable",),
@@ -369,13 +406,16 @@ def test_built_modules_unconfirmed_on_an_unverified_reactor():
     )
     assert [check.confirmed for check in checks] == [True, False, True, True]
     assert checks[1].reason == (
-        "no successful build of the whole project recorded its module list, "
+        "no successful build of the whole project listed its modules, "
         "and the project's own module list could not be read in full"
     )
     # A disk scan that found modules without output is a fact about the build,
     # not a gap in what SAG knows, so on its own it leaves the check confirmed.
     alone = sag_checks(
-        conflicts=("build_modules_incomplete",), test_judgment="success", test_reason=None, java_unresolved=()
+        conflicts=("build_modules_incomplete",),
+        test_judgment="success",
+        test_reason=None,
+        java_unresolved=(),
     )
     assert alone[1].confirmed
 
@@ -388,10 +428,17 @@ def test_ungraded_test_outcome_carries_the_recorded_reason():
         java_unresolved=(),
     )
     assert not checks[2].confirmed
-    assert checks[2].reason == "test execution completion lacks bound task, assessment or outcome evidence"
-    fallback = sag_checks(conflicts=(), test_judgment="unknown", test_reason=None, java_unresolved=())
+    assert (
+        checks[2].reason
+        == "test execution completion lacks bound task, assessment or outcome evidence"
+    )
+    fallback = sag_checks(
+        conflicts=(), test_judgment="unknown", test_reason=None, java_unresolved=()
+    )
     assert fallback[2].reason == "the run recorded no test outcome that could be graded"
-    graded_red = sag_checks(conflicts=(), test_judgment="failed", test_reason=None, java_unresolved=())
+    graded_red = sag_checks(
+        conflicts=(), test_judgment="failed", test_reason=None, java_unresolved=()
+    )
     assert graded_red[2].confirmed
 
 
@@ -426,7 +473,11 @@ def test_a_run_that_closed_cleanly_ended_normally():
         task=None,
         project_root=None,
     )
-    assert control.model_dump() == {"ended": "normally", "commands_still_running": 0, "detail": None}
+    assert control.model_dump() == {
+        "ended": "normally",
+        "commands_still_running": 0,
+        "detail": None,
+    }
 
 
 def test_live_jobs_at_the_deadline_stop_at_the_time_limit_counting_pinned_steps():
@@ -435,12 +486,20 @@ def test_live_jobs_at_the_deadline_stop_at_the_time_limit_counting_pinned_steps(
         _step("ci-step-2", argv=("mvn", "-q", "-fae", "test")),
     )
     control = run_control(
-        conflicts=("job_live_at_close:job-a", "job_live_at_close:job-b", "acceptance_task_incomplete"),
+        conflicts=(
+            "job_live_at_close:job-a",
+            "job_live_at_close:job-b",
+            "acceptance_task_incomplete",
+        ),
         close_reason="test_terminated",
         phase_records=(_record("build"),),
         live_job_reasons={"job-a": "deadline", "job-b": "deadline"},
         obligations={
-            "job-a": {"tool": "maven", "argv": "/usr/local/bin/mvn -q -fae test", "working_directory": "/workspace/helix"},
+            "job-a": {
+                "tool": "maven",
+                "argv": "/usr/local/bin/mvn -q -fae test",
+                "working_directory": "/workspace/helix",
+            },
             "job-b": {
                 "tool": "maven",
                 "argv": "/usr/local/bin/mvn --fail-at-end test",
@@ -459,9 +518,17 @@ def test_a_job_that_could_not_be_stopped_is_a_job_control_failure():
     control = run_control(
         conflicts=("job_live_at_close:job-a", "job_barrier_integrity_failure"),
         close_reason="aborted",
-        phase_records=(_record("build", termination="aborted", outcome="failed", reason="stalled"),),
+        phase_records=(
+            _record("build", termination="aborted", outcome="failed", reason="stalled"),
+        ),
         live_job_reasons={"job-a": "cleanup_failed"},
-        obligations={"job-a": {"tool": "maven", "argv": "/opt/mvn verify", "working_directory": "/workspace/w"}},
+        obligations={
+            "job-a": {
+                "tool": "maven",
+                "argv": "/opt/mvn verify",
+                "working_directory": "/workspace/w",
+            }
+        },
         task=_task(_step("build")),
         project_root="/workspace/w",
     )
@@ -474,7 +541,9 @@ def test_an_aborted_run_says_which_phase_and_why():
     control = run_control(
         conflicts=(),
         close_reason="aborted",
-        phase_records=(_record("build", termination="aborted", outcome="failed", reason="docker went away"),),
+        phase_records=(
+            _record("build", termination="aborted", outcome="failed", reason="docker went away"),
+        ),
         live_job_reasons={},
         obligations={},
         task=None,

@@ -7,28 +7,51 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic.alias_generators import to_camel
 
-RowKey = Literal["setup", "task", "build", "tests", "coverage", "ci", "report"]
-Tone = Literal["success", "attention", "failed", "neutral"]
-
-# Reading order, fixed so three surfaces and successive runs line up.
-ROW_ORDER: tuple[RowKey, ...] = (
+RowKey = Literal[
+    "ci_command",
+    "official_ci",
+    "unconfirmed",
+    "run",
+    "summary",
+    "coverage",
+    "report",
+    # Fact rows: built by `sag.result_card.rows` and folded into the card's
+    # rows above, never placed on a card themselves.
     "setup",
     "task",
     "build",
     "tests",
-    "coverage",
     "ci",
+]
+Tone = Literal["success", "attention", "failed", "neutral"]
+
+# Reading order, fixed so three surfaces and successive runs line up: what the
+# project's CI command did, how that compares with the official CI run, what
+# SAG could not confirm, how the run ended, and only then the one word derived
+# from those lines (spec 2026-10-22).
+ROW_ORDER: tuple[RowKey, ...] = (
+    "ci_command",
+    "official_ci",
+    "unconfirmed",
+    "run",
+    "summary",
+    "coverage",
     "report",
 )
 
 ROW_LABELS: dict[RowKey, str] = {
+    "ci_command": "CI command",
+    "official_ci": "Official CI",
+    "unconfirmed": "Not confirmed by SAG",
+    "run": "Run",
+    "summary": "Summary",
+    "coverage": "Coverage",
+    "report": "Report",
     "setup": "Setup",
     "task": "Required task",
     "build": "Build",
     "tests": "Tests",
-    "coverage": "Coverage",
     "ci": "Official CI",
-    "report": "Report",
 }
 
 
@@ -133,9 +156,9 @@ class RunResultCard(_Frozen):
 
     @property
     def tone(self) -> Tone:
-        """The whole card reads as its setup row: one word for the run."""
+        """The whole card reads as its summary row: the word derived from the rest."""
 
-        return self.rows[0].tone
+        return self.row("summary").tone
 
     def row(self, key: RowKey) -> ResultRow:
         for row in self.rows:

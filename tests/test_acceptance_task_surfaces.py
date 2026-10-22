@@ -27,14 +27,19 @@ from sag.web.session_registry import _session_detail, _setup_artifact_item
 
 
 def _block_task_fragments(completion):
-    """What the result block must state about a sealed required task."""
+    """What the result block must state about a sealed required task.
+
+    The CI command row states the task: its result word, the steps passed out
+    of the total, and one line per step. The block wraps its body column, so
+    the fragments are matched on whitespace-collapsed text.
+    """
 
     steps = tuple(completion.steps or ())
     if not steps:
-        return [str(completion.status), *completion.reasons]
+        return ["unavailable", "no step result was recorded", *completion.reasons]
     complete = sum(1 for step in steps if step.status == "complete")
     return [
-        f"{completion.status} {complete}/{len(steps)} steps",
+        f"{complete} of {len(steps)} steps passed",
         *[f"{step.id}: {step.status} \u2014 {step.command}" for step in steps],
     ]
 
@@ -143,7 +148,8 @@ def test_required_task_result_is_identical_across_sealed_surfaces(snapshot_facto
     # itself rather than against the condensed log's phrasing.
     for surface in (surfaces.markdown, surfaces.cli):
         assert surface.verdict == snapshot.verdict
-        assert all(fragment in surface.text for fragment in _block_task_fragments(completion))
+        said = " ".join(surface.text.split())
+        assert all(fragment in said for fragment in _block_task_fragments(completion))
     orch = SnapshotOrchestrator(
         {
             VERDICT_PATH: snapshot.model_dump_json(),
@@ -158,17 +164,21 @@ def test_required_task_result_is_identical_across_sealed_surfaces(snapshot_facto
     # each from the field that is supposed to carry it. Joining the five fields
     # into one string and matching substrings passed a fragment that had landed
     # in the wrong field, which is most of what this fence is for.
-    task = next(row for row in detail["resultCard"]["rows"] if row["key"] == "task")
+    task = next(row for row in detail["resultCard"]["rows"] if row["key"] == "ci_command")
     steps = tuple(completion.steps or ())
-    assert task["status"] == str(completion.status)
+    assert task["status"] == {
+        "complete": "passed",
+        "incomplete": "did not finish",
+        "unavailable": "unavailable",
+    }[str(completion.status)]
     if steps:
         complete = sum(1 for step in steps if step.status == "complete")
-        assert task["headline"] == f"{completion.status} {complete}/{len(steps)} steps"
+        assert task["headline"].startswith(f"{complete} of {len(steps)} steps passed")
     else:
-        assert task["headline"] == "step definition unavailable"
+        assert task["headline"] == "no step result was recorded"
         # The row explains the code rather than restating it bare.
         for reason in completion.reasons[:1]:
-            assert task["reason"] and reason in task["reason"]
+            assert task["detail"] and f"({reason})" in task["detail"]
     # The step lines the block prints, in the row's own `items`, one for one.
     assert [item.split(" \u2192 exit ")[0].split(";")[0] for item in task["items"]] == [
         f"{step.id}: {step.status} \u2014 {step.command}" for step in steps

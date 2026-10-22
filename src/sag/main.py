@@ -451,7 +451,7 @@ def _delivering(termination: RunTermination) -> RunTermination:
     `recorded_report` says `delivered` for a directory that holds a report;
     this says it for the document being written into one, which is the same
     statement a moment earlier. Only the report word is replaced: how the run
-    itself ended is the run's to say, and the Setup row reads it.
+    itself ended is the run's to say, and the Run row reads it.
     """
 
     return termination.model_copy(update={"report_delivery_status": ReportDeliveryStatus.DELIVERED})

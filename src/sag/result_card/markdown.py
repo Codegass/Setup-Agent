@@ -15,8 +15,9 @@ _OLDER_RECORD = "reconstructed from an older run record"
 #: What a row's items are, said in the row's own terms. A row not named here
 #: takes its label, so a new row gets a heading without an edit here.
 _ITEM_HEADINGS: dict[str, str] = {
-    "task": "Required task steps",
-    "ci": "Official CI findings",
+    "ci_command": "CI command steps",
+    "official_ci": "Official CI findings",
+    "unconfirmed": "Not confirmed by SAG",
 }
 
 

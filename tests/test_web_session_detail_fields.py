@@ -75,7 +75,7 @@ def test_result_card_serializes_under_its_camel_case_alias():
     detail = ExecutionSessionDetail.model_construct(result_card=card)
     dumped = detail.model_dump(mode="json", by_alias=True, include={"result_card"})
     assert "resultCard" in dumped
-    assert dumped["resultCard"]["rows"][0]["key"] == "setup"
+    assert dumped["resultCard"]["rows"][0]["key"] == "ci_command"
     # The envelope key is not the only camelCase thing here: the body speaks the
     # same convention, so a reader never switches halfway through the object.
     assert dumped["resultCard"]["runId"] == card.run_id

@@ -42,7 +42,7 @@ def test_card_from_a_clean_run():
     assert card.tone == "success"
     assert card.stats.turns == 12
     assert card.stats.tool_failures == 2
-    assert card.row("setup").headline == "12 turns · 20 tool calls · 6m 30s"
+    assert card.row("run").detail == "12 turns · 20 tool calls · 6m 30s"
     assert card.attention == ()
     assert card.notes == ()
 
@@ -181,7 +181,7 @@ def test_failing_names_are_capped_with_a_remainder():
 def test_one_module_metrics_payload_reaches_every_reader_of_it():
     """A read-only view of the file is the same file, to both readers of it.
 
-    `build_row` and `_attention` each narrow the payload themselves. While one
+    The build facts and `_attention` each narrow the payload themselves. While one
     accepted any `Mapping` and the other only a `dict`, a caller handing over a
     `MappingProxyType` got a card that raised the file's failing-test bullets
     and dropped the file's jar count out of the build row in the same breath —
@@ -198,8 +198,8 @@ def test_one_module_metrics_payload_reaches_every_reader_of_it():
     plain = build_result_card(payload, module_metrics=metrics)
     frozen = build_result_card(payload, module_metrics=MappingProxyType(metrics))
 
-    assert "4 jars" in plain.row("build").detail
-    assert frozen.row("build") == plain.row("build")
+    assert "4 jars" in plain.row("official_ci").detail
+    assert frozen.row("official_ci") == plain.row("official_ci")
     assert frozen.attention == plain.attention
 
 
@@ -319,7 +319,7 @@ def test_a_run_whose_tests_went_red_is_named_under_attention():
 
     item = next(item for item in card.attention if item.kind == "failing_tests")
     assert "8" in item.title and "3" in item.title
-    assert card.row("tests").headline.startswith("994 executed")
+    assert "994 executed" in card.row("official_ci").detail
 
 
 def test_the_attention_item_counts_what_the_tests_row_counts():
@@ -374,7 +374,7 @@ def test_a_run_that_recorded_no_test_outcomes_is_not_named():
 def test_a_blocked_phase_reason_is_printed_once_not_twice():
     """One screen, one copy of a 450-character paragraph.
 
-    The Setup row's detail is `blocked at <phase>: <reason>` and the Needs
+    The Run row's detail says `blocked at <phase>: <reason>` and the Needs
     attention item restated the same reason in full, so every blocked run
     printed its whole blocking paragraph twice — on the terminal, in the
     report and on the page. The item still names the phase, which is what
@@ -396,7 +396,7 @@ def test_a_blocked_phase_reason_is_printed_once_not_twice():
 
     item = next(item for item in card.attention if item.kind == "blocked_phase")
     assert item.title == "The test phase did not finish"
-    assert reason in (card.row("setup").detail or ""), "the row still states it"
+    assert reason in (card.row("run").detail or ""), "the row still states it"
     assert item.detail is None, "and the item does not state it a second time"
 
 

@@ -131,7 +131,7 @@ class ReportDeliveryOnly:
     row reads ``termination``. A surface that reads a finished run's artifacts
     from outside the run can say whether the report document exists — it is
     holding one — but nothing it reads says whether the run completed or was
-    cut short. Carrying no ``termination`` is how the Setup row is told that,
+    cut short. Carrying no ``termination`` is how the Run row is told that,
     and it reads the same as the run ending normally.
     """
 

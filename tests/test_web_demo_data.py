@@ -74,12 +74,13 @@ def test_demo_session_locks_local_ui_demo_facts():
     card = detail.result_card
     assert card is not None
     assert card.verdict == "partial"
-    assert card.row("build").headline == "3/3 modules built"
-    assert card.row("tests").headline.startswith(
-        "320 executed · 312 passed · 8 failed"
+    # The demo pins no task, so its build and tests are what the run did.
+    assert card.row("ci_command").status == "not supplied"
+    assert card.row("official_ci").detail.startswith(
+        "this run: 3/3 modules built · 320 executed · 312 passed · 8 failed"
     )
     assert card.row("report").status == "delivered"
-    # One attention item, counting the same eight failures the Tests row does.
+    # One attention item, counting the same eight failures the card's counts do.
     assert [item.title for item in card.attention] == ["commons-cli-core · 8 failing"]
 
 
