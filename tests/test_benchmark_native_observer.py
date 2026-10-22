@@ -505,6 +505,40 @@ def test_parallel_metadata_probes_do_not_create_a_build_capture_conflict(fixture
     assert observer.errors == []
 
 
+def test_parallel_probe_shell_does_not_hide_the_shell_that_runs_the_step(fixture, tmp_path):
+    """OpenCode opens `mvn -version` and `mvn verify` shells at once; the launch binds to the latter."""
+    observer, _, event, transcript, _ = make_observer(fixture, tmp_path)
+    observer.event(event)
+    probe = {**event, "tool_use_id": "probe", "tool_input": {"command": "mvn -version"}}
+    observer.event(probe)
+    observer.event(event["launcher_event"])
+    assert observer.errors == []
+    assert observer.calls["native-1"]["selected_step"] is not None
+    assert observer.calls["probe"]["selected_step"] is None
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("mvn verify", True),
+        ("/opt/maven/bin/mvn verify", True),
+        ("cd /workspace/project && mvn verify 2>&1 | tail -50", True),
+        ("mvn -version", False),
+        ("mvn verify -DskipTests", False),
+        ("mvn clean verify", False),
+        ("echo mvn verify", False),
+        ("mvn verify > build.log 2>&1", True),
+        ("(cd sub; mvn verify)", True),
+        ("", False),
+    ],
+)
+def test_shell_names_step_matches_the_frozen_argv_as_contiguous_tokens(command, expected):
+    from scripts.benchmark_native_observer import shell_names_step
+
+    steps = [{"argv": ["mvn", "verify"], "cwd": "."}]
+    assert shell_names_step({"command": command}, steps) is expected
+
+
 def test_unobserved_retry_never_uses_prior_success(fixture, tmp_path):
     observer, root, event, transcript, _ = make_observer(fixture, tmp_path)
     observer.event(event)

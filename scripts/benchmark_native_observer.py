@@ -104,6 +104,52 @@ def native_result(arm, event):
     }
 
 
+def shell_names_step(native_input, steps):
+    """True when the shell command text runs a frozen step's argv as one simple command.
+
+    The step's tokens must appear contiguously, bounded by the start or end of
+    the command or by a shell operator or redirection, so `mvn -version`,
+    `mvn verify -DskipTests` and `echo mvn verify` never name a `mvn verify`
+    step. The first token may spell the launcher by path (`/opt/maven/bin/mvn`)
+    as long as its basename is the step's.
+    """
+    command = (native_input or {}).get("command") if isinstance(native_input, dict) else None
+    if not isinstance(command, str) or not command.strip():
+        return False
+    # Operators written without spaces (`(cd sub; mvn verify)`) become their
+    # own tokens; a quoted operator inside a step argument would also split,
+    # which only makes that shell fail to name the step (the safe direction).
+    spaced = _OPERATORS.sub(r" \1 ", command)
+    try:
+        tokens = shlex.split(spaced)
+    except ValueError:
+        tokens = spaced.split()
+
+    def boundary(index):
+        if index < 0 or index >= len(tokens):
+            return True
+        token = tokens[index]
+        return token in {"&&", "||", ";", "|", "&", "(", ")", "{", "}"} or _REDIRECTION.match(token) is not None
+
+    for step in steps:
+        argv = list(step.get("argv") or [])
+        if not argv or len(tokens) < len(argv):
+            continue
+        for start in range(len(tokens) - len(argv) + 1):
+            window = tokens[start:start + len(argv)]
+            if window[1:] != argv[1:]:
+                continue
+            if window[0] != argv[0] and posixpath.basename(window[0]) != posixpath.basename(argv[0]):
+                continue
+            if boundary(start - 1) and boundary(start + len(argv)):
+                return True
+    return False
+
+
+_REDIRECTION = re.compile(r"^\d*[<>]")
+_OPERATORS = re.compile(r"(\|\||&&|[();|&])")
+
+
 def launcher_matches(expected, observed):
     """Bind a resolved Maven launcher (as the witness saw it) to a frozen step launcher.
 
@@ -273,6 +319,13 @@ class NativeObserver:
                 or c.get("native_result", {}).get("status") == "pending"
             )
         ]
+        if len(active) > 1:
+            # An agent may open several shells at once (a version probe beside
+            # the build). The launch binds to the one shell whose command names
+            # the frozen step; two such shells stay ambiguous.
+            named = [c for c in active if shell_names_step(c.get("native_input"), matches)]
+            if len(named) == 1:
+                active = named
         if len(active) != 1:
             raise ValueError("Native Maven launch has no unique active shell tool")
         call = active[0]
