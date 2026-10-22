@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from scripts.d3r2_campaign import config_environment
-from scripts.run_portable_harness import effective_sag_config, prompt, sag_model_config
+from scripts.run_portable_harness import checkout_pinned_commit, effective_sag_config, prompt, sag_model_config
 
 
 def environment(config):
@@ -104,3 +104,44 @@ def test_common_brief_preserves_per_step_reviewed_environment():
     assert 'will rerun' not in brief
     assert 'will not run missing commands' in brief
     assert 'wait for every required command' in brief
+
+
+def _fake_dex(fail_first_checkout, head):
+    calls = []
+
+    def dex(argv, **kwargs):
+        calls.append(argv)
+        if argv[:4] == ['git', '-C', '/workspace/project', 'checkout'] and fail_first_checkout and len(
+            [c for c in calls if c[:4] == argv[:4]]
+        ) == 1:
+            raise RuntimeError("fatal: reference is not a tree: " + argv[-1])
+        if argv[-2:] == ['rev-parse', 'HEAD']:
+            return head
+        return ''
+
+    return dex, calls
+
+
+def test_pinned_commit_no_branch_reaches_is_fetched_directly():
+    sha = 'db8698e9ea679b8319b9e07716c664788e856b2b'
+    dex, calls = _fake_dex(fail_first_checkout=True, head=sha)
+    checkout_pinned_commit(dex, '/workspace/project', sha)
+    assert [c[3:] for c in calls] == [
+        ['checkout', '--detach', sha],
+        ['fetch', '--force', 'origin', sha],
+        ['checkout', '--detach', sha],
+        ['rev-parse', 'HEAD'],
+    ]
+
+
+def test_reachable_pinned_commit_is_checked_out_without_a_fetch():
+    sha = 'db8698e9ea679b8319b9e07716c664788e856b2b'
+    dex, calls = _fake_dex(fail_first_checkout=False, head=sha)
+    checkout_pinned_commit(dex, '/workspace/project', sha)
+    assert [c[3:] for c in calls] == [['checkout', '--detach', sha], ['rev-parse', 'HEAD']]
+
+
+def test_checkout_at_another_commit_is_refused():
+    dex, _ = _fake_dex(fail_first_checkout=False, head='0' * 40)
+    with pytest.raises(ValueError):
+        checkout_pinned_commit(dex, '/workspace/project', 'db8698e9ea679b8319b9e07716c664788e856b2b')

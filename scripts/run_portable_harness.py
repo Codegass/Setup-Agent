@@ -51,6 +51,22 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def checkout_pinned_commit(dex, checkout, sha):
+    """Detach the clone at the pinned commit; fetch the commit directly when no branch reaches it.
+
+    A pinned commit that is no longer on any branch (a rewritten or deleted branch, a
+    detached CI head) is absent from a plain clone, so the first checkout fails with
+    "reference is not a tree". GitHub serves such commits to an explicit fetch by id.
+    """
+    try:
+        dex(['git', '-C', checkout, 'checkout', '--detach', sha], timeout=90)
+    except RuntimeError:
+        dex(['git', '-C', checkout, 'fetch', '--force', 'origin', sha], timeout=900)
+        dex(['git', '-C', checkout, 'checkout', '--detach', sha], timeout=90)
+    if dex(['git', '-C', checkout, 'rev-parse', 'HEAD']) != sha:
+        raise ValueError('Prepared checkout differs from frozen commit')
+
+
 def admit_definition(spec, *, allow_review_required=False):
     """A live attempt needs a complete definition unless review_required is opted in.
 
@@ -270,9 +286,7 @@ def run(args):
         dex(['mkdir', '-p', '/workspace', '/work'])
         repo = task['repo'] if task['repo'].startswith('https://') else 'https://github.com/'+task['repo']+'.git'
         dex(['git', 'clone', '--no-checkout', repo, checkout], timeout=900)
-        dex(['git', '-C', checkout, 'checkout', '--detach', task['sha']], timeout=90)
-        if dex(['git', '-C', checkout, 'rev-parse', 'HEAD']) != task['sha']:
-            raise ValueError('Prepared checkout differs from frozen commit')
+        checkout_pinned_commit(dex, checkout, task['sha'])
         upload_recorder()
         initial = json.loads(recorder('start', ['--agent', args.arm]))
         call(['docker', 'cp', container+':/opt/benchmark-records', str(out/'initial-records')])
