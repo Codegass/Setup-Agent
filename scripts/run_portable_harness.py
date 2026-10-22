@@ -34,6 +34,7 @@ POLICY = {'version': 'sag-unattended-v1', 'scope': 'task_affecting_human_actions
           'window': 'process_start_to_termination', 'initial_task_excluded': True,
           'operator_commitment': 'report_any_task_affecting_deviation', 'manual_cancellation': 'counted'}
 REVIEW_ENV = 'SAG_BENCHMARK_ALLOW_REVIEW_REQUIRED'
+BASELINE_LOCALE = {'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 
 
 def now():
@@ -145,6 +146,10 @@ def baseline_model_environment(arm, *, token, endpoint, seconds):
            'ANTHROPIC_DEFAULT_HAIKU_MODEL':'gpt-5.4-mini','CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1',
            'DISABLE_AUTOUPDATER':'1','DISABLE_TELEMETRY':'1','OPENCODE_CONFIG':'/work/opencode.json',
            'OPENCODE_DISABLE_AUTOUPDATE':'true','OPENCODE_DISABLE_SHARE':'true'}
+    if arm in ('claude', 'opencode'):
+        # The image's default locale gives Java the platform encoding
+        # ANSI_X3.4-1968; CI runners and SAG's dispatch prefix use UTF-8.
+        env.update(BASELINE_LOCALE)
     if arm == 'claude':
         env.update(claude_arm_environment(seconds))
     return env

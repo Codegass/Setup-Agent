@@ -185,3 +185,14 @@ def test_launch_listing_keeps_redacting_gateway_credentials():
     assert "secret-token" not in listed.values()
     assert listed["ANTHROPIC_API_KEY"] == "<per-attempt gateway credential>"
     assert listed["ANTHROPIC_BASE_URL"] == "http://host.docker.internal:18571"
+
+
+@pytest.mark.parametrize("arm", ["claude", "opencode"])
+def test_baseline_shells_run_with_a_utf8_locale(arm):
+    """Claude Code's shell reported platform encoding ANSI_X3.4-1968, which failed
+    charset-sensitive tests in commons-codec and commons-csv; CI runners are UTF-8,
+    and SAG's dispatch prefix already exports C.UTF-8."""
+    env = _baseline_environment(arm)
+    assert env["LANG"] == env["LC_ALL"] == "C.UTF-8"
+    listed = launch_environment(env)
+    assert listed["LANG"] == listed["LC_ALL"] == "C.UTF-8"
