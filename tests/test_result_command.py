@@ -88,7 +88,7 @@ def test_prints_the_block_for_a_recorded_session(tmp_path):
     result = CliRunner().invoke(cli, ["result", str(_recorded(tmp_path))])
 
     assert result.exit_code == 0, result.output
-    assert "Required task" in result.output
+    assert "CI command" in result.output
     assert "Official CI" in result.output
 
 
@@ -99,7 +99,7 @@ def test_json_prints_the_card_and_nothing_a_parser_chokes_on(tmp_path):
     assert result.exit_code == 0, result.output
     card = json.loads(result.output)
     assert card["schema_version"] == 1
-    assert [row["key"] for row in card["rows"]][0] == "setup"
+    assert [row["key"] for row in card["rows"]][0] == "ci_command"
 
 
 def test_finds_a_verdict_when_pointed_at_the_setup_agent_directory_itself(tmp_path):
