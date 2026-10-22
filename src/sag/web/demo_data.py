@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from sag.agent.verdict_finalizer import (
+    VERDICT_SCHEMA_VERSION,
     ReportDeliveryStatus,
     RunTermination,
     RunTerminationStatus,
@@ -392,7 +393,7 @@ def _commons_run_record() -> dict[str, Any]:
 
     counts = {"executed": 320, "passed": 312, "failed": 8, "errors": 0, "skipped": 0}
     return {
-        "schema_version": 5,
+        "schema_version": VERDICT_SCHEMA_VERSION,
         "run_id": _COMMONS_RUN_ID,
         "finalized_at": "2026-06-06T02:16:44Z",
         "input_refs": [],

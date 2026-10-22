@@ -69,7 +69,7 @@ def test_fixture_replays_to_declared_snapshot_without_external_calls(fixture_nam
     assert result.header.fixture_kind == "recorded_tool_transcript"
     assert result.header.source_manifest
     assert result.expected_snapshot["schema_version"] == 3
-    assert result.snapshot.schema_version == 5
+    assert result.snapshot.schema_version == 6
     assert result.snapshot.rates
     assert result.snapshot.ci_comparison.status == "no_target"
     assert result.snapshot.ci_comparison.certificate is None
@@ -358,7 +358,7 @@ def test_evidence_publication_is_strict_but_inert_inside_pending_action_pair(tmp
 
     result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
-    assert result.snapshot.schema_version == 5
+    assert result.snapshot.schema_version == 6
     assert result.snapshot.verdict == "partial"
     assert result.executed_envelope_count == result.paired_envelope_count == 6
 
@@ -433,7 +433,7 @@ def test_mutable_publication_revision_chain_is_inert_and_strict(tmp_path):
         _paramiko_rows_with_publications([first, second]),
     )
     result = ControlReplayRunner.offline(verify_expected=False).run(valid)
-    assert result.snapshot.schema_version == 5
+    assert result.snapshot.schema_version == 6
     assert result.snapshot.verdict == "partial"
 
     forged = tmp_path / "publication-revision-forged.jsonl"
@@ -1921,11 +1921,14 @@ def test_v4_expectation_projects_only_additive_ci_field_and_still_detects_drift(
     historical = current.snapshot.model_dump(mode="json")
     historical["schema_version"] = 4
     historical.pop("ci_comparison")
+    # The v6 measured dimensions are as additive to a v4 record as the CI field.
+    for key in ("ci_command", "official_ci", "sag_checks", "run_control"):
+        historical.pop(key, None)
     rows[0]["expected_snapshot"] = historical
     transcript = tmp_path / "v4-expectation.jsonl"
     _write_replay_rows(transcript, rows)
     result = ControlReplayRunner.offline().run(transcript)
-    assert result.snapshot.schema_version == 5
+    assert result.snapshot.schema_version == 6
     assert result.expected_snapshot == historical
     assert result.snapshot.rates == historical["rates"]
     assert result.snapshot.verdict == historical["verdict"]

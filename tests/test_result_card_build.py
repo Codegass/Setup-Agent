@@ -241,7 +241,9 @@ def test_a_ci_finding_that_names_work_needs_attention():
 
 
 def test_a_current_record_names_its_source():
-    card = build_result_card(snapshot_dict(verdict="unknown", schema_version=5))
+    from sag.agent.verdict_finalizer import VERDICT_SCHEMA_VERSION
+
+    card = build_result_card(snapshot_dict(verdict="unknown", schema_version=VERDICT_SCHEMA_VERSION))
     assert card.verdict == "unknown"
     assert card.verdict_source == "snapshot"
 

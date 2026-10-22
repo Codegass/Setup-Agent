@@ -1,8 +1,8 @@
 """Snapshot and sibling-artifact fixtures for result-card tests.
 
 Built as plain dicts so a test can state exactly the fields it is about and
-leave the rest at a neutral default. ``snapshot_dict`` returns the v5 payload
-``RunVerdictSnapshot.model_validate`` accepts.
+leave the rest at a neutral default. ``snapshot_dict`` returns a payload at the
+current verdict schema that ``RunVerdictSnapshot.model_validate`` accepts.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from typing import Any
 
 from sag.agent.control_events import canonical_sha256
 from sag.agent.java_success_certificates import evaluate_java_success_certificate
+from sag.agent.verdict_finalizer import VERDICT_SCHEMA_VERSION
 
 from test_java_success_certificates import _obligations, _payload, _scope
 from verdict_rate_fakes import complete_verdict_rates
@@ -29,10 +30,10 @@ CLEAN_TEST_COUNTS = {
 
 
 def snapshot_dict(**overrides: Any) -> dict[str, Any]:
-    """A complete v5 verdict payload; override any top-level key."""
+    """A complete current verdict payload; override any top-level key."""
 
     payload: dict[str, Any] = {
-        "schema_version": 5,
+        "schema_version": VERDICT_SCHEMA_VERSION,
         "run_id": RUN_ID,
         "finalized_at": "2026-09-14T21:14:51Z",
         "input_refs": [],

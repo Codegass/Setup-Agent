@@ -219,7 +219,7 @@ def test_v4_finalize_round_trip_carries_the_complete_rates_block():
         project_name="project",
     ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
 
-    assert snapshot.schema_version == 5
+    assert snapshot.schema_version == 6
     assert snapshot.rates == {
         "build": {
             "modules": {
@@ -500,7 +500,7 @@ def test_finalization_is_byte_identical_and_uses_compare_publish_cas():
     second = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
 
     assert first.model_dump_json() == second.model_dump_json()
-    assert first.schema_version == 5
+    assert first.schema_version == 6
     assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
     assert VERDICT_TMP_PATH not in orchestrator.files
     assert not any(

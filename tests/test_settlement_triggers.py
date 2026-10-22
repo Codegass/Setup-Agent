@@ -554,7 +554,7 @@ def test_a_pre_plan_8_transcript_still_replays_byte_identically():
 
     assert result.produced_event_digest == result.expected_event_digest
     assert result.expected_snapshot["schema_version"] == 3
-    assert result.snapshot.schema_version == 5
+    assert result.snapshot.schema_version == 6
     assert result.snapshot.rates
     assert not any(conflict.startswith("job_unsettled:") for conflict in result.snapshot.conflicts)
 

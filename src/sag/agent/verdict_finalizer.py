@@ -29,6 +29,18 @@ from sag.verdict_rates import (
 
 from .ci_comparison import CIComparisonSnapshot, PinnedCITarget, build_ci_comparison
 from .acceptance_task import AcceptanceTask, TaskCompletionSnapshot, build_task_completion
+from .verdict_dimensions import (
+    CICommand,
+    OfficialCI,
+    RunControl,
+    SagCheck,
+    ci_command,
+    ci_command_result,
+    official_ci,
+    run_control,
+    sag_checks,
+    validate_sag_checks,
+)
 from .evidence_publications import (
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
     VERDICT_LOGICAL_ARTIFACT_ID,
@@ -41,7 +53,9 @@ from .evidence_state import EvidenceRole, RunEvidenceState, ToolObservation
 
 VERDICT_SNAPSHOT_PATH = "/workspace/.setup_agent/verdict.json"
 LEGACY_VERDICT_SCHEMA_VERSION = 3
-VERDICT_SCHEMA_VERSION = 5
+# v6 (2026-10-22): the measured dimensions (`ci_command`, `official_ci`,
+# `sag_checks`, `run_control`) are sealed beside the word.
+VERDICT_SCHEMA_VERSION = 6
 _VERDICT_FILENAME = "verdict.json"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
@@ -327,6 +341,13 @@ class RunVerdictSnapshot(BaseModel):
     phase_records: tuple[PhaseRecordSnapshot, ...] = ()
     ci_comparison: CIComparisonSnapshot | None = None
     task_completion: TaskCompletionSnapshot | None = None
+    # v6: what the run measured, kept apart from what SAG could confirm. Each
+    # is absent from a record written before v6, and `ci_command` is absent
+    # whenever no pinned task was bound.
+    ci_command: CICommand | None = None
+    official_ci: OfficialCI | None = None
+    sag_checks: tuple[SagCheck, ...] = ()
+    run_control: RunControl | None = None
 
     @model_validator(mode="after")
     def _task_completion_consistent(self):
@@ -335,6 +356,27 @@ class RunVerdictSnapshot(BaseModel):
                 raise ValueError("task completion belongs to another run")
             if self.verdict == "success" and self.task_completion.status != "complete":
                 raise ValueError("incomplete required task cannot carry a success verdict")
+        measured = (
+            self.ci_command is not None
+            or self.official_ci is not None
+            or bool(self.sag_checks)
+            or self.run_control is not None
+        )
+        if measured and self.schema_version < 6:
+            raise ValueError("measured dimensions exist only in verdict schema v6 and later")
+        if self.sag_checks:
+            validate_sag_checks(self.sag_checks)
+        if self.ci_command is not None:
+            if self.task_completion is None:
+                raise ValueError("a CI command result needs the pinned task it measured")
+            steps = tuple(self.task_completion.steps)
+            if (
+                self.ci_command.result != ci_command_result(self.task_completion)
+                or self.ci_command.steps_total != len(steps)
+                or self.ci_command.steps_passed
+                != sum(1 for step in steps if step.status == "complete")
+            ):
+                raise ValueError("the CI command result disagrees with the pinned task steps")
         return self
 
     @model_serializer(mode="wrap")
@@ -344,6 +386,11 @@ class RunVerdictSnapshot(BaseModel):
             data.pop("ci_comparison", None)
         if self.task_completion is None:
             data.pop("task_completion", None)
+        for key in ("ci_command", "official_ci", "run_control"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        if not self.sag_checks:
+            data.pop("sag_checks", None)
         return data
 
     @model_validator(mode="before")
@@ -351,7 +398,7 @@ class RunVerdictSnapshot(BaseModel):
     def _load_historical_rates_additively(cls, value: Any) -> Any:
         """Historical artifacts retain their recorded version.
 
-        The writer stamps v5 through the field default.  A v3 reader merely
+        The writer stamps v6 through the field default.  A v3 reader merely
         supplies the additive empty projection; it never rewrites history.
         """
         if not isinstance(value, dict):
@@ -1674,10 +1721,10 @@ def _validated_rates_block(
 
 
 def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapshot:
-    """Validate one decoded v3/v4/v5 verdict payload without granting authority.
+    """Validate one decoded v3/v4/v5/v6 verdict payload without granting authority.
 
-    The historical function name is retained for offline callers.  V3 is
-    and v4 are display/forensic only; the live reader requires current v5.
+    The historical function name is retained for offline callers.  V3, v4 and
+    v5 are display/forensic only; the live reader requires current v6.
     """
 
     if not isinstance(payload, Mapping):
@@ -1685,7 +1732,7 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
     if type(payload.get("schema_version")) is not int:
         raise ValueError("verdict schema version must be a strict integer")
     schema_version = payload.get("schema_version")
-    if schema_version not in (LEGACY_VERDICT_SCHEMA_VERSION, 4, VERDICT_SCHEMA_VERSION):
+    if schema_version not in (LEGACY_VERDICT_SCHEMA_VERSION, 4, 5, VERDICT_SCHEMA_VERSION):
         raise ValueError("verdict schema version is not supported")
 
     raw_test_stats = payload.get("test_stats", {})
@@ -1884,6 +1931,128 @@ def read_live_verdict_snapshot(orchestrator, *, authority=None) -> RunVerdictSna
     return snapshot
 
 
+def _receipts_by_id(validator, project_root: str | None) -> dict[str, Mapping[str, Any]]:
+    """This run's current receipts by id, or nothing when they cannot be read."""
+
+    reader = getattr(validator, "_current_scoped_receipts", None)
+    if not callable(reader) or not project_root:
+        return {}
+    try:
+        receipts = reader(project_root)
+    except Exception as exc:
+        logger.debug(f"receipts unavailable for the measured dimensions: {exc}")
+        return {}
+    return {
+        str(receipt["receipt_id"]): receipt
+        for receipt in receipts or ()
+        if isinstance(receipt, Mapping) and receipt.get("receipt_id")
+    }
+
+
+def _java_requirement_gaps(orchestrator, validator) -> tuple[str, ...] | None:
+    """The Java requirements the survey left open, after the run's own profile
+    selection is applied. None when the record itself could not be read."""
+
+    try:
+        from sag.tools.internal.build_preflight import read_live_build_requirements
+
+        read = read_live_build_requirements(orchestrator)
+    except Exception:
+        return None
+    if not read.complete or read.conflict is not None or read.payload is None:
+        return None
+    manifest = dict(read.payload)
+    requirements = manifest.get("java_requirements")
+    narrow = getattr(validator, "_java_requirements_for_invocation", None)
+    if isinstance(requirements, Mapping) and callable(narrow):
+        try:
+            requirements = narrow(manifest)
+        except Exception:
+            pass
+    if not isinstance(requirements, Mapping):
+        return ()
+    return tuple(str(item) for item in requirements.get("unresolved") or ())
+
+
+def _live_obligations(orchestrator) -> dict[str, Mapping[str, Any]]:
+    """The job ledger by job id, or nothing when it cannot be read."""
+
+    try:
+        from sag.agent.job_obligations import read_obligations
+
+        records = read_obligations(orchestrator)
+    except Exception:
+        return {}
+    return {
+        str(record.get("job_id")): record
+        for record in records or ()
+        if isinstance(record, Mapping) and record.get("job_id")
+    }
+
+
+def _test_outcome_reason(state: RunEvidenceState) -> str | None:
+    rollup = state.fact_value("test.stats")
+    if isinstance(rollup, Mapping):
+        reason = str(rollup.get("execution_reason") or "").strip()
+        if reason:
+            return reason
+    for record in reversed(state.phase_records):
+        if str(getattr(record, "phase", "") or "") == "test":
+            return str(getattr(record, "reason", "") or "").strip() or None
+    return None
+
+
+def _measured_dimensions(
+    finalizer: "VerdictFinalizer",
+    state: RunEvidenceState,
+    *,
+    completion: TaskCompletionSnapshot | None,
+    tests: SnapshotTestStats,
+    conflicts: tuple[str, ...],
+) -> dict[str, Any]:
+    """The four v6 dimensions, from facts this finalizer already holds."""
+
+    project_root = f"/workspace/{finalizer.project_name}" if finalizer.project_name else None
+    receipts = _receipts_by_id(finalizer.validator, project_root)
+    live = [
+        conflict.split(":", 1)[1]
+        for conflict in conflicts
+        if conflict.startswith("job_live_at_close:")
+    ]
+    live_reasons: dict[str, str | None] = {}
+    for job_id in live:
+        payload = state.fact_value(f"job_live_at_close.{job_id}")
+        live_reasons[job_id] = (
+            str(payload.get("close_reason") or "") or None if isinstance(payload, Mapping) else None
+        )
+    task = finalizer.acceptance_task if completion is not None else None
+    return {
+        "ci_command": ci_command(completion, task=task, receipts=receipts),
+        "official_ci": official_ci(finalizer.ci_target, completion=completion, receipts=receipts),
+        "sag_checks": sag_checks(
+            conflicts=conflicts,
+            test_judgment=tests.judgment,
+            test_reason=_test_outcome_reason(state),
+            java_unresolved=(
+                _java_requirement_gaps(finalizer.orchestrator, finalizer.validator)
+                if "build_requirements_unavailable" in conflicts
+                else ()
+            ),
+        ),
+        "run_control": run_control(
+            conflicts=conflicts,
+            close_reason=state.close_reason,
+            phase_records=state.phase_records,
+            live_job_reasons=live_reasons,
+            obligations=(
+                _live_obligations(finalizer.orchestrator) if live and task is not None else {}
+            ),
+            task=task,
+            project_root=project_root,
+        ),
+    }
+
+
 class VerdictFinalizer:
     def __init__(
         self,
@@ -2019,6 +2188,9 @@ class VerdictFinalizer:
                 repository=self.repository,
                 target=self.ci_target,
                 task_completion=completion,
+            ),
+            **_measured_dimensions(
+                self, state, completion=completion, tests=tests, conflicts=conflicts
             ),
         )
         self._expected_snapshots[cache_key] = snapshot

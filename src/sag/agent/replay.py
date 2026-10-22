@@ -123,6 +123,24 @@ class ReplayMismatchError(ReplayValidationError):
 
 _V4_RATE_CONFLICTS = frozenset({UNBOUNDED_CONFLICT})
 
+#: Fields verdict schema v6 added beside the word. An archived expectation
+#: written before v6 has none of them, so a comparison against it drops them;
+#: everything the archived shape does carry is still compared verbatim.
+_V6_MEASURED_FIELDS = (
+    "ci_command",
+    "official_ci",
+    "sag_checks",
+    "run_control",
+    "project_conflicts",
+    "knowledge_conflicts",
+)
+
+
+def _without_v6_measurements(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in _V6_MEASURED_FIELDS:
+        payload.pop(key, None)
+    return payload
+
 
 def _legacy_v3_snapshot_projection(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
     """Project today's replay into the immutable verdict-v3 comparison shape.
@@ -151,7 +169,7 @@ def _legacy_v3_snapshot_projection(snapshot: RunVerdictSnapshot) -> dict[str, An
     )
     payload.pop("rates", None)
     payload.pop("ci_comparison", None)
-    return payload
+    return _without_v6_measurements(payload)
 
 
 #: Event kinds the engine stopped emitting when Plan 2 deleted the scheduler.
@@ -2497,6 +2515,10 @@ class ControlReplayRunner:
                 # additive v5 CI field is outside this archived shape.
                 actual_snapshot["schema_version"] = 4
                 actual_snapshot.pop("ci_comparison", None)
+                _without_v6_measurements(actual_snapshot)
+            elif header.expected_snapshot.get("schema_version") == 5:
+                actual_snapshot["schema_version"] = 5
+                _without_v6_measurements(actual_snapshot)
             if actual_snapshot != header.expected_snapshot:
                 raise ReplayMismatchError("replayed snapshot differs from frozen expectation")
             if digest != header.expected_event_digest:
