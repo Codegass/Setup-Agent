@@ -111,7 +111,8 @@ def shell_names_step(native_input, steps):
     the command or by a shell operator or redirection, so `mvn -version`,
     `mvn verify -DskipTests` and `echo mvn verify` never name a `mvn verify`
     step. The first token may spell the launcher by path (`/opt/maven/bin/mvn`)
-    as long as its basename is the step's. Leading `NAME=value` assignments,
+    as long as its basename is the step's (for a `mvn` step, also `mvn-<version>`,
+    as `launcher_matches` reads it). Leading `NAME=value` assignments,
     optionally introduced by `env` (`PATH=/opt/maven/bin:$PATH mvn verify`,
     `env JAVA_HOME=/jdk mvn verify`), belong to the same simple command, so the
     boundary is looked for before them.
@@ -153,7 +154,7 @@ def shell_names_step(native_input, steps):
             window = tokens[start:start + len(argv)]
             if window[1:] != argv[1:]:
                 continue
-            if window[0] != argv[0] and posixpath.basename(window[0]) != posixpath.basename(argv[0]):
+            if window[0] != argv[0] and _launcher_name(posixpath.basename(window[0]), argv[0]) != posixpath.basename(argv[0]):
                 continue
             if command_start(start) and boundary(start + len(argv)):
                 return True
@@ -161,15 +162,27 @@ def shell_names_step(native_input, steps):
 
 
 _REDIRECTION = re.compile(r"^\d*[<>]")
+_VERSIONED_MVN = re.compile(r"mvn-\d+(?:\.\d+)*")
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _OPERATORS = re.compile(r"(\|\||&&|[();|&])")
+
+
+def _launcher_name(name, expected):
+    """A launcher file name, read for a frozen `mvn` step: `mvn-<version>` is `mvn`."""
+    if expected == "mvn" and _VERSIONED_MVN.fullmatch(name):
+        return "mvn"
+    return name
 
 
 def launcher_matches(expected, observed):
     """Bind a resolved Maven launcher (as the witness saw it) to a frozen step launcher.
 
     - a literal step launcher binds only to itself, or for ``mvn`` to an absolute path
-      whose basename is ``mvn`` (a PATH resolution the witness reports resolved);
+      whose basename is ``mvn`` (a PATH resolution the witness reports resolved), or
+      ``mvn-<version>`` (``/tmp/opencode/mvn-3.9.16``, a symlink an agent made). The
+      witness records the launcher as invoked (the launcher script's ``$0``), never the
+      symlink's resolved target, so this reads the name only; the Maven version is still
+      the witness session's own report, checked against the step by the evaluator;
     - a ``./mvnw`` step binds only to the Maven Wrapper's own distribution launcher,
       ``<...>/wrapper/dists/<distribution>/<hash>/bin/mvn``: the wrapper script sources
       /etc/mavenrc from that binary, so the witness never sees ``./mvnw`` itself. A
@@ -179,7 +192,7 @@ def launcher_matches(expected, observed):
     if observed == expected:
         return True
     path = PurePosixPath(observed)
-    if not path.is_absolute() or path.name != "mvn":
+    if not path.is_absolute() or _launcher_name(path.name, expected) != "mvn":
         return False
     if expected == "mvn":
         return True

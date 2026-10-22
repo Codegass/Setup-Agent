@@ -541,6 +541,11 @@ def test_parallel_probe_shell_does_not_hide_the_shell_that_runs_the_step(fixture
         ("echo PATH=/opt/maven/bin mvn verify", False),
         ("echo env mvn verify", False),
         ("-DPATH=/opt mvn verify", False),
+        # A launcher spelled with a version suffix, as launcher_matches reads it.
+        ("PATH=/tmp/opencode:$PATH /tmp/opencode/mvn-3.9.16 verify > /tmp/opencode/ci-step-1.log 2>&1", True),
+        ("mvn-3.9.16 verify", True),
+        ("/tmp/opencode/mvn-latest verify", False),
+        ("/tmp/opencode/mvnw-3.9.16 verify", False),
     ],
 )
 def test_shell_names_step_matches_the_frozen_argv_as_contiguous_tokens(command, expected):
@@ -697,6 +702,24 @@ def test_launcher_matches_binds_wrapper_distribution_only_to_mvnw_steps():
     assert not launcher_matches("./gradlew", "/root/.gradle/wrapper/dists/gradle-8.5-bin/abc/gradle-8.5/bin/gradle")
 
 
+def test_launcher_matches_reads_a_version_suffix_on_a_mvn_launcher_name():
+    """struts-examples-opencode ran Maven through a symlink named /tmp/opencode/mvn-3.9.16.
+    The witness records the launcher as invoked ($0), not its resolved target, so the
+    rule reads the name: `mvn-<version>` is a Maven launcher for a `mvn` step only."""
+    from scripts.benchmark_native_observer import launcher_matches
+
+    assert launcher_matches("mvn", "/tmp/opencode/mvn-3.9.16")
+    assert launcher_matches("mvn", "/opt/bin/mvn-3")
+    assert not launcher_matches("mvn", "mvn-3.9.16")  # a launcher the witness saw resolved is absolute
+    assert not launcher_matches("mvn", "/tmp/opencode/mvn-latest")
+    assert not launcher_matches("mvn", "/tmp/opencode/mvn-3.9.16-wrapper")
+    assert not launcher_matches("mvn", "/tmp/opencode/mvn3.9.16")
+    assert not launcher_matches("mvn", "/tmp/opencode/mvnw-3.9.16")
+    assert not launcher_matches("mvn", "/tmp/opencode/mvnDebug-3.9.16")
+    assert not launcher_matches("./mvnw", "/tmp/opencode/mvn-3.9.16")
+    assert not launcher_matches("./mvnw", "/root/.m2/wrapper/dists/apache-maven-3.9.16/56ba1f9f/bin/mvn-3.9.16")
+
+
 def _mvnw_observer(fixture, tmp_path, observed_launcher):
     observer, root, event, transcript, requests = make_observer(fixture, tmp_path)
     observer.task = copy.deepcopy(observer.task)
@@ -743,3 +766,75 @@ def test_system_maven_launch_never_binds_to_a_mvnw_step(fixture, tmp_path):
     assert observer.errors == []
     run = observer.close(transcript)
     assert run["invocations"] == []
+
+
+def _witness_from_launch(observer):
+    """Stand-in for the Maven witness trace: the launch exactly as the callback reported it."""
+
+    def native_launch(call):
+        body = [
+            {
+                "event": "ObserverStarted",
+                "java_version": "17.0.12",
+                "java_home": "/jdk17",
+                "process_id": str(call["process_id"]),
+                "run_id": call["namespace"],
+                "launcher_observation": json.dumps(
+                    {"argv": call["parsed"]["argv"], "cwd": call["parsed"]["cwd"],
+                     "root": observer.root, "commit": observer.task["sha"]}
+                ),
+            },
+            {"event": "SessionStarted", "maven_version": "3.9.16"},
+            {"event": "ObserverClosed", "closed_epoch_ms": 0},
+        ]
+        return write(observer.base, "launch-" + call["invocation_id"] + ".jsonl",
+                     "\n".join(json.dumps(r) for r in body))
+
+    return native_launch
+
+
+def _probe_any_launcher(observer, requests):
+    task = observer.task
+
+    def execute(command, **kwargs):
+        args = shlex.split(command)
+        request = json.loads(args[-1])
+        if request.get("operation") == "probe":
+            requests.append(request["argv"])
+            result = {"head": task["sha"], "errors": [], "files": [], "configs": [],
+                      "probe_stdout": base64.b64encode(b"Apache Maven 3.9.16\nJava version: 17.0.12\n").decode(),
+                      "probe_stderr": "", "probe_exit_code": 0, "probe_executable": request["argv"][0]}
+            return {"success": True, "exit_code": 0, "output": json.dumps(result)}
+        answer = subprocess.run(args, capture_output=True, text=True)
+        return {"success": answer.returncode == 0, "exit_code": answer.returncode, "output": answer.stdout}
+
+    observer.execute_raw = execute
+
+
+def test_versioned_launcher_symlink_binds_and_scores_struts_examples(fixture, tmp_path):
+    """struts-examples-opencode, events 000019/000020: the pinned arguments through
+    /tmp/opencode/mvn-3.9.16 in the pinned directory were treated as exploration."""
+    observer, root, event, transcript, requests = make_observer(fixture, tmp_path)
+    _probe_any_launcher(observer, requests)
+    observer._native_launch = _witness_from_launch(observer)
+    launcher = "/tmp/opencode/mvn-3.9.16"
+    event["tool_input"] = {"command": (
+        "PATH=/tmp/opencode:$PATH JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 "
+        "MAVEN_OPTS='-Dmaven.repo.local=/tmp/opencode/m2repo' " + launcher + " verify")}
+    event["launcher_event"]["launch"]["argv"] = [launcher, "verify"]
+    observer.event(event)
+    observer.event(event["launcher_event"])
+    assert observer.errors == []
+    assert observer.calls["native-1"]["contract"]["observed_launcher"] == launcher
+    assert requests == [[launcher, "--version"]]
+    reports = root / "target/surefire-reports"
+    reports.mkdir(parents=True)
+    (reports / "TEST-demo.xml").write_text(
+        '<testsuite tests="1" failures="0" errors="0" skipped="0"><testcase name="a"/></testsuite>'
+    )
+    observer.event({**event, "hook_event_name": "PostToolUse", "tool_response": {
+        "output": (fixture[4] / "log.txt").read_text(), "metadata": {"exit": 0}}})
+    run = observer.close(transcript)
+    assert not run["capture_errors"] and len(run["invocations"]) == 1
+    score = evaluate(observer.task, observer.spec, run, observer.base, required_execution_origin="agent")
+    assert score["status"] == "complete", score
