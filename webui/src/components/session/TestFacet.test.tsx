@@ -128,23 +128,37 @@ describe("TestFacet", () => {
     expect(screen.getAllByText(/the run did not record module and test names/)[0]).toBeVisible()
   })
 
-  it("states the headline the result card states, rather than working it out again", () => {
+  it("states the lines the result card states, rather than working them out again", () => {
+    // The card states this run's tests on its Official CI row, and on its "Not
+    // confirmed by SAG" row when the outcome could not be graded; the tab
+    // quotes both, in the card's words.
     const carded = {
       ...igniteShape,
       resultCard: {
         schemaVersion: 1,
         runId: "r",
-        verdict: "partial",
+        verdict: "failed",
         verdictSource: "snapshot",
         rows: [
           {
-            key: "tests",
-            label: "Tests",
-            status: "unavailable",
+            key: "official_ci",
+            label: "Official CI",
+            status: "compared",
             tone: "attention",
-            headline: "≥2,688 executed · 2,662 passed · 2 failed · 11 errors · 13 skipped",
-            detail: "99.5% of non-skipped passed · 2,692 raw executions",
-            reason: "the run recorded test outcomes but no judgment about them",
+            headline:
+              "built 7 of 9 modules, ran 2,679 of 2,762 tests (CI cell 'Apache Jenkins httpcomponents-client Linux JDK 17 #225')",
+            detail: "0 failures, 4 errors in this run · 2,692 raw executions",
+          },
+          {
+            key: "unconfirmed",
+            label: "Not confirmed by SAG",
+            status: "2 of 4",
+            tone: "attention",
+            headline: "SAG could not confirm these from its own records",
+            items: [
+              "which modules the build produced: no successful build of the whole project listed its modules, and the project's own module list could not be read in full",
+              "whether the tests passed: test execution completion lacks bound task, assessment or outcome evidence",
+            ],
           },
         ],
         stats: {},
@@ -154,16 +168,24 @@ describe("TestFacet", () => {
     } as any
 
     render(<TestFacet detail={carded} />)
+    expect(screen.getByText("compared")).toBeInTheDocument()
+    expect(screen.getByText("Official CI")).toBeInTheDocument()
     expect(
-      screen.getByText("≥2,688 executed · 2,662 passed · 2 failed · 11 errors · 13 skipped"),
+      screen.getByText(
+        "built 7 of 9 modules, ran 2,679 of 2,762 tests (CI cell 'Apache Jenkins httpcomponents-client Linux JDK 17 #225')",
+      ),
     ).toBeInTheDocument()
     expect(
-      screen.getByText("99.5% of non-skipped passed · 2,692 raw executions"),
+      screen.getByText("0 failures, 4 errors in this run · 2,692 raw executions"),
     ).toBeInTheDocument()
     expect(
-      screen.getByText("the run recorded test outcomes but no judgment about them"),
+      screen.getByText(
+        "Not confirmed by SAG: whether the tests passed: test execution completion lacks bound task, assessment or outcome evidence",
+      ),
     ).toBeInTheDocument()
-    // The card said `unavailable`; the tab may not say `Executed` beside it.
+    // Only the tests line of that row belongs on this tab.
+    expect(screen.queryByText(/which modules the build produced/)).not.toBeInTheDocument()
+    // The card did not say `executed`; the tab may not say `Executed` beside it.
     expect(screen.queryByText("Executed")).not.toBeInTheDocument()
   })
 

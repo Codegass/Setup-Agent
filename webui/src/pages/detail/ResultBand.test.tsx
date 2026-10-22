@@ -10,8 +10,9 @@ function row(overrides: Partial<ResultRow> & Pick<ResultRow, "key" | "label">): 
 }
 
 /** The seven rows in the order and the wording `build_result_card` emits them:
- *  every headline, detail, reason and item below was copied from a card built
- *  from a real `verdict.json` in `logs/`. */
+ *  the CI command, the official CI comparison, what SAG could not confirm, how
+ *  the run ended, the Summary word, then coverage and the report. The strings
+ *  are the card's own, as the terminal block prints them. */
 function card(overrides: Partial<ResultCard> = {}): ResultCard {
   return {
     schemaVersion: 1,
@@ -19,23 +20,44 @@ function card(overrides: Partial<ResultCard> = {}): ResultCard {
     verdict: "success",
     verdictSource: "snapshot",
     rows: [
-      row({ key: "setup", label: "Setup", status: "success", tone: "success", headline: "4/4 phases · 12 turns" }),
       row({
-        key: "task",
-        label: "Required task",
-        status: "complete",
+        key: "ci_command",
+        label: "CI command",
+        status: "passed",
         tone: "success",
-        headline: "complete 1/1 steps",
-        detail: "mvn -B -f pom.xml -V clean test → exit 0",
+        headline: "1 of 1 steps passed",
+        detail: "Java 17 and Maven 3.9.16 as pinned · sources unchanged",
         items: ["ci-step-1: complete — mvn -B -f pom.xml -V clean test → exit 0"],
       }),
-      row({ key: "build", label: "Build", status: "success", tone: "success", headline: "1/1 modules built" }),
       row({
-        key: "tests",
-        label: "Tests",
-        status: "executed",
+        key: "official_ci",
+        label: "Official CI",
+        status: "compared",
         tone: "success",
-        headline: "994 executed · 994 passed · 0 failed · 0 errors · 0 skipped",
+        headline: "built 1 of 1 modules, ran 994 of 994 tests (CI cell 'build (17)')",
+        detail: "0 failures, 0 errors in this run · 119 class files",
+      }),
+      row({
+        key: "unconfirmed",
+        label: "Not confirmed by SAG",
+        status: "none",
+        tone: "success",
+        headline: "SAG confirmed each of the above from its own records.",
+      }),
+      row({
+        key: "run",
+        label: "Run",
+        status: "ended normally",
+        tone: "success",
+        headline: "ended normally",
+        detail: "4/4 phases · 12 turns",
+      }),
+      row({
+        key: "summary",
+        label: "Summary",
+        status: "success",
+        tone: "success",
+        headline: "derived from the lines above",
       }),
       row({
         key: "coverage",
@@ -43,13 +65,6 @@ function card(overrides: Partial<ResultCard> = {}): ResultCard {
         status: "not collected",
         headline: "not collected",
         reason: "coverage pass not run",
-      }),
-      row({
-        key: "ci",
-        label: "Official CI",
-        status: "not compared",
-        headline: "not compared",
-        reason: "no CI job on this commit matches the run's JDK and OS (official_ci_cell_not_matched)",
       }),
       row({ key: "report", label: "Report", status: "delivered", headline: "setup-report.md" }),
     ],
@@ -70,22 +85,32 @@ describe("ResultBand", () => {
     window.localStorage?.clear?.()
   })
 
-  it("shows every row's label, status and headline", () => {
-    render(<ResultBand card={card()} onOpenTab={() => {}} />)
-    for (const label of ["Setup", "Required task", "Build", "Tests", "Coverage", "Official CI", "Report"]) {
+  it("shows every row's label, status and headline in the terminal's order", () => {
+    const { container } = render(<ResultBand card={card()} onOpenTab={() => {}} />)
+    const labels = ["CI command", "Official CI", "Not confirmed by SAG", "Run", "Summary", "Coverage", "Report"]
+    for (const label of labels) {
       expect(screen.getByText(label)).toBeInTheDocument()
     }
-    expect(screen.getByText("994 executed · 994 passed · 0 failed · 0 errors · 0 skipped")).toBeInTheDocument()
-    expect(screen.getByText("complete 1/1 steps")).toBeInTheDocument()
+    expect(
+      Array.from(container.querySelectorAll("[data-row]")).map((node) => node.getAttribute("data-row")),
+    ).toEqual(["ci_command", "official_ci", "unconfirmed", "run", "summary", "coverage", "report"])
+    expect(screen.getByText("1 of 1 steps passed")).toBeInTheDocument()
+    expect(
+      screen.getByText("built 1 of 1 modules, ran 994 of 994 tests (CI cell 'build (17)')"),
+    ).toBeInTheDocument()
+    expect(screen.getByText("SAG confirmed each of the above from its own records.")).toBeInTheDocument()
+    expect(screen.getByText("derived from the lines above")).toBeInTheDocument()
     expect(screen.getByText("not collected", { selector: "span" })).toBeInTheDocument()
   })
 
-  it("collapses to the run's own verdict and drops the other six rows", () => {
+  it("collapses to the first line and the Summary", () => {
     render(<ResultBand card={card()} onOpenTab={() => {}} />)
     fireEvent.click(screen.getByRole("button", { name: "Collapse" }))
-    expect(screen.getByText("Setup")).toBeInTheDocument()
-    expect(screen.getByText("4/4 phases · 12 turns")).toBeInTheDocument()
-    for (const label of ["Required task", "Build", "Tests", "Coverage", "Official CI", "Report"]) {
+    expect(screen.getByText("CI command")).toBeInTheDocument()
+    expect(screen.getByText("1 of 1 steps passed")).toBeInTheDocument()
+    expect(screen.getByText("Summary")).toBeInTheDocument()
+    expect(screen.getByText("derived from the lines above")).toBeInTheDocument()
+    for (const label of ["Official CI", "Not confirmed by SAG", "Run", "Coverage", "Report"]) {
       expect(screen.queryByText(label)).toBeNull()
     }
   })
@@ -93,9 +118,9 @@ describe("ResultBand", () => {
   it("expands again", () => {
     render(<ResultBand card={card()} onOpenTab={() => {}} />)
     fireEvent.click(screen.getByRole("button", { name: "Collapse" }))
-    expect(screen.queryByText("Tests")).toBeNull()
+    expect(screen.queryByText("Official CI")).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "Show all 7 rows" }))
-    expect(screen.getByText("Tests")).toBeInTheDocument()
+    expect(screen.getByText("Official CI")).toBeInTheDocument()
   })
 
   it("remembers the choice for the next visit", () => {
@@ -120,7 +145,7 @@ describe("ResultBand", () => {
       first.unmount()
 
       render(<ResultBand card={card()} onOpenTab={() => {}} />)
-      expect(screen.queryByText("Tests")).toBeNull()
+      expect(screen.queryByText("Official CI")).toBeNull()
       expect(screen.getByRole("button", { name: "Show all 7 rows" })).toBeInTheDocument()
     } finally {
       if (original) Object.defineProperty(window, "localStorage", original)
@@ -128,32 +153,30 @@ describe("ResultBand", () => {
   })
 
   it("hides a kept row's detail and reason rather than trimming them", () => {
-    const blocked = card({
+    const unfinished = card({
       rows: [
         row({
-          key: "setup",
-          label: "Setup",
-          status: "partial",
+          key: "ci_command",
+          label: "CI command",
+          status: "did not finish",
           tone: "attention",
-          headline: "3/4 phases · 29 turns · 25m 45s",
-          detail: "blocked at test: test receipt parsing is unreadable in the judge container",
-          reason: "the underlying test run completed with failures",
+          headline: "1 of 2 steps passed · step 2 of 2 did not finish",
+          detail:
+            "toolchain not checked: step ci-step-2 did not finish, so its Java version was not recorded · sources unchanged",
         }),
-        row({ key: "tests", label: "Tests", status: "unavailable" }),
+        row({ key: "official_ci", label: "Official CI", status: "not compared" }),
+        row({ key: "summary", label: "Summary", status: "partial", tone: "attention", headline: "derived from the lines above" }),
       ],
     })
-    render(<ResultBand card={blocked} onOpenTab={() => {}} />)
+    render(<ResultBand card={unfinished} onOpenTab={() => {}} />)
     fireEvent.click(screen.getByRole("button", { name: "Collapse" }))
-    expect(screen.getByText("3/4 phases · 29 turns · 25m 45s")).toBeInTheDocument()
-    expect(screen.queryByText(/blocked at test/)).toBeNull()
-    expect(screen.queryByText(/completed with failures/)).toBeNull()
+    expect(screen.getByText("1 of 2 steps passed · step 2 of 2 did not finish")).toBeInTheDocument()
+    expect(screen.queryByText(/toolchain not checked/)).toBeNull()
   })
 
   it("shows a row's reason when it has nothing to measure", () => {
     render(<ResultBand card={card()} onOpenTab={() => {}} />)
-    expect(
-      screen.getByText(/no CI job on this commit matches the run's JDK and OS/),
-    ).toBeInTheDocument()
+    expect(screen.getByText("coverage pass not run")).toBeInTheDocument()
   })
 
   it("hides a row's items behind a disclosure", () => {
@@ -168,8 +191,19 @@ describe("ResultBand", () => {
   it("opens the tab a row belongs to", () => {
     const onOpenTab = vi.fn()
     render(<ResultBand card={card()} onOpenTab={onOpenTab} />)
-    fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind Tests" }))
-    expect(onOpenTab).toHaveBeenCalledWith("tests")
+    fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind Run" }))
+    expect(onOpenTab).toHaveBeenCalledWith("turns")
+    fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind CI command" }))
+    expect(onOpenTab).toHaveBeenCalledWith("evidence")
+  })
+
+  // The Summary is derived from the rows above it; those rows are the links.
+  it("states the Summary label without a button", () => {
+    render(<ResultBand card={card()} onOpenTab={() => {}} />)
+    expect(screen.getByText("Summary")).toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "Open the evidence behind Summary" }),
+    ).not.toBeInTheDocument()
   })
 
   // A row whose tab this run does not have must not offer a button that goes
@@ -184,16 +218,16 @@ describe("ResultBand", () => {
         onOpenTab={onOpenTab}
       />,
     )
-    expect(screen.getByRole("button", { name: "Open the evidence behind Tests" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Open the evidence behind Coverage" })).toBeInTheDocument()
     expect(
       screen.queryByRole("button", { name: "Open the evidence behind Official CI" }),
     ).not.toBeInTheDocument()
     expect(screen.getByText("Official CI")).toBeInTheDocument()
   })
 
-  // Real cards say the same word twice on three of the seven rows — build
-  // "success"/"success", coverage "not collected"/"not collected", CI "not
-  // compared"/"not compared". The chip has already said it.
+  // Real cards say the same word twice on some rows — the Run row's "ended
+  // normally"/"ended normally", coverage "not collected"/"not collected". The
+  // chip has already said it.
   it("does not repeat a headline that only says the status again", () => {
     const { container } = render(<ResultBand card={card()} onOpenTab={() => {}} />)
     const coverage = container.querySelector('[data-row="coverage"]')!
@@ -202,11 +236,11 @@ describe("ResultBand", () => {
     expect(coverage.querySelector("p")!.textContent).toBe("coverage pass not run")
   })
 
-  it("takes the band's tone from the setup row", () => {
+  it("takes the band's tone from the Summary row", () => {
     const failed = card({
       verdict: "failed",
       rows: card().rows.map((r) =>
-        r.key === "setup" ? { ...r, status: "failed", tone: "failed" as const } : r,
+        r.key === "summary" ? { ...r, status: "failed", tone: "failed" as const } : r,
       ),
     })
     const { container } = render(<ResultBand card={failed} onOpenTab={() => {}} />)
@@ -256,7 +290,7 @@ describe("ResultBand", () => {
   it("states a row's reason in the run's own words", () => {
     const withCode = card({
       rows: card().rows.map((r) =>
-        r.key === "ci"
+        r.key === "official_ci"
           ? {
               ...r,
               items: [

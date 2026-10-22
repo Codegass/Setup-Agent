@@ -8,25 +8,17 @@ function buildState(build: WorkspaceSummary["build"]): string {
   return normalize(typeof build === "string" ? build : build.state)
 }
 
-/** The Official CI words that are a finding about this run.
- *
- *  Only one. `invalid` — a comparison that reached a CI job and produced no
- *  score — now spells itself "not scored" rather than sharing "not compared"
- *  with the runs that had no CI job at all, so the rail cell CAN tell the two
- *  apart. Whether "not scored" belongs in this set is a separate decision and
- *  has not been made: 135 of the 342 evaluated comparisons under `logs/` are
- *  invalid, so adding it would flag a third of the fleet, and the result
- *  band's Official CI row already carries the row's own tone for it.
- *
- *  `partial` is deliberately absent: it is a weaker match, not a failure, and
- *  the row already prints the word "partial" where a reader can see it.
- */
-const CI_ATTENTION = new Set(["not met"])
+/** The CI command words that are a finding about this run: the project's own
+ *  pinned command failed, or never finished. The Official CI cell is not read
+ *  for attention: since the 2026-10-22 card it says only whether a comparison
+ *  could be made ("compared" / "not compared"), and how this run fell short of
+ *  the official CI run is stated on the card's Official CI row. */
+const COMMAND_ATTENTION = new Set(["failed", "did not finish"])
 
-/** A workspace needs attention if its run failed, a required task step did not
- *  finish, its Official CI comparison was not met, the run recorded a failing
- *  or erroring test, its build failed, its legacy test facet failed, or its
- *  container stopped unexpectedly. */
+/** A workspace needs attention if its run failed, its pinned CI command failed
+ *  or did not finish, a required task step did not finish, the run recorded a
+ *  failing or erroring test, its build failed, its legacy test facet failed,
+ *  or its container stopped unexpectedly. */
 export function needsAttention(workspace: WorkspaceSummary): boolean {
   const build = buildState(workspace.build)
   const test = normalize(workspace.test.state)
@@ -45,7 +37,7 @@ export function needsAttention(workspace: WorkspaceSummary): boolean {
   // absence never flags: only a word the record actually wrote does.
   const runFailed = result?.verdict === "failed"
   const taskUnfinished = normalize(result?.task?.status) === "incomplete"
-  const ciFinding = CI_ATTENTION.has(normalize(result?.ci?.status))
+  const commandUnpassed = COMMAND_ATTENTION.has(normalize(result?.ciCommand?.status))
   // A count, not a word. The legacy `test.state` above says "success" on a run
   // that recorded a failing test — `sag-rocketmq` serves `state: "success",
   // fail: 1` — so 29 archived runs carried red tests while being neither
@@ -56,7 +48,7 @@ export function needsAttention(workspace: WorkspaceSummary): boolean {
   return (
     runFailed ||
     taskUnfinished ||
-    ciFinding ||
+    commandUnpassed ||
     redTests ||
     buildFailed ||
     testFailed ||

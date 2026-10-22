@@ -262,7 +262,18 @@ export interface ModuleRollup {
 // whole. camelCase like the rest of this file: `src/sag/result_card/models.py`
 // serves it under a camelCase alias generator.
 
-export type RowKey = "setup" | "task" | "build" | "tests" | "coverage" | "ci" | "report"
+/** The card's seven rows, in reading order: what the project's pinned CI
+ *  command did, how this run compares with the official CI run, what SAG could
+ *  not confirm, how the run ended, the one word derived from those lines, then
+ *  coverage and the report (`ROW_ORDER` in `src/sag/result_card/models.py`). */
+export type RowKey =
+  | "ci_command"
+  | "official_ci"
+  | "unconfirmed"
+  | "run"
+  | "summary"
+  | "coverage"
+  | "report"
 /** The card's own four words. Deliberately not `Tone`, which this file already
  *  uses for the badge palette (`neutral | blue | green | red | amber`). */
 export type CardTone = "success" | "attention" | "failed" | "neutral"
@@ -445,7 +456,12 @@ export interface ReceiptSummary {
 /** The cells the dashboard rail shows for one workspace. A cell the run did not
  *  measure is absent — there is no zero to fall back on. */
 export interface WorkspaceResult {
+  /** The card's Summary word, derived from the card's lines above it. */
   verdict: CanonicalVerdict
+  /** The card's first line: the pinned CI command's word ("passed", "failed",
+   *  "did not finish", "not supplied") and its headline ("1 of 3 steps passed ·
+   *  step 2 of 3 exited 1"). Absent when the run has no card to copy it from. */
+  ciCommand?: { status: string; headline: string } | null
   task?: { status: string; completed: number; required: number } | null
   tests?: {
     executed: number

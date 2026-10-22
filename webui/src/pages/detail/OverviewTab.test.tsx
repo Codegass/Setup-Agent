@@ -7,31 +7,43 @@ import { OverviewTab } from "./OverviewTab"
 
 afterEach(() => cleanup())
 
-/** The seven rows in the order the card always carries them. Only the three the
- *  Overview reads carry realistic strings; the rest are here so `rows` is the
- *  shape the API actually serves. */
+/** The seven rows in the order the card always carries them. Only the rows the
+ *  Overview must not restate carry realistic strings; the rest are here so
+ *  `rows` is the shape the API actually serves. */
 function rows(overrides: Partial<Record<ResultRow["key"], Partial<ResultRow>>> = {}): ResultRow[] {
   const base: ResultRow[] = [
-    { key: "setup", label: "Setup", status: "success", tone: "success", headline: "5/5 phases · 24 turns" },
-    { key: "task", label: "Required task", status: "not supplied", tone: "neutral", headline: "no required task was supplied" },
     {
-      key: "build",
-      label: "Build",
-      status: "success",
-      tone: "success",
-      headline: "1/1 modules built",
-      detail: "1,284 class files · counts are diagnostic, CI defines scope",
+      key: "ci_command",
+      label: "CI command",
+      status: "not supplied",
+      tone: "neutral",
+      headline: "no pinned CI command; the build and tests below are what the run did",
     },
     {
-      key: "tests",
-      label: "Tests",
-      status: "executed",
-      tone: "success",
-      headline: "994 executed · 933 passed · 0 failed · 0 errors · 61 skipped",
-      detail: "100% of non-skipped passed",
+      key: "official_ci",
+      label: "Official CI",
+      status: "not compared",
+      tone: "neutral",
+      headline: "official CI numbers not available: no official CI record was supplied for this run",
+      detail: "this run: 1/1 modules built · 994 executed · 933 passed · 0 failed · 0 errors · 61 skipped · 1,284 class files",
     },
+    {
+      key: "unconfirmed",
+      label: "Not confirmed by SAG",
+      status: "none",
+      tone: "success",
+      headline: "SAG confirmed each of the above from its own records.",
+    },
+    {
+      key: "run",
+      label: "Run",
+      status: "ended normally",
+      tone: "success",
+      headline: "ended normally",
+      detail: "5/5 phases · 24 turns",
+    },
+    { key: "summary", label: "Summary", status: "success", tone: "success", headline: "derived from the lines above" },
     { key: "coverage", label: "Coverage", status: "not collected", tone: "neutral", headline: "not collected" },
-    { key: "ci", label: "Official CI", status: "not compared", tone: "neutral", headline: "not compared" },
     { key: "report", label: "Report", status: "delivered", tone: "neutral", headline: "written inside the container" },
   ]
   return base.map((row) => ({ ...row, ...(overrides[row.key] ?? {}) }))
@@ -129,17 +141,16 @@ describe("OverviewTab", () => {
     expect(screen.queryByRole("heading", { name: "Needs attention" })).toBeNull()
   })
 
-  it("does not restate the result band's Build and Tests rows", () => {
+  it("does not restate the result band's build and test counts", () => {
     const d = cleanDetail()
     render(<OverviewTab detail={d} />)
     // The band renders these rows above the tab bar, on screen the whole time.
     // Saying them again here printed the same sentence twice on one screen.
-    const buildRow = d.resultCard!.rows.find((row) => row.key === "build")!
-    const testsRow = d.resultCard!.rows.find((row) => row.key === "tests")!
-    expect(screen.queryByText(buildRow.headline)).toBeNull()
-    expect(screen.queryByText(buildRow.detail!)).toBeNull()
-    expect(screen.queryByText(testsRow.headline)).toBeNull()
-    expect(screen.queryByText(testsRow.detail!)).toBeNull()
+    const command = d.resultCard!.rows.find((row) => row.key === "ci_command")!
+    const official = d.resultCard!.rows.find((row) => row.key === "official_ci")!
+    expect(screen.queryByText(command.headline)).toBeNull()
+    expect(screen.queryByText(official.headline)).toBeNull()
+    expect(screen.queryByText(official.detail!)).toBeNull()
   })
 
   it("shows the run's notes in a disclosure", () => {

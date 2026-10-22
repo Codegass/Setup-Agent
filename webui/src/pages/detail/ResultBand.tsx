@@ -8,23 +8,23 @@ import { cn } from "@/lib/utils"
 import type { TabId } from "./facets"
 
 /** Which tab answers each row. Clicking a row is the two-click path from a
- *  number to the evidence behind it. */
-const ROW_TAB: Record<RowKey, TabId> = {
-  setup: "turns",
-  task: "evidence",
-  build: "build",
-  tests: "tests",
+ *  number to the evidence behind it. The Summary row has no tab of its own:
+ *  it is derived from the rows above it, and those are the links. */
+const ROW_TAB: Partial<Record<RowKey, TabId>> = {
+  ci_command: "evidence",
+  official_ci: "ci",
+  unconfirmed: "evidence",
+  run: "turns",
   coverage: "tests",
-  ci: "ci",
   report: "report",
 }
 
-/** What a row's extra lines are, so the disclosure can name them. Only the
- *  required-task and Official CI rows carry items today; anything else that
- *  grows them reads as "details" until it is named here. */
+/** What a row's extra lines are, so the disclosure can name them. Anything
+ *  else that grows items reads as "details" until it is named here. */
 const ITEM_NOUN: Partial<Record<RowKey, string>> = {
-  task: "step",
-  ci: "finding",
+  ci_command: "step",
+  official_ci: "finding",
+  unconfirmed: "check",
 }
 
 function plural(count: number, noun: string): string {
@@ -157,7 +157,10 @@ function Row({
 }
 
 /**
- * The run's whole result, seven rows, in the order the terminal prints them.
+ * The run's whole result, seven rows, in the order the terminal prints them:
+ * the CI command, the official CI comparison, what SAG could not confirm, how
+ * the run ended, and the Summary word derived from those lines. Collapsed, it
+ * keeps the first line and the Summary.
  *
  * Every string below the chrome is the run's own — the band restates a row's
  * headline, detail, reason and items exactly as the record wrote them, and
@@ -195,9 +198,15 @@ export function ResultBand({
       </div>
     )
   }
-  const tone = card.rows[0]?.tone ?? "neutral"
-  const linkable = (id: TabId): TabId | null =>
-    availableTabs === undefined || availableTabs.includes(id) ? id : null
+  // The band wears the Summary row's colour, the colour of the word the run
+  // is summed up in, as the terminal block's closing line does.
+  const summary = card.rows.find((row) => row.key === "summary")
+  const tone = summary?.tone ?? card.rows[0]?.tone ?? "neutral"
+  const linkable = (id: TabId | undefined): TabId | null =>
+    id !== undefined && (availableTabs === undefined || availableTabs.includes(id)) ? id : null
+  const shown = collapsed
+    ? card.rows.filter((row, index) => index === 0 || row.key === "summary")
+    : card.rows
   return (
     <div className={cn("rounded-lg border px-4 py-2", BAND[tone])} data-tone={tone}>
       {/* A result rebuilt from an older run record is worth less than one read
@@ -211,7 +220,7 @@ export function ResultBand({
           {"reconstructed from an older run record"}
         </p>
       ) : null}
-      {(collapsed ? card.rows.slice(0, 1) : card.rows).map((row, index) => (
+      {shown.map((row, index) => (
         <Row
           compact={collapsed}
           key={row.key}

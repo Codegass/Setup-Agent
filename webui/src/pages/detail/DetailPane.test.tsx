@@ -43,24 +43,38 @@ const detail: ExecutionSessionDetail = {
     verdict: "success",
     verdictSource: "snapshot",
     rows: [
-      { key: "setup", label: "Setup", status: "success", tone: "success", headline: "4/4 phases" },
       {
-        key: "task",
-        label: "Required task",
+        key: "ci_command",
+        label: "CI command",
         status: "not supplied",
         tone: "neutral",
-        headline: "no required task was supplied",
+        headline: "no pinned CI command; the build and tests below are what the run did",
       },
-      { key: "build", label: "Build", status: "success", tone: "success", headline: "1/1 modules built" },
       {
-        key: "tests",
-        label: "Tests",
-        status: "executed",
-        tone: "success",
-        headline: "10 executed · 10 passed · 0 failed · 0 errors · 0 skipped",
+        key: "official_ci",
+        label: "Official CI",
+        status: "not compared",
+        tone: "neutral",
+        headline: "official CI numbers not available: no official CI record was supplied for this run",
+        detail: "this run: 1/1 modules built · 10 executed · 10 passed · 0 failed · 0 errors · 0 skipped",
       },
+      {
+        key: "unconfirmed",
+        label: "Not confirmed by SAG",
+        status: "none",
+        tone: "success",
+        headline: "SAG confirmed each of the above from its own records.",
+      },
+      {
+        key: "run",
+        label: "Run",
+        status: "ended normally",
+        tone: "success",
+        headline: "ended normally",
+        detail: "4/4 phases",
+      },
+      { key: "summary", label: "Summary", status: "success", tone: "success", headline: "derived from the lines above" },
       { key: "coverage", label: "Coverage", status: "not collected", tone: "neutral", headline: "not collected" },
-      { key: "ci", label: "Official CI", status: "not compared", tone: "neutral", headline: "not compared" },
       { key: "report", label: "Report", status: "delivered", tone: "neutral", headline: "setup-report.md" },
     ],
     stats: {},
@@ -141,13 +155,14 @@ describe("DetailPane", () => {
     const { container } = render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
     expect(screen.getByRole("heading", { name: "owner/x" })).toBeInTheDocument()
     // The result band states each of the card's seven rows. Scoped to the band's
-    // own row: the Overview below it restates the tests row word for word, so an
-    // unscoped query would find two and say nothing about which surface it read.
+    // own row, so the query says which surface it read this run's tests from.
     expect(screen.getByText("4/4 phases")).toBeInTheDocument()
-    const testsRow = container.querySelector('[data-row="tests"]') as HTMLElement
+    const testsRow = container.querySelector('[data-row="official_ci"]') as HTMLElement
     expect(testsRow).not.toBeNull()
     expect(
-      within(testsRow).getByText("10 executed · 10 passed · 0 failed · 0 errors · 0 skipped"),
+      within(testsRow).getByText(
+        "this run: 1/1 modules built · 10 executed · 10 passed · 0 failed · 0 errors · 0 skipped",
+      ),
     ).toBeInTheDocument()
     expect(screen.getByText("Official CI")).toBeInTheDocument()
     // Tab bar.
@@ -177,7 +192,7 @@ describe("DetailPane", () => {
     expect(screen.getByRole("button", { name: /^Overview/ })).toHaveAttribute("aria-current", "false")
   })
 
-  it("opens the turns from the result band's Setup row", async () => {
+  it("opens the turns from the result band's Run row", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -193,7 +208,7 @@ describe("DetailPane", () => {
     )
     render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
 
-    fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind Setup" }))
+    fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind Run" }))
 
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /^Turns/ })).toHaveAttribute(

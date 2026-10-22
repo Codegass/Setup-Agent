@@ -37,12 +37,20 @@ const TONE_CLASS: Record<CardTone, string> = {
   neutral: "text-foreground",
 }
 
+/** How the card's "Not confirmed by SAG" row opens its line about the tests
+ *  (`_CHECK_QUESTION` in `src/sag/result_card/rows.py`). */
+const UNGRADED_TESTS = "whether the tests passed: "
+
 /**
  * How the tests came out, said once.
  *
  * When the run recorded a result, the words are the result card's own — the
- * same string the terminal printed and the report wrote. A second reading of
- * the same counts, worked out here, is how the band and the tab came to
+ * same strings the terminal printed and the report wrote. The card states this
+ * run's tests on its Official CI row, beside the official CI run's where those
+ * are known ("ran 2,679 of 2,762 tests", "0 failures, 4 errors in this run",
+ * or "this run: 994 executed · 933 passed · …"), and states on its "Not
+ * confirmed by SAG" row when the outcome could not be graded. A second reading
+ * of the same counts, worked out here, is how the band and the tab came to
  * disagree about one run.
  *
  * A record with no card (a run finalized before the card existed) still states
@@ -55,7 +63,11 @@ function TestConclusionCard({ detail }: { detail: ExecutionSessionDetail }) {
   // could not be read it was handed defaults, so its "not recorded" sentence
   // would state a finding nobody made.
   const recordRead = recordWasRead(detail.snapshotStatus)
-  const row: ResultRow | undefined = detail.resultCard?.rows.find((r) => r.key === "tests")
+  const rows = detail.resultCard?.rows ?? []
+  const row: ResultRow | undefined = rows.find((r) => r.key === "official_ci")
+  const ungraded = rows
+    .find((r) => r.key === "unconfirmed")
+    ?.items?.find((item) => item.startsWith(UNGRADED_TESTS))
   const run = presentTestRun(test)
   const summary = recordRead
     ? run.summary
@@ -74,7 +86,7 @@ function TestConclusionCard({ detail }: { detail: ExecutionSessionDetail }) {
               {row ? row.status : run.stateLabel}
             </div>
             <div className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
-              Test execution
+              {row ? row.label : "Test execution"}
             </div>
           </div>
           {/* Only where there is no card to quote: a carded run states its rate
@@ -92,6 +104,11 @@ function TestConclusionCard({ detail }: { detail: ExecutionSessionDetail }) {
         ) : null}
         {row?.reason ? (
           <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{row.reason}</p>
+        ) : null}
+        {ungraded ? (
+          <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">
+            {`Not confirmed by SAG: ${ungraded}`}
+          </p>
         ) : null}
         {run.nonSkipped > 0 ? (
           <div className="mt-3">

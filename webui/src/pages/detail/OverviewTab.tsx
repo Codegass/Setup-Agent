@@ -97,7 +97,7 @@ function AttentionRow({ item }: { item: AttentionItem }) {
  * then the modules behind the numbers, then anything the run set aside.
  *
  * It does not restate the result band. The band sits above the tab bar and is
- * on screen the whole time; an Overview that repeated its Build and Tests rows
+ * on screen the whole time; an Overview that repeated its build and test counts
  * printed the same sentence twice on one screen. What this tab adds is what
  * the band has no room for.
  *

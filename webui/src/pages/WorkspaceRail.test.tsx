@@ -30,16 +30,18 @@ function ws(overrides: Partial<WorkspaceSummary>): WorkspaceSummary {
 }
 
 /** The rail's result cells, as `_workspace_result` builds them: the card's own
- *  words for the verdict and the Official CI row, the record's own counts. */
+ *  words for the Summary, the CI command line and the Official CI row, the
+ *  record's own counts. */
 function healthy(): WorkspaceSummary {
   return ws({
     id: "sag-healthy",
     project: "owner/healthy",
     result: {
       verdict: "success",
+      ciCommand: { status: "passed", headline: "1 of 1 steps passed" },
       task: { status: "complete", completed: 1, required: 1 },
       tests: { executed: 994, passed: 933, failed: 0, errors: 0, skipped: 61 },
-      ci: { status: "met" },
+      ci: { status: "compared" },
     },
   })
 }
@@ -55,7 +57,7 @@ function failing(): WorkspaceSummary {
       verdict: "failed",
       task: { status: "complete", completed: 2, required: 2 },
       tests: { executed: 120, passed: 118, failed: 1, errors: 1, skipped: 0 },
-      ci: { status: "met" },
+      ci: { status: "compared" },
     },
   })
 }
@@ -69,7 +71,7 @@ function running(): WorkspaceSummary {
       verdict: "success",
       task: { status: "complete", completed: 1, required: 1 },
       tests: { executed: 10, passed: 10, failed: 0, errors: 0, skipped: 0 },
-      ci: { status: "met" },
+      ci: { status: "compared" },
     },
   })
 }
@@ -82,13 +84,14 @@ function taskIncomplete(): WorkspaceSummary {
       verdict: "partial",
       task: { status: "incomplete", completed: 0, required: 3 },
       tests: { executed: 40, passed: 40, failed: 0, errors: 0, skipped: 0 },
-      ci: { status: "met" },
+      ci: { status: "compared" },
     },
   })
 }
 
-/** The three Official CI words a real card puts in this cell besides "met" and
- *  "exceeded". Only "not met" is a finding about the project. */
+/** The two Official CI words a current card puts in this cell: whether a
+ *  comparison with the official CI run could be made. Neither is a finding;
+ *  how the run fell short is stated on the card's Official CI row. */
 function withCI(id: string, project: string, status: string): WorkspaceSummary {
   return ws({
     id,
@@ -162,9 +165,18 @@ describe("WorkspaceRail", () => {
   it("shows each row's four results", () => {
     render(<WorkspaceRail {...props} data={{ ...data, workspaces: [healthy()] }} />)
     expect(screen.getByText("success")).toBeInTheDocument()
-    expect(screen.getByText("1/1")).toBeInTheDocument()
+    // The card's first line takes the required-task cell when the card has one.
+    expect(screen.getByTitle("CI command: 1 of 1 steps passed")).toHaveTextContent("passed")
+    expect(screen.queryByText("1/1")).not.toBeInTheDocument()
     expect(screen.getByText("933/994")).toBeInTheDocument()
-    expect(screen.getByText("met")).toBeInTheDocument()
+    expect(screen.getByText("compared")).toBeInTheDocument()
+  })
+
+  it("falls back to the required-task fraction when the result has no CI command line", () => {
+    const older = healthy()
+    older.result = { ...older.result!, ciCommand: null }
+    render(<WorkspaceRail {...props} data={{ ...data, workspaces: [older] }} />)
+    expect(screen.getByText("1/1")).toBeInTheDocument()
   })
 
   it("marks red results on a row", () => {
@@ -184,7 +196,7 @@ describe("WorkspaceRail", () => {
     render(<WorkspaceRail {...props} data={{ ...data, workspaces: [healthy()] }} />)
     expect(
       screen.getByRole("button", {
-        name: "Open workspace owner/healthy — setup success, required task 1/1, tests 933/994, official CI met",
+        name: "Open workspace owner/healthy — summary success, CI command passed: 1 of 1 steps passed, tests 933/994, official CI compared",
       }),
     ).toBeInTheDocument()
   })
@@ -201,39 +213,48 @@ describe("WorkspaceRail", () => {
     expect(renderedOrder()[0]).toContain("owner/failing")
   })
 
-  it("flags an Official CI comparison this run did not meet", () => {
-    render(
-      <WorkspaceRail
-        {...props}
-        data={{ ...data, workspaces: [healthy(), withCI("sag-ci", "owner/ci", "not met")] }}
-      />,
-    )
+  it("flags a run whose pinned CI command failed", () => {
+    // An older record keeps the word it sealed (here `partial`) while its card
+    // reads the CI command's own result off the task steps; the command line is
+    // what flags it.
+    const commandFailed = ws({
+      id: "sag-ci",
+      project: "owner/ci",
+      result: {
+        verdict: "partial",
+        ciCommand: { status: "failed", headline: "0 of 1 steps passed · step 1 of 1 exited 1" },
+        tests: { executed: 40, passed: 40, failed: 0, errors: 0, skipped: 0 },
+        ci: { status: "not compared" },
+      },
+    })
+    render(<WorkspaceRail {...props} data={{ ...data, workspaces: [healthy(), commandFailed] }} />)
     expect(renderedOrder()[0]).toContain("owner/ci")
+    expect(screen.getByTitle("CI command: 0 of 1 steps passed · step 1 of 1 exited 1")).toHaveTextContent("failed")
     fireEvent.click(screen.getByRole("button", { name: /needs attention/i }))
     expect(renderedOrder()).toEqual([
-      "owner/ci — setup success, required task 1/1, tests 40/40, official CI not met",
+      "owner/ci — summary partial, CI command failed: 0 of 1 steps passed · step 1 of 1 exited 1, tests 40/40, official CI not compared",
     ])
   })
 
-  it("leaves a partial comparison, and one with nothing to compare, unflagged", () => {
-    // "not compared" is what the card spells for a comparison that produced no
-    // result AND for one nobody could make — 269 of 373 archived runs. Flagging
-    // it would flag most of the fleet, so the rail leaves it to the CI row,
-    // which has the tone to tell those apart. "partial" says partial on the row.
+  it("leaves a comparison, and one with nothing to compare, unflagged", () => {
+    // "not compared" is what the card spells when no official CI numbers could
+    // be set beside this run's — no CI record, no matched job, or a job that
+    // states no counts. Flagging it would flag most of the fleet, so the rail
+    // leaves it to the Official CI row, which has the tone to tell them apart.
     render(
       <WorkspaceRail
         {...props}
         data={{
           ...data,
           workspaces: [
-            withCI("sag-partial", "owner/partial", "partial"),
+            withCI("sag-compared", "owner/compared", "compared"),
             withCI("sag-none", "owner/none", "not compared"),
           ],
         }}
       />,
     )
     expect(screen.queryByRole("button", { name: /needs attention/i })).not.toBeInTheDocument()
-    expect(screen.getByText("partial")).toBeInTheDocument()
+    expect(screen.getByText("compared")).toBeInTheDocument()
     expect(screen.getByText("not compared")).toBeInTheDocument()
   })
 

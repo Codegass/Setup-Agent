@@ -11,6 +11,7 @@ import type {
   TaskCompletion,
   TestSummary,
   TrajectoryTurn,
+  WorkspaceResult,
 } from "./types"
 
 const verdictContract = {
@@ -91,12 +92,25 @@ describe("result card types", () => {
       verdict: "success",
       verdictSource: "snapshot",
       rows: [
-        { key: "setup", label: "Setup", status: "success", tone: "success", headline: "5/5 phases" },
-        { key: "task", label: "Required task", status: "complete", tone: "success", headline: "complete 1/1 steps" },
-        { key: "build", label: "Build", status: "success", tone: "success", headline: "1/1 modules built" },
-        { key: "tests", label: "Tests", status: "executed", tone: "success", headline: "994 executed" },
+        { key: "ci_command", label: "CI command", status: "passed", tone: "success", headline: "1 of 1 steps passed" },
+        {
+          key: "official_ci",
+          label: "Official CI",
+          status: "compared",
+          tone: "success",
+          headline: "built 1 of 1 modules, ran 933 of 933 tests (CI cell 'build')",
+          detail: "0 failures, 0 errors in this run",
+        },
+        {
+          key: "unconfirmed",
+          label: "Not confirmed by SAG",
+          status: "none",
+          tone: "success",
+          headline: "SAG confirmed each of the above from its own records.",
+        },
+        { key: "run", label: "Run", status: "ended normally", tone: "success", headline: "ended normally" },
+        { key: "summary", label: "Summary", status: "success", tone: "success", headline: "derived from the lines above" },
         { key: "coverage", label: "Coverage", status: "not collected", tone: "neutral", headline: "not collected" },
-        { key: "ci", label: "Official CI", status: "not compared", tone: "neutral", headline: "not compared" },
         { key: "report", label: "Report", status: "delivered", tone: "neutral", headline: "report.md" },
       ],
       stats: {},
@@ -104,14 +118,25 @@ describe("result card types", () => {
       notes: [],
     }
     expect(card.rows.map((row) => row.key)).toEqual([
-      "setup",
-      "task",
-      "build",
-      "tests",
+      "ci_command",
+      "official_ci",
+      "unconfirmed",
+      "run",
+      "summary",
       "coverage",
-      "ci",
       "report",
     ])
+  })
+
+  it("carries the card's first line on the rail beside the Summary word", () => {
+    const result: WorkspaceResult = {
+      verdict: "failed",
+      ciCommand: { status: "failed", headline: "1 of 3 steps passed · step 2 of 3 exited 1" },
+      task: { status: "incomplete", completed: 1, required: 3 },
+      tests: null,
+      ci: { status: "compared" },
+    }
+    expect(result.ciCommand?.headline).toBe("1 of 3 steps passed · step 2 of 3 exited 1")
   })
 
   it("names the card's own fields the way the API serves them", () => {

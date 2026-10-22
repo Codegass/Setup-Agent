@@ -46,9 +46,18 @@ function redCount(tests: NonNullable<WorkspaceResult["tests"]>): number {
   return tests.failed + tests.errors
 }
 
+/** How the CI command cell reads: the card's own word, coloured like the row. */
+const COMMAND_TONE: Record<string, string> = {
+  passed: "text-status-success",
+  failed: "text-status-failed",
+  "did not finish": "text-status-attention",
+  unavailable: "text-status-attention",
+}
+
 /**
- * One row's whole result: the card's word for the run, how far the required
- * task got, how the tests came out, and the Official CI word.
+ * One row's whole result: the card's Summary word for the run, the card's
+ * first line (whether the pinned CI command passed), how the tests came out,
+ * and the Official CI word.
  *
  * Every cell is copied from `workspace.result`, which the API reads off the
  * run's own card and record. A cell the run did not measure is a dash — there
@@ -65,12 +74,21 @@ function ResultStrip({ result }: { result: WorkspaceResult | null | undefined })
   const red = tests ? redCount(tests) : 0
   return (
     <span className="flex shrink-0 items-center gap-2 font-mono text-[11px] tabular-nums">
-      <span className={cn(VERDICT_TONE[result.verdict] ?? "text-muted-foreground")} title="How the run came out">
+      <span className={cn(VERDICT_TONE[result.verdict] ?? "text-muted-foreground")} title="Summary, derived from the result's lines">
         {result.verdict}
       </span>
-      <span className="text-muted-foreground" title="Required task steps completed">
-        {result.task ? `${result.task.completed}/${result.task.required}` : "—"}
-      </span>
+      {result.ciCommand ? (
+        <span
+          className={cn(COMMAND_TONE[result.ciCommand.status] ?? "text-muted-foreground")}
+          title={`CI command: ${result.ciCommand.headline}`}
+        >
+          {result.ciCommand.status}
+        </span>
+      ) : (
+        <span className="text-muted-foreground" title="Required task steps completed">
+          {result.task ? `${result.task.completed}/${result.task.required}` : "—"}
+        </span>
+      )}
       <span className="text-muted-foreground" title="Tests passed of tests executed">
         {tests ? `${tests.passed.toLocaleString()}/${tests.executed.toLocaleString()}` : "—"}
       </span>
@@ -93,10 +111,12 @@ function resultClause(result: WorkspaceResult | null | undefined): string {
   const tests = result.tests
   const red = tests ? redCount(tests) : 0
   const parts = [
-    `setup ${result.verdict}`,
-    result.task
-      ? `required task ${result.task.completed}/${result.task.required}`
-      : "required task not recorded",
+    `summary ${result.verdict}`,
+    result.ciCommand
+      ? `CI command ${result.ciCommand.status}: ${result.ciCommand.headline}`
+      : result.task
+        ? `required task ${result.task.completed}/${result.task.required}`
+        : "required task not recorded",
     tests
       ? `tests ${tests.passed.toLocaleString()}/${tests.executed.toLocaleString()}${
           red > 0 ? `, ${red.toLocaleString()} failed or errored` : ""

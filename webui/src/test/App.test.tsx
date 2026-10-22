@@ -40,34 +40,55 @@ const jsonResponse = (payload: unknown) =>
 
 /** A result card the way `build_result_card` emits one: the seven rows, in
  *  order, each stating the run's own words. The tests that follow a refetch key
- *  off the setup row's headline, which is the band's first line. */
+ *  off the Run row's detail (the run's phase and turn counts), and read this
+ *  run's tests off the Official CI row's detail. */
 const resultCard = (
-  setupHeadline: string,
-  testsHeadline = "320 executed · 312 passed · 8 failed · 0 errors · 0 skipped",
+  runCounts: string,
+  thisRun = "this run: 1/1 modules built · 320 executed · 312 passed · 8 failed · 0 errors · 0 skipped",
 ): ResultCard => ({
   schemaVersion: 1,
   runId: "CC-3",
   verdict: "partial",
   verdictSource: "snapshot",
   rows: [
-    { key: "setup", label: "Setup", status: "partial", tone: "attention", headline: setupHeadline },
     {
-      key: "task",
-      label: "Required task",
+      key: "ci_command",
+      label: "CI command",
       status: "not supplied",
       tone: "neutral",
-      headline: "no required task was supplied",
+      headline: "no pinned CI command; the build and tests below are what the run did",
     },
-    { key: "build", label: "Build", status: "success", tone: "success", headline: "1/1 modules built" },
     {
-      key: "tests",
-      label: "Tests",
-      status: "executed",
+      key: "official_ci",
+      label: "Official CI",
+      status: "not compared",
       tone: "attention",
-      headline: testsHeadline,
+      headline: "official CI numbers not available: no official CI record was supplied for this run",
+      detail: thisRun,
+    },
+    {
+      key: "unconfirmed",
+      label: "Not confirmed by SAG",
+      status: "none",
+      tone: "success",
+      headline: "SAG confirmed each of the above from its own records.",
+    },
+    {
+      key: "run",
+      label: "Run",
+      status: "ended normally",
+      tone: "success",
+      headline: "ended normally",
+      detail: runCounts,
+    },
+    {
+      key: "summary",
+      label: "Summary",
+      status: "partial",
+      tone: "attention",
+      headline: "derived from the lines above",
     },
     { key: "coverage", label: "Coverage", status: "not collected", tone: "neutral", headline: "not collected" },
-    { key: "ci", label: "Official CI", status: "not compared", tone: "neutral", headline: "not compared" },
     { key: "report", label: "Report", status: "delivered", tone: "neutral", headline: "setup-report.md" },
   ],
   stats: {},
@@ -252,14 +273,16 @@ describe("App", () => {
     // Master-detail: header heading + result band + tab nav.
     expect(await screen.findByRole("heading", { name: "apache/commons-cli" })).toBeInTheDocument()
     expect(screen.getByRole("navigation", { name: /detail tabs/i })).toBeInTheDocument()
-    // The result band states every row of the card the API served. The tests row
-    // is read inside the band, because the Overview below restates it word for
-    // word and an unscoped query would not say which surface it found.
+    // The result band states every row of the card the API served. This run's
+    // tests are read inside the band's Official CI row, so the query says which
+    // surface it found them on.
     expect(screen.getByText("3/5 phases · 21 turns")).toBeInTheDocument()
-    const bandTests = document.querySelector('[data-row="tests"]') as HTMLElement
+    const bandTests = document.querySelector('[data-row="official_ci"]') as HTMLElement
     expect(bandTests).not.toBeNull()
     expect(
-      within(bandTests).getByText("320 executed · 312 passed · 8 failed · 0 errors · 0 skipped"),
+      within(bandTests).getByText(
+        "this run: 1/1 modules built · 320 executed · 312 passed · 8 failed · 0 errors · 0 skipped",
+      ),
     ).toBeInTheDocument()
     // The Report tab swaps in the report document body.
     fireEvent.click(screen.getByRole("button", { name: /^Report/ }))
@@ -476,7 +499,7 @@ describe("App", () => {
       outcome: "Setup completed after polling.",
       resultCard: resultCard(
         "5/5 phases · 33 turns",
-        "430 executed · 430 passed · 0 failed · 0 errors · 0 skipped",
+        "this run: 1/1 modules built · 430 executed · 430 passed · 0 failed · 0 errors · 0 skipped",
       ),
       test: { state: "success", pass: 430, fail: 0, skip: 0, total: 430 },
     }
@@ -515,11 +538,13 @@ describe("App", () => {
     await new Promise((resolve) => setTimeout(resolve, 3200))
 
     expect(await screen.findByText("5/5 phases · 33 turns")).toBeInTheDocument()
-    // The Tests tab states the freshly polled card's own tests row — the same
-    // string the band above it states, not a second reading of the counts.
+    // The Tests tab states the freshly polled card's own Official CI line — the
+    // same string the band above it states, not a second reading of the counts.
     fireEvent.click(screen.getByRole("button", { name: /^Tests/ }))
     expect(
-      screen.getAllByText("430 executed · 430 passed · 0 failed · 0 errors · 0 skipped").length,
+      screen.getAllByText(
+        "this run: 1/1 modules built · 430 executed · 430 passed · 0 failed · 0 errors · 0 skipped",
+      ).length,
     ).toBe(2)
   }, 8000)
 
