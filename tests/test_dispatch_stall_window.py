@@ -1812,3 +1812,201 @@ def test_cleanup_default_clock_is_monotonic_not_wall_time(monkeypatch):
 
     assert result.code == "killed"
     assert clock.t == 5
+
+
+# --- A stalled job whose session leader exited after TERM ------------------
+#
+# commons-vfs under the project user: TERM reached the group, the leader (bash,
+# pid = pgid = sid) exited, and the forked surefire JVM in the same group lived
+# on. The launcher identity can no longer be re-read from a leader that is
+# gone, so the KILL was refused and the run ended with the job still running.
+# The group is still this job's when its leader's pid no longer exists, every
+# member is in the session the launcher's setsid created (sid == pgid), and
+# the launcher's pid/pgid/identity files still read as registered.
+
+GROUP_LISTING = "set -o pipefail; ps -eo pid=,pgid=,sid= | awk -v p=4242 -v g=4242 '$1 == p || $2 == g'"
+LEADER_STAT_PREFIX = 'stat_line="$(cat /proc/4242/stat'
+
+
+class _LeaderExitHarness(_DiagnosticHarness):
+    """TERM ends the session leader; the rows in ``members`` live on."""
+
+    def __init__(self, members, *, survives_kill=False, after_term=None, **kwargs):
+        super().__init__(**kwargs)
+        self.members = members
+        self.survives_kill = survives_kill
+        self.after_term = after_term
+        self.leader_alive = True
+
+    def execute(self, command, **kwargs):
+        if command == "kill -TERM -- -4242":
+            self.commands.append(command)
+            self.leader_alive = False
+            if self.after_term:
+                self.after_term(self)
+            return {"exit_code": 0, "output": ""}
+        if command == "kill -KILL -- -4242":
+            self.commands.append(command)
+            self.live = self.survives_kill
+            return {"exit_code": 0, "output": ""}
+        if not self.leader_alive and command == "ps -o pid=,pgid=,sid= -p 4242":
+            self.commands.append(command)
+            return {"exit_code": 1, "output": ""}
+        if not self.leader_alive and command.startswith(LEADER_STAT_PREFIX):
+            self.commands.append(command)
+            return {"exit_code": 1, "output": ""}
+        if command == GROUP_LISTING:
+            self.commands.append(command)
+            rows = self.members if not self.leader_alive else ["4242 4242 4242", *self.members]
+            return {"exit_code": 0, "output": "\n".join(rows)}
+        return super().execute(command, **kwargs)
+
+
+def _sealed_cleanup(monkeypatch, harness, **kwargs):
+    monkeypatch.setattr(stall_diagnostics, "write_container_text_atomic", harness.writer)
+    monkeypatch.setattr(
+        stall_diagnostics, "compare_publish_container_text_atomic", harness.cas_writer
+    )
+    diagnostic = collect_stall_diagnostic(harness.execute, _stall_job())
+    seal = seal_stall_evidence(harness.execute, diagnostic)
+    return cleanup_registered_process_group(
+        harness.execute,
+        _stall_job(),
+        seal,
+        grace_seconds=0,
+        sleep=lambda _seconds: None,
+        **kwargs,
+    )
+
+
+def _cleanup_record(harness):
+    return json.loads(harness.files[stall_diagnostics.diagnostic_cleanup_ref("job-1")])
+
+
+def test_a_group_whose_leader_exited_after_term_is_killed_when_it_stayed_in_the_session(
+    monkeypatch,
+):
+    # The surefire JVM and its shell, both still in the job's own session.
+    harness = _LeaderExitHarness(["4300 4242 4242", "4311 4242 4242"])
+
+    result = _sealed_cleanup(monkeypatch, harness)
+
+    assert result.code == "killed_after_leader_exit"
+    assert (result.term_sent, result.kill_sent, result.group_live) == (True, True, False)
+    assert result.process_group_terminal is True
+    assert result.marker_reconciliation_required is True
+    term = harness.commands.index("kill -TERM -- -4242")
+    listing = harness.commands.index(GROUP_LISTING)
+    kill = harness.commands.index("kill -KILL -- -4242")
+    assert term < listing < kill
+    # The launcher's files were read again after TERM, before the KILL.
+    for path in ("/tmp/sag_jobs/job-1.pid", "/tmp/sag_jobs/job-1.pgid", "/tmp/sag_jobs/job-1.identity"):
+        assert term < max(i for i, c in enumerate(harness.commands) if c == f"cat {path} 2>/dev/null") < kill
+    assert not any("pkill" in command or "killall" in command for command in harness.commands)
+    record = _cleanup_record(harness)
+    assert record["code"] == "killed_after_leader_exit"
+    assert (record["term_sent"], record["kill_sent"], record["group_live"]) == (True, True, False)
+    assert result.evidence_ref == stall_diagnostics.diagnostic_cleanup_ref("job-1")
+
+
+def test_the_whole_stall_control_reports_the_kill_after_leader_exit(monkeypatch):
+    harness = _LeaderExitHarness(
+        ["4300 4242 4242"], progress=[_progress_output(), _progress_output()]
+    )
+    monkeypatch.setattr(stall_diagnostics, "write_container_text_atomic", harness.writer)
+    clock = Fuse(start=0, fuse=1000)
+
+    result = control_stalled_job(harness.execute, _stall_job(), now=clock.now, sleep=clock.sleep)
+
+    assert result.code == "killed_after_leader_exit"
+    assert result.confirmed_stall is True
+    assert result.marker_reconciliation_required is True
+
+
+def test_a_member_in_another_session_keeps_the_refusal(monkeypatch):
+    # A pgid whose members are not all in the job's session is not this job's.
+    harness = _LeaderExitHarness(["4300 4242 4242", "4311 4242 9000"])
+
+    result = _sealed_cleanup(monkeypatch, harness)
+
+    assert result.code == "identity_changed_before_kill"
+    assert (result.term_sent, result.kill_sent, result.group_live) == (True, False, True)
+    assert "kill -KILL -- -4242" not in harness.commands
+    record = _cleanup_record(harness)
+    assert {key: record[key] for key in ("code", "term_sent", "kill_sent", "group_live", "pgid")} == {
+        "code": "identity_changed_before_kill",
+        "term_sent": True,
+        "kill_sent": False,
+        "group_live": True,
+        "pgid": 4242,
+    }
+    assert set(record) == {
+        "schema_version",
+        "job_id",
+        "pgid",
+        "seal_ref",
+        "code",
+        "term_sent",
+        "kill_sent",
+        "group_live",
+        "recorded_at",
+    }
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        [],  # nothing listed: the group cannot be shown to be this job's
+        ["4300 4242"],  # a malformed row
+        ["4242 7777 7777", "4300 4242 4242"],  # the leader's pid now belongs to another group
+    ],
+)
+def test_an_unprovable_group_keeps_the_refusal(monkeypatch, members):
+    harness = _LeaderExitHarness(members)
+
+    result = _sealed_cleanup(monkeypatch, harness)
+
+    assert result.code == "identity_changed_before_kill"
+    assert "kill -KILL -- -4242" not in harness.commands
+
+
+@pytest.mark.parametrize(
+    "path, value",
+    [
+        ("/tmp/sag_jobs/job-1.pid", "4300"),
+        ("/tmp/sag_jobs/job-1.pgid", "4300"),
+        ("/tmp/sag_jobs/job-1.identity", "f" * 64),
+    ],
+)
+def test_launcher_files_that_no_longer_read_as_registered_keep_the_refusal(
+    monkeypatch, path, value
+):
+    harness = _LeaderExitHarness(
+        ["4300 4242 4242"], after_term=lambda h: h.files.__setitem__(path, value)
+    )
+
+    result = _sealed_cleanup(monkeypatch, harness)
+
+    assert result.code == "identity_changed_before_kill"
+    assert "kill -KILL -- -4242" not in harness.commands
+
+
+def test_a_present_leader_takes_todays_path(monkeypatch):
+    # Leader alive and verified after TERM: today's KILL, today's code, and
+    # the group listing is never consulted.
+    harness = _DiagnosticHarness()
+
+    result = _sealed_cleanup(monkeypatch, harness)
+
+    assert result.code == "killed"
+    assert GROUP_LISTING not in harness.commands
+
+
+def test_a_kill_after_leader_exit_that_leaves_the_group_live_is_live_at_close(monkeypatch):
+    harness = _LeaderExitHarness(["4300 4242 4242"], survives_kill=True)
+
+    result = _sealed_cleanup(monkeypatch, harness)
+
+    assert result.code == "job_live_at_close"
+    assert (result.term_sent, result.kill_sent, result.group_live) == (True, True, True)
+    assert result.process_group_terminal is False

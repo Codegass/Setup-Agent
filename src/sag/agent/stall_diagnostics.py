@@ -667,24 +667,33 @@ def cleanup_registered_process_group(
             CleanupResult(job_id, pgid, "terminated_after_term", term_sent=True, group_live=False),
             seal,
         )
+    killed_code = "killed"
     if not _registered_identity_matches(execute, job, job_id=job_id, pid=_pid, pgid=pgid):
-        return _persist_cleanup(
-            execute,
-            CleanupResult(
-                job_id,
-                pgid,
-                "identity_changed_before_kill",
-                term_sent=True,
-                group_live=True,
-            ),
-            seal,
-        )
+        # TERM often ends the session leader (the job's shell) while a forked
+        # child in its group, such as a surefire JVM, lives on. The leader can
+        # then no longer be re-identified, but the group is still this job's
+        # when every member is in the session the launcher's setsid created.
+        if not _leader_exited_with_group_in_its_session(
+            execute, job, job_id=job_id, pid=_pid, pgid=pgid
+        ):
+            return _persist_cleanup(
+                execute,
+                CleanupResult(
+                    job_id,
+                    pgid,
+                    "identity_changed_before_kill",
+                    term_sent=True,
+                    group_live=True,
+                ),
+                seal,
+            )
+        killed_code = "killed_after_leader_exit"
     killed = _execute(execute, f"kill -KILL -- -{pgid}", timeout=15)
     live = _process_group_live(execute, pgid)
     result = CleanupResult(
         job_id,
         pgid,
-        "killed" if _succeeded(killed) and not live else "job_live_at_close",
+        killed_code if _succeeded(killed) and not live else "job_live_at_close",
         term_sent=True,
         kill_sent=_succeeded(killed),
         group_live=live,
@@ -1365,21 +1374,8 @@ def _registered_identity_matches(
 ) -> bool:
     """Re-read launcher identity files and the live kernel session tuple."""
 
-    expected_pid_path = f"/tmp/sag_jobs/{job_id}.pid"
-    expected_pgid_path = f"/tmp/sag_jobs/{job_id}.pgid"
-    expected_identity_path = f"/tmp/sag_jobs/{job_id}.identity"
     expected_token = _digest(job.get("process_identity_token"))
-    if _text(job.get("pid_path")) != expected_pid_path:
-        return False
-    if _text(job.get("pgid_path")) != expected_pgid_path:
-        return False
-    if _text(job.get("identity_path")) != expected_identity_path or not expected_token:
-        return False
-    if _read_positive_integer(execute, expected_pid_path) != pid:
-        return False
-    if _read_positive_integer(execute, expected_pgid_path) != pgid:
-        return False
-    if _read_digest(execute, expected_identity_path) != expected_token:
+    if not _registered_launcher_files_match(execute, job, job_id=job_id, pid=pid, pgid=pgid):
         return False
     result = _execute(
         execute,
@@ -1403,6 +1399,80 @@ def _registered_identity_matches(
         timeout=15,
     )
     return _succeeded(current) and _digest(current.get("output")) == expected_token
+
+
+def _leader_exited_with_group_in_its_session(
+    execute: Callable[..., Any],
+    job: Mapping[str, Any],
+    *,
+    job_id: str,
+    pid: int,
+    pgid: int,
+) -> bool:
+    """Whether a group whose leader has exited is still provably this job's.
+
+    Used only after TERM, when the leader can no longer be re-identified. The
+    launcher's pid/pgid/identity files must still read as registered, the
+    leader's pid must no longer exist, and every live member of the group must
+    be in the session whose id is the pgid: the one the launcher's ``setsid``
+    created. A reused pgid would belong to a different session.
+    """
+
+    if not _registered_launcher_files_match(execute, job, job_id=job_id, pid=pid, pgid=pgid):
+        return False
+    # Rows for the leader's pid (anywhere) and for every member of the group.
+    listing = _execute(
+        execute,
+        (
+            "set -o pipefail; ps -eo pid=,pgid=,sid= "
+            f"| awk -v p={pid} -v g={pgid} '$1 == p || $2 == g'"
+        ),
+        timeout=15,
+        truncate_output=False,
+    )
+    if not _succeeded(listing):
+        return False
+    members = []
+    for line in _text(listing.get("output")).splitlines():
+        if not line.strip():
+            continue
+        row = [_positive_int(field) for field in line.split()]
+        if len(row) != 3 or None in row:
+            return False
+        member_pid, member_pgid, member_sid = row
+        if member_pid == pid:
+            return False  # the leader's pid exists: not an exited leader
+        if member_pgid != pgid or member_sid != pgid:
+            return False
+        members.append(member_pid)
+    return bool(members)
+
+
+def _registered_launcher_files_match(
+    execute: Callable[..., Any],
+    job: Mapping[str, Any],
+    *,
+    job_id: str,
+    pid: int,
+    pgid: int,
+) -> bool:
+    """Re-read the launcher's pid, pgid and identity files for this job."""
+
+    expected_token = _digest(job.get("process_identity_token"))
+    paths = {
+        "pid": f"/tmp/sag_jobs/{job_id}.pid",
+        "pgid": f"/tmp/sag_jobs/{job_id}.pgid",
+        "identity": f"/tmp/sag_jobs/{job_id}.identity",
+    }
+    return bool(
+        expected_token
+        and _text(job.get("pid_path")) == paths["pid"]
+        and _text(job.get("pgid_path")) == paths["pgid"]
+        and _text(job.get("identity_path")) == paths["identity"]
+        and _read_positive_integer(execute, paths["pid"]) == pid
+        and _read_positive_integer(execute, paths["pgid"]) == pgid
+        and _read_digest(execute, paths["identity"]) == expected_token
+    )
 
 
 def _read_positive_integer(execute: Callable[..., Any], path: str) -> Optional[int]:
