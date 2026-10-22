@@ -53,7 +53,8 @@ PROCESS_PROVENANCE = {
 }
 
 
-def _confirmed_stall_cleanup_result(*, group_live=False):
+def _confirmed_stall_cleanup_result(*, group_live=False, code=None, kill_sent=True):
+    code = code or ("job_live_at_close" if group_live else "killed")
     diagnostic = DiagnosticBundle(
         job_id=JOB,
         pid=4711,
@@ -78,16 +79,16 @@ def _confirmed_stall_cleanup_result(*, group_live=False):
     )
     return StallControlResult(
         job_id=JOB,
-        code="job_live_at_close" if group_live else "killed",
+        code=code,
         diagnostic=diagnostic,
         progress=ProgressObservation(diagnostic.snapshot),
         seal=seal,
         cleanup=CleanupResult(
             job_id=JOB,
             pgid=4711,
-            code="job_live_at_close" if group_live else "killed",
+            code=code,
             term_sent=True,
-            kill_sent=True,
+            kill_sent=kill_sent,
             group_live=group_live,
         ),
     )
@@ -459,6 +460,75 @@ def test_confirmed_stall_cleanup_stays_in_controller_until_marker_settlement(mon
         fact.key.startswith(f"job_stall_observed.{JOB}.")
         for fact in engine.run_evidence_state.facts
     )
+
+
+def _stalled_engine(monkeypatch, result, *, exit_code):
+    orchestrator = _with_obligation(
+        _orchestrator(exit_code=None),
+        **PROCESS_PROVENANCE,
+        handoff_reason="stalled",
+    )
+    engine = _engine([_text_turn()], max_iterations=1)
+    engine.orchestrator = orchestrator
+    engine.config.max_wall_clock_seconds = 7_200
+    engine._run_started_at = 0.0
+    engine._wall_clock_cap = 7_200.0
+    engine._JOB_MARKER_RECONCILE_ATTEMPTS = 2
+
+    def cleanup(_execute, _job, **_kwargs):
+        if exit_code is not None:
+            # The leader exited on TERM, so Docker already holds the exec's
+            # terminal status by the time the group is killed.
+            orchestrator.set_detached_terminal_state(DOCKER_EXEC_ID, "finished", exit_code)
+        return result
+
+    monkeypatch.setattr("sag.agent.react_engine.control_stalled_job", cleanup)
+    return engine, orchestrator
+
+
+def _stall_events(engine):
+    return [
+        fact.value
+        for fact in engine.run_evidence_state.facts
+        if fact.key.startswith(f"job_stall_observed.{JOB}.")
+    ]
+
+
+def test_a_kill_after_the_leader_exited_settles_like_a_stall_kill(monkeypatch):
+    engine, orchestrator = _stalled_engine(
+        monkeypatch,
+        _confirmed_stall_cleanup_result(code="killed_after_leader_exit"),
+        exit_code=143,
+    )
+
+    assert engine._drain_job_barrier(now=lambda: 0.0, sleep=lambda _seconds: None) == "cleared"
+    body = orchestrator.filesystem.files[f"{OBLIGATION_DIR}/{JOB}.json"]
+    assert '"process_state": "terminal"' in body
+    assert '"settlement_state": "settled"' in body
+    assert "job_barrier_integrity_failure" not in engine.run_evidence_state.conflicts
+    assert f"job_live_at_close:{JOB}" not in engine.run_evidence_state.conflicts
+    [stall] = _stall_events(engine)
+    assert stall["controller_code"] == "killed_after_leader_exit"
+    assert (stall["term_sent"], stall["kill_sent"], stall["group_live"]) == (True, True, False)
+    assert engine.llm_client.requests == []
+
+
+def test_a_refused_kill_after_the_leader_exited_is_still_an_integrity_failure(monkeypatch):
+    # Today's commons-vfs record: TERM sent, KILL refused, the group live.
+    engine, _orchestrator = _stalled_engine(
+        monkeypatch,
+        _confirmed_stall_cleanup_result(
+            code="identity_changed_before_kill", group_live=True, kill_sent=False
+        ),
+        exit_code=143,
+    )
+
+    assert (
+        engine._drain_job_barrier(now=lambda: 0.0, sleep=lambda _seconds: None)
+        == "integrity_failure"
+    )
+    assert "job_barrier_integrity_failure" in engine.run_evidence_state.conflicts
+    assert f"job_live_at_close:{JOB}" in engine.run_evidence_state.conflicts
 
 
 def test_dead_group_without_supervisor_marker_is_integrity_not_live(monkeypatch):
