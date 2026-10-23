@@ -33,6 +33,30 @@ def save(path, value):
         os.fsync(stream.fileno())
 
 
+
+def anthropic_adapters():
+    """litellm's Anthropic Messages <-> Responses API adapters, wherever this litellm keeps them.
+
+    litellm moved them from ``llms.anthropic.experimental_pass_through`` (<= 1.83) to
+    ``llms.anthropic.pass_through`` (1.106); the classes and their methods are the same.
+    """
+    try:
+        from litellm.llms.anthropic.pass_through.responses_adapters.transformation import (
+            LiteLLMAnthropicToResponsesAPIAdapter,
+        )
+        from litellm.llms.anthropic.pass_through.messages.fake_stream_iterator import (
+            FakeAnthropicMessagesStreamIterator,
+        )
+    except ModuleNotFoundError:
+        from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+            LiteLLMAnthropicToResponsesAPIAdapter,
+        )
+        from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
+            FakeAnthropicMessagesStreamIterator,
+        )
+    return LiteLLMAnthropicToResponsesAPIAdapter, FakeAnthropicMessagesStreamIterator
+
+
 def prepare_request(path, body, arm):
     """Return the actual provider request, preserving the requested body separately."""
     body = dict(body)
@@ -40,9 +64,7 @@ def prepare_request(path, body, arm):
         raise ValueError("This experiment permits only " + MODEL)
     body["model"] = MODEL
     if path == "/v1/messages":
-        from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
-            LiteLLMAnthropicToResponsesAPIAdapter,
-        )
+        LiteLLMAnthropicToResponsesAPIAdapter, _ = anthropic_adapters()
         body = LiteLLMAnthropicToResponsesAPIAdapter().translate_request(body)
         # Explicit protocol setting; never inherit a model-specific default.
         body["reasoning"] = {"effort": "none"}
@@ -187,9 +209,8 @@ def create_app(*, directory, run_id, arm, token, api_key, api_base):
             active.discard(ident)
             if path != "/v1/messages" or upstream.status_code != 200:
                 return Response(raw, status_code=upstream.status_code, media_type="application/json")
-            from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import LiteLLMAnthropicToResponsesAPIAdapter
             from litellm.types.llms.openai import ResponsesAPIResponse
-            from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import FakeAnthropicMessagesStreamIterator
+            LiteLLMAnthropicToResponsesAPIAdapter, FakeAnthropicMessagesStreamIterator = anthropic_adapters()
             response = LiteLLMAnthropicToResponsesAPIAdapter().translate_response(ResponsesAPIResponse(**json.loads(raw)))
             if original.get("stream"):
                 return StreamingResponse(FakeAnthropicMessagesStreamIterator(response), media_type="text/event-stream")
