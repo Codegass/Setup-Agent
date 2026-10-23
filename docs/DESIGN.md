@@ -114,6 +114,47 @@ components:
 
 # Design System: SAG Workbench
 
+## Run results
+
+- Lead with this run's Build and Tests: observed modules, class files, JARs,
+  and test outcomes. These facts do not require a CI record. Keep the result
+  surface neutral; color the individual facts.
+- Show Task verification only when a task was supplied. A prescribed task is
+  not necessarily an official CI command. Show CI comparison only when a CI
+  reference was supplied; an absent baseline is not a missing user requirement.
+  A supplied but unusable baseline still states why it could not be compared.
+  Keep task completion, local outcomes, SAG checks, and run termination separate.
+- Use the card's structured `dimensions` for graphs. Keep the original row text
+  under disclosures. Older cards without dimensions retain their text view.
+- Compare module names by intersection with the CI list. Test counts are counts,
+  not proof of matching test identities. Show missing values as missing, and
+  preserve zero and values above CI without inventing percentages.
+  If either side is missing, show a dashed guide instead of a filled bar.
+- Let the result and detail panels share one scroll area. Keep the tab bar
+  reachable, and move focus to the selected tab when following an evidence link.
+- Preserve Flow after Overview: goal, phase timeline, tasks, iterations, and
+  clickable tool calls with output and observation details. Flow does not need
+  a CI reference. Missing trace data gets an empty state, not a hidden tab.
+  Use the recorded Turns layout inside Flow, with a single navigation entry.
+  Render controller events without tool calls as compact, expandable status
+  rows. Keep the turn ID, control sequence, gate decision and recorded message
+  under the disclosure. A successful report check confirms report delivery;
+  it does not establish build or test success. Keep controller tool calls as
+  action rows, and show unconfirmed checks without a success mark.
+  Flow's phase progress
+  does not replace the result card's verified Build and Tests outcomes.
+  For recorded runs, show the same per-turn token and duration plots as Turns.
+  The latest recorded gate labels each phase; an ended workflow is not a
+  successful task. Show "not run" only for an explicitly skipped phase with
+  no recorded actions. Retain calls even when their phase grading is missing.
+  Read full output by ref on demand: a large output file omitted from the
+  bounded trace is not a missing output. Keep older verdicts marked as rebuilt
+  from an older record. Collapse long goals and phase instructions, with their
+  full text available on expansion.
+- In the Tests panel, prefer the run's own counts over CI-bound counts.
+  Totals that include skipped results say "recorded", not "ran". `compared`
+  is a comparison state, not a test-pass verdict.
+
 ## 1. Overview
 
 **Creative North Star: "The Instrument Panel"**
@@ -281,6 +322,18 @@ popovers). If a card has a resting drop shadow, it is wrong.
 - **Disabled:** Reduced opacity, no pointer events (during submit).
 
 ### Navigation
+- The process has one tab: **Flow**. Use the recorded-turn layout, grouped by
+  phase and iteration. Do not offer a second Turns tab for the same run.
+- Keep the phase task, actor notes, exact parameters, model context and raw
+  output available through disclosures. Preserve ledger calls even when the
+  context trace is missing; preserve context outputs when the ledger is incomplete.
+- Usage charts link to an iteration and return keyboard focus there. Iteration
+  cards count each actor response once, show Advisor separately, and disclose
+  exact input/output counts. Time is the union of recorded action intervals;
+  it excludes model response time and is not the run's total duration.
+- Violet identifies Advisor in charts and calls, in both themes. It is a role
+  colour, not a result status. Show its model and effort from the archived
+  provider request. Missing or ambiguous settings stay unknown.
 - **Style:** A single sticky top bar (Surface White at 85% with backdrop blur,
   bottom Hairline). Left: wordmark plus a breadcrumb trail
   (dashboard / workspace / session) in 12.5px, active segment in ink, ancestors

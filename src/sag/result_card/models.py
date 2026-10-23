@@ -7,6 +7,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic.alias_generators import to_camel
 
+from sag.agent.verdict_dimensions import (
+    CICommand,
+    FirstUnpassedStep,
+    OfficialCI,
+    RunControl,
+    SagCheck,
+)
+
 RowKey = Literal[
     "ci_command",
     "official_ci",
@@ -130,6 +138,66 @@ class AttentionItem(_Frozen):
     refs: tuple[str, ...] = ()
 
 
+# Reuse the sealed measurements and their validation. Only the wire aliases
+# differ: the card API is camelCase, including its nested records.
+class ResultFirstUnpassedStep(FirstUnpassedStep, _Frozen):
+    pass
+
+
+class ResultCICommand(CICommand, _Frozen):
+    first_unpassed_step: ResultFirstUnpassedStep | None = None
+
+
+class ResultOfficialCI(OfficialCI, _Frozen):
+    pass
+
+
+class ResultSagCheck(SagCheck, _Frozen):
+    pass
+
+
+class ResultRunControl(RunControl, _Frozen):
+    pass
+
+
+class ResultBuild(_Frozen):
+    fact: ResultRow
+    modules_built: int | None
+    modules_total: int | None
+    class_files: int | None
+    jars: int | None
+
+
+class ResultTestCounts(_Frozen):
+    executed: int
+    passed: int
+    failed: int
+    errors: int
+    skipped: int
+
+
+class ResultTests(_Frozen):
+    fact: ResultRow
+    counts: ResultTestCounts | None
+    lower_bound: bool = False
+    raw_executions: int | None = None
+    flaky_count: int = 0
+
+
+class ResultDimensions(_Frozen):
+    """Measurements for charts; copied from the same inputs as the text rows."""
+
+    ci_command: ResultCICommand | None
+    official_ci: ResultOfficialCI
+    sag_checks: tuple[ResultSagCheck, ...]
+    run_control: ResultRunControl
+    # Local evidence is independent of a supplied task or official CI record.
+    # Optional for cards saved before the Workbench exposed these measurements.
+    build: ResultBuild | None = None
+    tests: ResultTests | None = None
+    has_ci_reference: bool | None = None
+
+
 class RunResultCard(_Frozen):
     schema_version: Literal[1] = 1
     run_id: str
@@ -142,6 +210,9 @@ class RunResultCard(_Frozen):
     verdict_source: Literal["snapshot", "legacy", "unavailable"]
     rows: tuple[ResultRow, ...]
     stats: ResultStats
+    # Optional so previously saved cards still open without reconstructing
+    # measurements from their human-readable sentences.
+    dimensions: ResultDimensions | None = None
     attention: tuple[AttentionItem, ...] = ()
     notes: tuple[str, ...] = ()
 
@@ -172,6 +243,7 @@ __all__ = [
     "ROW_ORDER",
     "AttentionItem",
     "ResultRow",
+    "ResultDimensions",
     "ResultStats",
     "RowKey",
     "RunResultCard",

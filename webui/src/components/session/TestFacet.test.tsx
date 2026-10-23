@@ -65,6 +65,63 @@ const igniteShape = {
 } as any
 
 describe("TestFacet", () => {
+  it("prefers local outcomes to a different CI-bound receipt total", () => {
+    render(<TestFacet detail={{
+      ...single,
+      resultCard: {
+        rows: [],
+        dimensions: {
+          officialCi: { agentTestsExecuted: 933, agentFailures: 0, agentErrors: 0 },
+          sagChecks: [],
+          tests: {
+            fact: { key: "tests", status: "executed", tone: "attention", headline: "320 executed · 312 passed · 8 failed" },
+            counts: { executed: 320, passed: 312, failed: 8, errors: 0, skipped: 0 },
+            lowerBound: true, rawExecutions: 340, flakyCount: 0,
+          },
+        },
+      },
+    }} />)
+    const results = screen.getByRole("region", { name: "Test results" })
+    expect(within(results).getByText("≥ 320")).toHaveClass("text-foreground")
+    expect(within(results).getByText("8")).toHaveClass("text-status-failed")
+    expect(within(results).queryByText("933")).toBeNull()
+  })
+
+  it("keeps local test facts when no CI-bound counts were supplied", () => {
+    render(<TestFacet detail={{
+      ...single,
+      resultCard: {
+        rows: [{ key: "official_ci", status: "not compared", detail: "this run: 320 executed · 312 passed · 8 failed" }],
+        dimensions: {
+          officialCi: { agentTestsExecuted: null, agentFailures: null, agentErrors: null },
+          sagChecks: [],
+        },
+      },
+    }} />)
+    expect(screen.getByText("this run: 320 executed · 312 passed · 8 failed")).toBeVisible()
+    expect(screen.queryByText("not compared")).toBeNull()
+  })
+
+  it("does not present a CI comparison as a test-pass verdict", () => {
+    const measured = {
+      ...single,
+      resultCard: {
+        rows: [{ key: "official_ci", label: "Official CI", status: "compared", tone: "success", headline: "ran 933 of 933 tests", detail: "933 executed · 4 errors" }],
+        dimensions: {
+          officialCi: { agentTestsExecuted: 933, agentFailures: 0, agentErrors: 4 },
+          sagChecks: [{ check: "test outcome graded", confirmed: false, reason: "test outcome evidence is incomplete" }],
+        },
+      },
+    }
+    render(<TestFacet detail={measured} />)
+    const results = screen.getByRole("region", { name: "Test results" })
+    expect(within(results).getByText("933")).toBeVisible()
+    expect(within(results).getByText("4")).toHaveClass("text-status-failed")
+    expect(within(results).getByText(/Test outcome not confirmed/)).toBeVisible()
+    expect(screen.queryByText("compared")).toBeNull()
+    expect(screen.queryByText(/97\.5% of non-skipped results passed/)).toBeNull()
+  })
+
   it("shows conclusion + FAILING + a 'View test details' detail for single-module", () => {
     render(<TestFacet detail={single} />)
     expect(screen.getByText(/97\.5% of non-skipped results passed/i)).toBeInTheDocument()

@@ -707,6 +707,12 @@ def _workspace_result(card: Any, snapshot: Any) -> WorkspaceResult | None:
     ci_status = _optional_text((rows.get("official_ci") or {}).get("status"))
     command = rows.get("ci_command") or {}
     command_status = _optional_text(command.get("status"))
+    dimensions = card.get("dimensions")
+    if isinstance(dimensions, dict):
+        if "ciCommand" in dimensions and dimensions["ciCommand"] is None:
+            command_status = None
+        if dimensions.get("hasCiReference") is False:
+            ci_status = None
     return WorkspaceResult(
         verdict=_text(card.get("verdict"), default="unknown"),
         ci_command=(

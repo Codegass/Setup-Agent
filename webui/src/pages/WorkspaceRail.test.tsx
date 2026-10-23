@@ -166,7 +166,7 @@ describe("WorkspaceRail", () => {
     render(<WorkspaceRail {...props} data={{ ...data, workspaces: [healthy()] }} />)
     expect(screen.getByText("success")).toBeInTheDocument()
     // The card's first line takes the required-task cell when the card has one.
-    expect(screen.getByTitle("CI command: 1 of 1 steps passed")).toHaveTextContent("passed")
+    expect(screen.getByTitle("Task verification: 1 of 1 steps passed")).toHaveTextContent("passed")
     expect(screen.queryByText("1/1")).not.toBeInTheDocument()
     expect(screen.getByText("933/994")).toBeInTheDocument()
     expect(screen.getByText("compared")).toBeInTheDocument()
@@ -184,6 +184,17 @@ describe("WorkspaceRail", () => {
     expect(screen.getByText("+2")).toBeInTheDocument()
   })
 
+  it("does not frame an optional task or CI baseline as missing for a normal run", () => {
+    const ordinary = healthy()
+    ordinary.result = { ...ordinary.result!, ciCommand: null, task: null, ci: null }
+    render(<WorkspaceRail {...props} data={{ ...data, workspaces: [ordinary] }} />)
+    expect(screen.getByRole("button", {
+      name: "Open workspace owner/healthy — summary success, tests 933/994",
+    })).toBeInTheDocument()
+    expect(screen.queryByTitle("Required task steps completed")).toBeNull()
+    expect(screen.queryByTitle("How this run measures against the project's own CI")).toBeNull()
+  })
+
   it("says so once when a run recorded no result at all", () => {
     render(
       <WorkspaceRail {...props} data={{ ...data, workspaces: [ws({ id: "sag-none", project: "owner/none" })] }} />,
@@ -196,7 +207,7 @@ describe("WorkspaceRail", () => {
     render(<WorkspaceRail {...props} data={{ ...data, workspaces: [healthy()] }} />)
     expect(
       screen.getByRole("button", {
-        name: "Open workspace owner/healthy — summary success, CI command passed: 1 of 1 steps passed, tests 933/994, official CI compared",
+        name: "Open workspace owner/healthy — summary success, task verification passed: 1 of 1 steps passed, tests 933/994, official CI compared",
       }),
     ).toBeInTheDocument()
   })
@@ -229,10 +240,10 @@ describe("WorkspaceRail", () => {
     })
     render(<WorkspaceRail {...props} data={{ ...data, workspaces: [healthy(), commandFailed] }} />)
     expect(renderedOrder()[0]).toContain("owner/ci")
-    expect(screen.getByTitle("CI command: 0 of 1 steps passed · step 1 of 1 exited 1")).toHaveTextContent("failed")
+    expect(screen.getByTitle("Task verification: 0 of 1 steps passed · step 1 of 1 exited 1")).toHaveTextContent("failed")
     fireEvent.click(screen.getByRole("button", { name: /needs attention/i }))
     expect(renderedOrder()).toEqual([
-      "owner/ci — summary partial, CI command failed: 0 of 1 steps passed · step 1 of 1 exited 1, tests 40/40, official CI not compared",
+      "owner/ci — summary partial, task verification failed: 0 of 1 steps passed · step 1 of 1 exited 1, tests 40/40, official CI not compared",
     ])
   })
 

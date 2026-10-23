@@ -17,7 +17,7 @@ from sag.agent.verdict_finalizer import (
 from sag.console.result_block import render_result_block
 from sag.result_card.build import build_result_card
 from sag.result_card.markdown import render_result_card_markdown
-from sag.result_card.models import ROW_LABELS, ROW_ORDER
+from sag.result_card.models import ROW_LABELS, ROW_ORDER, RunResultCard
 from sag.web.models import WorkspaceResult
 from sag.web.session_registry import _workspace_result
 
@@ -236,6 +236,38 @@ def test_rows_read_in_the_order_the_spec_sets():
     assert card.tone == card.row("summary").tone == "success"
 
 
+@pytest.mark.parametrize("fixture", [passed_all_confirmed, failed_step_two_of_three, unfinished_at_the_time_limit, no_task])
+def test_card_charts_receive_the_same_dimensions_as_the_text_rows(fixture):
+    payload = fixture()
+    card = _card(payload)
+    assert card.dimensions is not None
+    measured = card.dimensions.model_dump(mode="json")
+    for name in ("ci_command", "official_ci", "sag_checks", "run_control"):
+        if name in payload:
+            expected = payload[name]
+            if isinstance(expected, dict):
+                assert all(measured[name][key] == value for key, value in expected.items())
+            else:
+                assert measured[name] == expected
+    # The presentation addition must not re-judge the sealed word.
+    assert card.verdict == payload["verdict"]
+    wire = card.model_dump(mode="json", by_alias=True)
+    if card.dimensions.ci_command is not None:
+        assert wire["dimensions"]["ciCommand"]["stepsPassed"] == card.dimensions.ci_command.steps_passed
+        first = wire["dimensions"]["ciCommand"]["firstUnpassedStep"]
+        if first:
+            assert "exitCode" in first and "exit_code" not in first
+    else:
+        assert wire["dimensions"]["ciCommand"] is None
+    assert RunResultCard.model_validate(wire) == card
+
+
+def test_older_saved_card_needs_no_chart_dimensions():
+    payload = _card(passed_all_confirmed()).model_dump(mode="json", by_alias=True)
+    payload.pop("dimensions")
+    assert RunResultCard.model_validate(payload).dimensions is None
+
+
 def test_a_passed_command_with_everything_confirmed():
     card = _card(passed_all_confirmed())
     command = card.row("ci_command")
@@ -319,6 +351,60 @@ def test_a_run_with_no_pinned_task():
         "this run: 1/1 modules built · 994 executed · 933 passed · 0 failed · 0 errors · "
         "61 skipped · 119 class files · 4 jars"
     )
+
+
+def test_local_measurements_do_not_depend_on_a_task_or_ci_reference():
+    card = _card(no_task())
+    dimensions = card.dimensions
+    assert dimensions.ci_command is None
+    assert dimensions.has_ci_reference is False
+    assert dimensions.build.modules_built == 1
+    assert dimensions.build.class_files == 119
+    assert dimensions.build.jars == 4
+    assert dimensions.tests.counts.executed == 994
+    assert dimensions.tests.counts.skipped == 61
+    assert dimensions.tests.counts.failed == 0
+    wire = card.model_dump(mode="json", by_alias=True)
+    assert wire["dimensions"]["build"]["classFiles"] == 119
+    assert wire["dimensions"]["tests"]["counts"]["executed"] == 994
+    assert RunResultCard.model_validate(wire) == card
+    rail = _workspace_result(wire, None)
+    assert rail.ci_command is None
+    assert rail.ci is None
+
+
+def test_local_tests_do_not_borrow_the_ci_scoped_receipt_total():
+    card = _card(passed_all_confirmed())
+    assert card.dimensions.official_ci.agent_tests_executed == 933
+    assert card.dimensions.tests.counts.executed == 994
+    assert card.dimensions.has_ci_reference is True
+
+
+def test_an_unmatched_supplied_reference_is_distinct_from_no_reference():
+    payload = no_task()
+    payload["ci_comparison"]["target_record_sha256"] = "b" * 64
+    card = _card(payload)
+    assert card.dimensions.official_ci.basis == "unavailable"
+    assert card.dimensions.has_ci_reference is True
+
+
+def test_missing_local_counts_are_not_reported_as_measured_zero():
+    payload = no_task()
+    payload["build_evidence"] = {}
+    payload["test_stats"] = {}
+    card = build_result_card(payload)
+    assert card.dimensions.build.class_files is None
+    assert card.dimensions.build.jars is None
+    assert card.dimensions.build.modules_built is None
+    assert card.dimensions.tests.counts is None
+    assert card.dimensions.tests.fact.status == "unavailable"
+
+
+def test_a_measured_zero_jar_count_is_preserved():
+    metrics = module_metrics()
+    metrics["modules"][0]["jar_count"] = 0
+    card = build_result_card(no_task(), module_metrics=metrics)
+    assert card.dimensions.build.jars == 0
 
 
 def test_the_other_endings_of_a_run():

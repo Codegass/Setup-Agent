@@ -573,7 +573,7 @@ class WorkspaceResult(WebModel):
 
     #: The card's Summary word, derived from the card's lines above it.
     verdict: str
-    #: The card's first line. None when the record has no card to copy it from.
+    #: Prescribed task verification. None when no task was supplied or recorded.
     ci_command: WorkspaceCICommandResult | None = Field(
         default=None,
         validation_alias=AliasChoices("ci_command", "ciCommand"),

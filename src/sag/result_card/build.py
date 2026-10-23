@@ -13,17 +13,21 @@ from sag.result_card.glosses import cited, gloss
 from sag.result_card.models import (
     ROW_ORDER,
     AttentionItem,
+    ResultDimensions,
     ResultRow,
     ResultStats,
     RunResultCard,
 )
 from sag.result_card.rows import (
+    _lower_bounded,
+    build_row,
     ci_command_row,
     coverage_row,
     official_ci_row,
     report_row,
     run_row,
     summary_row,
+    tests_row,
     unconfirmed_row,
 )
 from sag.trajectory.phases import band_finished
@@ -399,6 +403,16 @@ def build_result_card(
         tool_failures=tool_failures,
     )
     command, official, checks, control = _dimensions(sealed)
+    build = sealed.build_evidence
+    tests = sealed.test_stats
+    jar_counts = [
+        item["jar_count"]
+        for item in _mapping(module_metrics).get("modules") or ()
+        if isinstance(item, Mapping)
+        and type(item.get("jar_count")) is int
+        and item["jar_count"] >= 0
+    ]
+    comparison = getattr(sealed, "ci_comparison", None)
     rows = {
         "ci_command": ci_command_row(sealed, command),
         "official_ci": official_ci_row(
@@ -428,6 +442,34 @@ def build_result_card(
         verdict_source=source,
         rows=tuple(rows[key] for key in ROW_ORDER),
         stats=stats,
+        dimensions=ResultDimensions.model_validate(
+            {
+                "ci_command": command.model_dump() if command is not None else None,
+                "official_ci": official.model_dump(),
+                "sag_checks": [check.model_dump() for check in checks],
+                "run_control": control.model_dump(),
+                "build": {
+                    "fact": build_row(sealed, module_metrics=module_metrics),
+                    "modules_built": build.reactor_modules_succeeded,
+                    "modules_total": build.reactor_modules_total,
+                    "class_files": build.compiled_classes,
+                    "jars": sum(jar_counts) if jar_counts else None,
+                },
+                "tests": {
+                    "fact": tests_row(sealed, report_metrics=report_metrics),
+                    # Default zero counts are not evidence of an empty test run.
+                    "counts": tests.unique.model_dump() if tests.unique.executed > 0 else None,
+                    "lower_bound": _lower_bounded(report_metrics),
+                    "raw_executions": tests.raw.executed or None,
+                    "flaky_count": tests.flaky_count,
+                },
+                "has_ci_reference": bool(
+                    official.basis != "unavailable"
+                    or official.cell
+                    or getattr(comparison, "target_record_sha256", None)
+                ),
+            }
+        ),
         attention=_attention(sealed, module_metrics=module_metrics, rows=rows),
         notes=_notes(sealed),
     )

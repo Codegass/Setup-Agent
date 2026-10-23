@@ -324,6 +324,9 @@ class TrajectoryReducer:
         #: set only when the ledger is closed, and stating the difference is
         #: the whole job.
         self._last_sealed_turn_id = 0
+        # Decision bytes and their sequence let a later turn_record correct
+        # the provisional owner, without borrowing a neighbouring turn's gate.
+        self._gate_records: dict[str, tuple[GateInfo, int | None]] = {}
         #: Every counted event of the run, by counter name. The conservation
         #: fence subtracts the OPEN turn's own counts from these, so a call
         #: still in flight is not read as a ledger that does not balance.
@@ -816,6 +819,39 @@ class TrajectoryReducer:
         if turn is None:
             turn = self._open(collector, actor=actor, phase=None)
 
+        stated_gate = _text(payload.get("gate_decision_id"))
+        if stated_gate and stated_gate in self._gate_records:
+            gate, _ = self._gate_records[stated_gate]
+            previous = self._by_decision.get(stated_gate)
+            chain = []
+            cursor = previous.gate if previous is not None else None
+            while (
+                cursor
+                and cursor.decision_id in self._gate_records
+                and cursor.decision_id not in {item.decision_id for item in chain}
+            ):
+                chain.append(cursor)
+                if cursor.decision_id == stated_gate:
+                    break
+                record = self._gate_records.get(cursor.supersedes or "")
+                cursor = record[0] if record else None
+            if not chain or chain[-1].decision_id != stated_gate:
+                chain = [gate]
+            if previous is not None and previous is not turn:
+                # A controller close follows a sealed action. Until this record
+                # arrived, its gate was tentatively attached to that action.
+                if previous.gate == chain[0]:
+                    previous.gate = None
+                for item in chain:
+                    gate_sequence = self._gate_records[item.decision_id][1]
+                    if gate_sequence in previous.control_seq:
+                        previous.control_seq.remove(gate_sequence)
+                collector.touched(previous)
+            for item in reversed(chain):
+                self._by_decision[item.decision_id] = turn
+                turn.touch(self._gate_records[item.decision_id][1])
+            turn.gate = chain[0]
+
         turn.sealed = True
         turn.actor = actor
         turn.stated_envelope = stated_envelope
@@ -1035,7 +1071,12 @@ class TrajectoryReducer:
             word=word,
             decision_id=_text(payload.get("decision_id")),
             supersedes=_text(payload.get("supersedes")),
+            code=_text(payload.get("code")),
+            reason=(_text(payload.get("reason")) or "")[:KEY_RESULTS_MAX_CHARS] or None,
+            accepted=payload.get("expected_accepted") if isinstance(payload.get("expected_accepted"), bool) else None,
         )
+        if gate.decision_id:
+            self._gate_records[gate.decision_id] = (gate, sequence)
         self._attach_gate(collector, gate, sequence, payload.get("phase"), payload)
 
     def _on_gate_outcome_revised(
@@ -1066,7 +1107,12 @@ class TrajectoryReducer:
             word=word,
             decision_id=_text(payload.get("revised_decision_id")),
             supersedes=delivered,
+            code=_text(payload.get("code")),
+            reason=(_text(payload.get("reason")) or "")[:KEY_RESULTS_MAX_CHARS] or None,
+            accepted=payload.get("revised_accepted") if isinstance(payload.get("revised_accepted"), bool) else None,
         )
+        if gate.decision_id:
+            self._gate_records[gate.decision_id] = (gate, sequence)
         owner = self._by_decision.get(delivered) if delivered else None
         if owner is None:
             self._band_gate(gate, payload.get("phase"), payload)

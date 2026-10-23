@@ -136,4 +136,45 @@ describe("TurnRow", () => {
     expect(screen.getByRole("heading", { name: "Tool call" })).toBeInTheDocument()
     expect(screen.getByRole("heading", { name: "Tool result" })).toBeInTheDocument()
   })
+
+  it("shows an automatic close as a status line with inspectable original bytes", () => {
+    const onNeedBytes = vi.fn()
+    const close = turn({ turn_id: 17, phase: "report", actor: "controller", call: null,
+      gate: { word: "success", accepted: true, code: "report_present", decision_id: "gate-report", reason: "Report bytes match the sealed snapshot." },
+      observation: { ref: "output_close" }, control_seq: [106, 107],
+      t0: "2026-10-21T08:44:05.555Z", t1: "2026-10-21T08:44:05.657Z" })
+    const props = { annotations: [], warnings: [], phases: [], turn: close, onNeedBytes }
+    const { rerender } = render(<TurnRow {...props} outputs={null} status="absent" />)
+    const toggle = screen.getByRole("button", { name: "Report verified · automatic event 17 · 102ms" })
+    expect(screen.queryByText("Turn 17")).not.toBeInTheDocument()
+    expect(screen.queryByText("no call")).not.toBeInTheDocument()
+    fireEvent.click(toggle)
+    expect(onNeedBytes).toHaveBeenCalledOnce()
+    expect(screen.getByText("Turn 17 · SAG controller")).toBeInTheDocument()
+    expect(screen.getByText(/106.*107/)).toBeInTheDocument()
+    expect(screen.queryByRole("heading", { name: "Model context" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("heading", { name: "Tool call" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("heading", { name: "Tool result" })).not.toBeInTheDocument()
+    const bytes = "PHASE_CLOSED: the harness closed phase 'report' with validated outcome 'success' (report_present): persisted report bytes match the current sealed snapshot"
+    rerender(<TurnRow {...props} outputs={{ output_close: bytes }} status="ready" />)
+    fireEvent.click(screen.getByRole("button", { name: "output_close" }))
+    expect(screen.getByTestId("ref-output-output_close")).toHaveTextContent(bytes)
+  })
+
+  it.each([
+    [{ word: "failed", accepted: true }, "Report check failed"],
+    [{ word: "partial", accepted: true }, "Report check incomplete"],
+    [{ word: "success", accepted: false }, "Report check not accepted"],
+    [{ word: "success" }, "Report check unresolved"],
+    [null, "Automatic event"],
+  ])("does not promote a failed or unconfirmed automatic check", (gate, label) => {
+    render(row({ actor: "controller", phase: "report", call: null, observation: null, gate }))
+    expect(screen.getByText(label)).toBeInTheDocument()
+    expect(screen.queryByText("Report verified")).not.toBeInTheDocument()
+  })
+
+  it.each(["failed", "refused", "cancelled", "pending"] as const)("retains a controller %s outcome without a call envelope", outcome => {
+    render(row({ actor: "controller", call: null, gate: null, observation: { outcome } }))
+    expect(screen.getByText(`Automatic action ${outcome}`)).toBeInTheDocument()
+  })
 })

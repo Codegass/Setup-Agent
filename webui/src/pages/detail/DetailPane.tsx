@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 
 import type { ExecutionSessionDetail, SubmitTaskResponse, WorkspaceSummary } from "@/api/types"
 import { NewTaskModal } from "@/components/workspace/NewTaskModal"
@@ -38,6 +38,7 @@ function TabBar({
         return (
           <button
             key={tab.id}
+            data-tab={tab.id}
             aria-current={on}
             className={cn(
               "inline-flex shrink-0 items-center gap-2 border-b-2 px-3 py-2.5 text-[13px] font-semibold transition-colors",
@@ -88,10 +89,16 @@ export function DetailPane({
   const tabs = useMemo(() => buildDetailTabs(detail), [detail])
   const tabIds = useMemo(() => tabs.map((tab) => tab.id), [tabs])
   const initial: TabId =
-    initialFacet && tabs.some((t) => t.id === initialFacet)
+    initialFacet === "turns" ? "flow" : initialFacet && tabs.some((t) => t.id === initialFacet)
       ? (initialFacet as TabId)
       : "overview"
   const [active, setActive] = useState<TabId>(initial)
+  const tabsRef = useRef<HTMLDivElement>(null)
+  const openTab = (id: TabId) => {
+    setActive(id)
+    tabsRef.current?.scrollIntoView({ block: "start" })
+    tabsRef.current?.querySelector<HTMLButtonElement>(`button[data-tab="${id}"]`)?.focus({ preventScroll: true })
+  }
 
   // A new session (or one whose tab set no longer contains the active tab) resets
   // the panel back to the requested/default tab.
@@ -119,22 +126,28 @@ export function DetailPane({
         workspace={workspace}
       />
 
-      <div className="shrink-0 bg-card px-5 pb-4 pt-4 sm:px-7">
-        <ResultBand
-          availableTabs={tabIds}
-          card={detail.resultCard}
-          onOpenTab={setActive}
-          snapshotStatus={detail.snapshotStatus}
-        />
-      </div>
-
-      <TabBar active={active} onSelect={setActive} tabs={tabs} />
-
-      <main className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-7">
-        <div className="mx-auto max-w-[1000px]">
-          <TabBody detail={detail} onSubmitTask={onSubmitTask} tabId={active} />
+      <div className="min-h-0 flex-1 overflow-y-auto" key={sessionId}>
+        <div className="bg-card px-5 pb-5 pt-5 sm:px-7">
+          <div className="mx-auto max-w-[1000px]">
+            <ResultBand
+              availableTabs={tabIds}
+              card={detail.resultCard}
+              onOpenTab={openTab}
+              snapshotStatus={detail.snapshotStatus}
+            />
+          </div>
         </div>
-      </main>
+
+        <div ref={tabsRef} className="sticky top-0 z-10">
+          <TabBar active={active} onSelect={setActive} tabs={tabs} />
+        </div>
+
+        <main className="min-h-[calc(100%-3rem)] px-5 py-6 sm:px-7">
+          <div className="mx-auto max-w-[1000px]">
+            <TabBody detail={detail} onOpenFlow={() => openTab("flow")} onSubmitTask={onSubmitTask} tabId={active} />
+          </div>
+        </main>
+      </div>
 
       {panel ? (
         <WorkspacePanel kind={panel} latest={detail} onClose={() => setPanel(null)} workspace={workspace} />

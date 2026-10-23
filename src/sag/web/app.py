@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from sag import __version__
-from sag.trajectory.builder import build_trajectory, read_call_envelope
+from sag.trajectory.builder import build_trajectory, read_call_envelope, read_output_ref
 from sag.trajectory.schema import DETAIL_TIERS
 from sag.web.launch_queue import WorkspaceBusyError
 from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchValidationError
@@ -270,6 +270,23 @@ def create_app(
         elif since is not None:
             document["turns"] = [turn for turn in document["turns"] if turn["turn_id"] > since]
         return document
+
+    @app.get("/api/sessions/{session_id}/outputs/{output_ref}")
+    def get_session_output(session_id: str, output_ref: str) -> dict:
+        """Read one full output without the bounded context-trace payload cap."""
+        try:
+            session_dir = builder.session_dir(session_id)
+        except UnattributableSessionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}") from exc
+        try:
+            content = read_output_ref(session_dir, output_ref)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Session directory is gone") from exc
+        if content is None:
+            raise HTTPException(status_code=404, detail=f"Output not recorded: {output_ref}")
+        return {"ref": output_ref, "content": content}
 
     @app.get("/api/sessions/{session_id}/trajectory/envelopes/{envelope_id}")
     def get_session_trajectory_envelope(session_id: str, envelope_id: str) -> dict:

@@ -122,6 +122,9 @@ class GateInfo(_TrajectoryModel):
     word: str
     decision_id: str | None = None
     supersedes: str | None = None
+    code: str | None = None
+    reason: str | None = Field(default=None, max_length=KEY_RESULTS_MAX_CHARS)
+    accepted: bool | None = None
 
 
 class TokenUsage(_TrajectoryModel):
@@ -129,6 +132,14 @@ class TokenUsage(_TrajectoryModel):
 
     input: int
     output: int
+
+
+class AdvisorInfo(_TrajectoryModel):
+    """Settings read from this consultation's archived provider requests."""
+
+    model: str | None = None
+    effort: str | None = None
+    request_refs: list[str] = Field(default_factory=list)
 
 
 class Turn(_TrajectoryModel):
@@ -162,6 +173,7 @@ class Turn(_TrajectoryModel):
     #: the run was never billed for as one thing, and would hide which of the
     #: two models a run's spend actually went to.
     advisor_tokens: TokenUsage | None = None
+    advisor: AdvisorInfo | None = None
     t0: str | None = None
     t1: str | None = None
     control_seq: list[int] = Field(default_factory=list)

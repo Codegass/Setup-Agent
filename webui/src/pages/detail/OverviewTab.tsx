@@ -106,7 +106,7 @@ function AttentionRow({ item }: { item: AttentionItem }) {
  * measure — a run with no card at all says that, rather than rendering an
  * empty shape.
  */
-export function OverviewTab({ detail }: { detail: ExecutionSessionDetail }) {
+export function OverviewTab({ detail, onOpenFlow }: { detail: ExecutionSessionDetail; onOpenFlow?: () => void }) {
   const card = detail.resultCard
   const modules = detail.modules ?? []
   const ms = detail.moduleSummary
@@ -189,8 +189,13 @@ export function OverviewTab({ detail }: { detail: ExecutionSessionDetail }) {
         // off the screen on every run checked against a live API. Stated in
         // full — it is the instruction this run was given.
         <section className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3">
-          <div className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">
-            Goal
+          <div className="flex items-center justify-between gap-3">
+            <span className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">Goal</span>
+            {onOpenFlow ? (
+              <button type="button" className="text-[12px] font-semibold text-primary hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring" onClick={onOpenFlow}>
+                View flow <span aria-hidden="true">→</span>
+              </button>
+            ) : null}
           </div>
           <p className="mt-1 text-[13px] leading-relaxed text-foreground">{goal}</p>
         </section>

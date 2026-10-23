@@ -42,16 +42,7 @@ interface Series {
   drawn?: (columns: SparkColumn[]) => boolean
 }
 
-/**
- * One ink for data, and the status palette left alone.
- *
- * These are two measures, not two series: each plot holds one series and names
- * it, so colour carries no identity here and a second hue would only invite the
- * reader to look for a meaning it does not have. The status colours the app
- * reserves stay reserved — `status-failed` marks an anomaly, which is a state,
- * and it never doubles as "the other measure".
- */
-const INK = "fill-primary"
+// Violet identifies Advisor throughout Flow; outcome colours retain their meaning.
 
 /** Exact counts belong in the title a reader hovers, not in a 6px column. */
 function tokenCount(value: number, noun = "tokens"): string {
@@ -119,6 +110,8 @@ function Plot({
   series,
   hoveredTurn,
   onHoverTurn,
+  onSelectTurn,
+  selectedTurn,
 }: {
   columns: SparkColumn[]
   series: Series
@@ -128,6 +121,8 @@ function Plot({
   /** Called with the turn and the column's own box, so the panel can be put
    *  under the column it is about rather than under the pointer. */
   onHoverTurn: (turnId: number | null, box?: DOMRect) => void
+  onSelectTurn?: (turnId: number) => void
+  selectedTurn?: number | null
 }) {
   const peak = peakColumn(columns, series.value)
   const peakValue = peak?.value ?? null
@@ -138,17 +133,18 @@ function Plot({
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-        <span className="text-[11px] font-semibold text-foreground">{series.label}</span>
-        <span className="text-[10.5px] text-muted-foreground">{series.detail}</span>
+        <span title={series.detail} className={cn("text-[11px] font-semibold", series.key === "advisor" ? "text-advisor" : "text-foreground")}>{series.label}</span>
       </div>
       <div className="flex items-end gap-2">
         <svg
           aria-label={series.label}
-          className="shrink-0"
+          className="min-w-0 flex-1"
+          style={{ minWidth: width }}
           height={PLOT}
           onMouseLeave={() => onHoverTurn(null)}
-          role="img"
+          role={onSelectTurn ? "group" : "img"}
           viewBox={`0 0 ${width} ${PLOT}`}
+          preserveAspectRatio="none"
           width={width}
         >
           {columns.map((column, index) => {
@@ -178,7 +174,7 @@ function Plot({
               <Fragment key={column.turnId}>
                 <rect
                   className={cn(
-                    stated ? INK : "fill-muted-foreground/35",
+                    stated ? series.key === "advisor" ? "fill-advisor" : "fill-primary" : "fill-muted-foreground/35",
                     faded && "opacity-30",
                   )}
                   data-bar={column.turnId}
@@ -190,11 +186,31 @@ function Plot({
                 />
                 <rect
                   data-hit={column.turnId}
+                  role={onSelectTurn ? "button" : undefined}
+                  tabIndex={onSelectTurn ? (selectedTurn ?? columns[0]?.turnId) === column.turnId ? 0 : -1 : undefined}
+                  aria-label={onSelectTurn ? `Show turn ${column.turnId} · ${column.phase} · ${column.tool ?? "engine"}` : undefined}
+                  aria-pressed={onSelectTurn ? selectedTurn === column.turnId : undefined}
+                  className={onSelectTurn ? "cursor-pointer focus:stroke-ring focus:stroke-2 focus:outline-none" : undefined}
                   fill="transparent"
                   height={PLOT}
                   onMouseEnter={(event) =>
                     onHoverTurn(column.turnId, event.currentTarget.getBoundingClientRect())
                   }
+                  onFocus={event => onHoverTurn(column.turnId, event.currentTarget.getBoundingClientRect())}
+                  onBlur={() => onHoverTurn(null)}
+                  onClick={() => { onHoverTurn(null); onSelectTurn?.(column.turnId) }}
+                  onKeyDown={event => {
+                    if (!onSelectTurn) return
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault()
+                      onHoverTurn(null)
+                      onSelectTurn(column.turnId)
+                    } else if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+                      event.preventDefault()
+                      const next = event.key === "Home" ? 0 : event.key === "End" ? columns.length - 1 : Math.max(0, Math.min(columns.length - 1, index + (event.key === "ArrowRight" ? 1 : -1)))
+                      event.currentTarget.parentElement?.querySelector<SVGElement>(`[data-hit="${columns[next].turnId}"]`)?.focus()
+                    }
+                  }}
                   width={PITCH}
                   x={x}
                   y={0}
@@ -212,7 +228,7 @@ function Plot({
             Splitting them keeps each plot's own number beside its own plot, so
             comparing tokens against seconds does not mean reading a tooltip
             twice. Let go and both return to the peak. */}
-        <div className="flex min-w-0 flex-col leading-tight">
+        <div className="flex w-32 shrink-0 flex-col leading-tight">
           <span className="font-mono text-[10.5px] text-foreground">
             {hovered
               ? hoveredValue == null
@@ -222,7 +238,7 @@ function Plot({
                 ? "—"
                 : series.format(peakValue)}
           </span>
-          <span className="whitespace-nowrap text-[10px] text-muted-foreground">
+          <span className="truncate text-[10px] text-muted-foreground">
             {hovered
               ? `Turn ${hovered.turnId}${
                   hoveredValue == null
@@ -326,7 +342,7 @@ function TurnPanel({ column }: { column: SparkColumn }) {
   )
 }
 
-export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
+export function TurnSparkline({ doc, onSelectTurn, selectedTurn }: { doc: TrajectoryDocument; onSelectTurn?: (turnId: number) => void; selectedTurn?: number | null }) {
   // Held here rather than in each plot: the strips are drawn on one set of
   // columns and the docstring above promises they are aligned turn-for-turn, so
   // pointing at a turn should name that turn everywhere it appears.
@@ -441,6 +457,8 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
               key={series.key}
               onHoverTurn={point}
               series={series}
+              onSelectTurn={onSelectTurn}
+              selectedTurn={selectedTurn}
             />
           ))}
         </div>
@@ -453,11 +471,10 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
           <TurnPanel column={pointed} />
         </div>
       ) : null}
-      <p className="mt-2 text-[10.5px] leading-relaxed text-muted-foreground">
-        Blue columns are stated values. Gray ticks mean no value is attributed to that turn.
-        Tokens are recorded once per model response; advisor tokens are what a consult itself
-        cost and are never added to them; duration is elapsed time for the turn.
-      </p>
+      <details className="mt-2 text-[10.5px] text-muted-foreground">
+        <summary className="cursor-pointer">How usage is counted{onSelectTurn ? " · select a column to open its step" : ""}</summary>
+        <p className="mt-1 leading-relaxed">Gray ticks mean no value is attributed to that turn. Actor tokens are recorded once per model response. Advisor tokens are counted separately. Action duration excludes model response time.</p>
+      </details>
     </figure>
   )
 }

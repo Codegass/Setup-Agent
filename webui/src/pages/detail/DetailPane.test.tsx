@@ -1,9 +1,15 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
 
 import { DetailPane } from "./DetailPane"
+
+beforeEach(() => {
+  // jsdom has no layout or scrolling. Actual viewport behavior is checked in
+  // the browser; this spy also lets navigation tests verify the intent.
+  HTMLElement.prototype.scrollIntoView = vi.fn()
+})
 
 // xterm.js needs a real browser; stub the terminal body so jsdom doesn't crash
 // (mirrors the repo-wide pattern in App.test.tsx). The dialog title under test
@@ -192,7 +198,45 @@ describe("DetailPane", () => {
     expect(screen.getByRole("button", { name: /^Overview/ })).toHaveAttribute("aria-current", "false")
   })
 
-  it("opens the turns from the result band's Run row", async () => {
+  it("opens Flow without requiring CI data and offers one process tab", () => {
+    render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
+    const flow = screen.getByRole("button", { name: "Flow" })
+    fireEvent.click(flow)
+    expect(flow).toHaveAttribute("aria-current", "true")
+    expect(screen.getByText("Flow is not available for this run.")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Turns" })).not.toBeInTheDocument()
+  })
+
+  it("supports Flow links and opens action details from the phase timeline", () => {
+    const withFlow: ExecutionSessionDetail = {
+      ...detail,
+      context: {
+        trunk: { goal: "Build and test this project", state: "completed", progress: { done: 1, total: 1 }, summary: "" },
+        phases: [{
+          id: "build-phase", name: "build", title: "Build the project", status: "completed", refs: [], progress: {},
+          tasks: [{ id: "build-task", title: "Compile sources", status: "completed", iterations: [{
+            sequence: 1, iteration: 1, thoughts: [],
+            actions: [{ toolName: "maven", success: true, output: "BUILD SUCCESS", observation: "Compiled sources.", refs: [] }],
+          }] }],
+        }],
+        debug: {},
+      },
+    }
+    render(<DetailPane workspace={workspace} detail={withFlow} initialFacet="flow" {...handlers} />)
+    expect(screen.getByRole("button", { name: "Flow" })).toHaveAttribute("aria-current", "true")
+    expect(screen.getByRole("heading", { name: "build" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "maven · success · details" }))
+    expect(screen.getByRole("dialog", { name: "maven" })).toBeInTheDocument()
+    expect(within(screen.getByRole("dialog")).getByText("BUILD SUCCESS")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+
+    fireEvent.click(screen.getByRole("button", { name: "Overview" }))
+    fireEvent.click(screen.getByRole("button", { name: "View flow" }))
+    expect(screen.getByRole("button", { name: "Flow" })).toHaveAttribute("aria-current", "true")
+    expect(screen.getByRole("button", { name: "Flow" })).toHaveFocus()
+  })
+
+  it("opens Flow from the result band's Run row", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -211,7 +255,7 @@ describe("DetailPane", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind Run" }))
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /^Turns/ })).toHaveAttribute(
+      expect(screen.getByRole("button", { name: /^Flow/ })).toHaveAttribute(
         "aria-current",
         "true",
       ),
@@ -229,6 +273,8 @@ describe("DetailPane", () => {
 
     fireEvent.click(row)
     expect(tab).toHaveAttribute("aria-current", "true")
+    expect(tab).toHaveFocus()
+    expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledWith({ block: "start" })
     expect(screen.getByText("no cell in the workflow matched this run")).toBeInTheDocument()
   })
 

@@ -92,6 +92,14 @@ export function fetchTrajectory(
   )
 }
 
+/** Read one output, including refs carried by Flow rather than by Turns. */
+export async function fetchSessionOutput(sessionId: string, ref: string): Promise<string> {
+  const result = await getJson<{ ref: string; content: string }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/outputs/${encodeURIComponent(ref)}`,
+  )
+  return result.content
+}
+
 /** Resolve the exact parameters for one call named by a trajectory turn. */
 export function fetchTrajectoryEnvelope(
   sessionId: string,

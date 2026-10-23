@@ -127,8 +127,8 @@ describe("TrajectoryTab", () => {
     expect(fetchMock).toHaveBeenLastCalledWith(
       "/api/sessions/S1/trajectory?detail=summary&since_seq=3",
     )
-    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("iter 1")
-    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("3·4·6")
+    expect(screen.getByTestId("turn-row-1").closest("[data-flow-iteration]")).toHaveAttribute("data-flow-iteration", "1")
+    expect(screen.getByTestId("turn-row-1")).toHaveAttribute("data-control-seq", "3·4·6")
     expect(screen.queryByText("missing_tool_result")).not.toBeInTheDocument()
   })
 
@@ -201,7 +201,7 @@ describe("TrajectoryTab", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(fetchMock).toHaveBeenLastCalledWith("/api/sessions/S1/trajectory?detail=summary")
     expect(screen.queryByText(/no turn has been billed yet/i)).not.toBeInTheDocument()
-    expect(screen.getByText("4.2k")).toBeInTheDocument()
+    expect(screen.getAllByText("4.2k").length).toBeGreaterThan(0)
   })
 
   it("reloads whole on demand even when the answer lands behind the ledger held", async () => {
@@ -225,12 +225,12 @@ describe("TrajectoryTab", () => {
 
     render(<TrajectoryTab live={false} sessionId="S1" />)
     await settle()
-    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("iter 4")
+    expect(screen.getByTestId("turn-row-1").closest("[data-flow-iteration]")).toHaveAttribute("data-flow-iteration", "4")
 
     fireEvent.click(screen.getByRole("button", { name: /reload whole/i }))
     await settle()
 
-    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("iter 1")
+    expect(screen.getByTestId("turn-row-1").closest("[data-flow-iteration]")).toHaveAttribute("data-flow-iteration", "1")
     expect(screen.getByText("missing_tool_result")).toBeInTheDocument()
   })
 
@@ -328,8 +328,8 @@ describe("TrajectoryTab", () => {
     await settle()
 
     expect(screen.getByRole("button", { name: /^Turn 2/ })).toBeInTheDocument()
-    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("1·2·3")
-    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("iter 4")
+    expect(screen.getByTestId("turn-row-1")).toHaveAttribute("data-control-seq", "1·2·3")
+    expect(screen.getByTestId("turn-row-1").closest("[data-flow-iteration]")).toHaveAttribute("data-flow-iteration", "4")
     expect(screen.queryByText("missing_tool_result")).not.toBeInTheDocument()
     // …and the bytes the reader was waiting for still landed.
     fireEvent.click(screen.getByRole("button", { name: /output_1/ }))

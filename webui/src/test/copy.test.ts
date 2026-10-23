@@ -109,8 +109,6 @@ describe("user-visible copy", () => {
       "TestCard",
       "FacetTabs",
       "ContextTrace",
-      "FlowTab",
-      "ActionDetailModal",
       "FilesDigest",
       "VerdictBand",
       "scrollSpy",

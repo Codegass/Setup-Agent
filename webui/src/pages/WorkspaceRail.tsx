@@ -46,7 +46,7 @@ function redCount(tests: NonNullable<WorkspaceResult["tests"]>): number {
   return tests.failed + tests.errors
 }
 
-/** How the CI command cell reads: the card's own word, coloured like the row. */
+/** The supplied task's own result, coloured like its result-card row. */
 const COMMAND_TONE: Record<string, string> = {
   passed: "text-status-success",
   failed: "text-status-failed",
@@ -56,13 +56,11 @@ const COMMAND_TONE: Record<string, string> = {
 
 /**
  * One row's whole result: the card's Summary word for the run, the card's
- * first line (whether the pinned CI command passed), how the tests came out,
- * and the Official CI word.
+ * supplied task (when present), local test counts, and optional CI comparison.
  *
  * Every cell is copied from `workspace.result`, which the API reads off the
- * run's own card and record. A cell the run did not measure is a dash — there
- * is no zero to fall back on — and a run with no result at all says that once
- * rather than four times.
+ * run's own card and record. An unmeasured test count stays a dash. Optional
+ * task and CI inputs do not leave placeholders when they were not supplied.
  */
 function ResultStrip({ result }: { result: WorkspaceResult | null | undefined }) {
   if (!result) {
@@ -80,15 +78,15 @@ function ResultStrip({ result }: { result: WorkspaceResult | null | undefined })
       {result.ciCommand ? (
         <span
           className={cn(COMMAND_TONE[result.ciCommand.status] ?? "text-muted-foreground")}
-          title={`CI command: ${result.ciCommand.headline}`}
+          title={`Task verification: ${result.ciCommand.headline}`}
         >
           {result.ciCommand.status}
         </span>
-      ) : (
+      ) : result.task ? (
         <span className="text-muted-foreground" title="Required task steps completed">
-          {result.task ? `${result.task.completed}/${result.task.required}` : "—"}
+          {`${result.task.completed}/${result.task.required}`}
         </span>
-      )}
+      ) : null}
       <span className="text-muted-foreground" title="Tests passed of tests executed">
         {tests ? `${tests.passed.toLocaleString()}/${tests.executed.toLocaleString()}` : "—"}
       </span>
@@ -97,9 +95,9 @@ function ResultStrip({ result }: { result: WorkspaceResult | null | undefined })
           {`+${red.toLocaleString()}`}
         </span>
       ) : null}
-      <span className="text-muted-foreground" title="How this run measures against the project's own CI">
-        {result.ci ? result.ci.status : "—"}
-      </span>
+      {result.ci ? <span className="text-muted-foreground" title="How this run measures against the project's own CI">
+        {result.ci.status}
+      </span> : null}
     </span>
   )
 }
@@ -113,18 +111,18 @@ function resultClause(result: WorkspaceResult | null | undefined): string {
   const parts = [
     `summary ${result.verdict}`,
     result.ciCommand
-      ? `CI command ${result.ciCommand.status}: ${result.ciCommand.headline}`
+      ? `task verification ${result.ciCommand.status}: ${result.ciCommand.headline}`
       : result.task
         ? `required task ${result.task.completed}/${result.task.required}`
-        : "required task not recorded",
+        : null,
     tests
       ? `tests ${tests.passed.toLocaleString()}/${tests.executed.toLocaleString()}${
           red > 0 ? `, ${red.toLocaleString()} failed or errored` : ""
         }`
       : "tests not recorded",
-    result.ci ? `official CI ${result.ci.status}` : "official CI not recorded",
+    result.ci ? `official CI ${result.ci.status}` : null,
   ]
-  return ` — ${parts.join(", ")}`
+  return ` — ${parts.filter(Boolean).join(", ")}`
 }
 
 const DOT_TONE: Record<string, string> = {

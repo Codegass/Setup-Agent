@@ -317,6 +317,68 @@ export interface AttentionItem {
   refs?: string[]
 }
 
+/** Sealed measurements, with the card API's camelCase aliases. Missing values
+ *  remain null: charts must never turn an unmeasured count into zero. */
+export interface LocalResultRow extends Omit<ResultRow, "key"> {
+  key: "build" | "tests"
+}
+
+export interface ResultDimensions {
+  build?: {
+    fact: LocalResultRow
+    modulesBuilt: number | null
+    modulesTotal: number | null
+    classFiles: number | null
+    jars: number | null
+  } | null
+  tests?: {
+    fact: LocalResultRow
+    counts: { executed: number; passed: number; failed: number; errors: number; skipped: number } | null
+    lowerBound: boolean
+    rawExecutions: number | null
+    flakyCount: number
+  } | null
+  hasCiReference?: boolean | null
+  ciCommand: {
+    result: "passed" | "failed" | "not_finished" | "unavailable"
+    stepsPassed: number
+    stepsTotal: number
+    firstUnpassedStep: {
+      id: string
+      status: "failed" | "missing" | "out_of_order" | "unavailable"
+      exitCode: number | null
+    } | null
+    toolchainAsPinned: "yes" | "no" | "unavailable"
+    pinnedJava: number[]
+    pinnedMaven: string[]
+    toolchainReason: string | null
+    sourceUnchanged: "yes" | "no" | "unavailable"
+    sourceDetail: string | null
+  } | null
+  officialCi: {
+    basis: "ci-target cell summary" | "unavailable"
+    reason: string | null
+    cell: string | null
+    ciTestsExecuted: number | null
+    ciTestsRed: number | null
+    ciModules: string[] | null
+    agentTestsExecuted: number | null
+    agentModulesBuilt: string[] | null
+    agentFailures: number | null
+    agentErrors: number | null
+  }
+  sagChecks: {
+    check: "java requirement decided" | "built modules confirmed" | "test outcome graded" | "test reports tied to the command"
+    confirmed: boolean
+    reason: string | null
+  }[]
+  runControl: {
+    ended: "normally" | "time_limit" | "job_control_failure" | "aborted"
+    commandsStillRunning: number
+    detail: string | null
+  }
+}
+
 export interface ResultCard {
   schemaVersion: 1
   runId: string
@@ -329,6 +391,7 @@ export interface ResultCard {
   verdictSource: "snapshot" | "legacy" | "unavailable"
   rows: ResultRow[]
   stats: ResultStats
+  dimensions?: ResultDimensions | null
   attention: AttentionItem[]
   notes: string[]
 }
@@ -657,6 +720,9 @@ export interface TrajectoryGate {
   word: string
   decision_id?: string | null
   supersedes?: string | null
+  code?: string | null
+  reason?: string | null
+  accepted?: boolean | null
 }
 
 export interface TrajectoryTokens {
@@ -681,6 +747,8 @@ export interface TrajectoryTurn {
    *  field, never folded into `tokens`: that is what the run paid for THIS
    *  model's response, and a turn that asked for advice was charged both. */
   advisor_tokens?: TrajectoryTokens | null
+  /** Actual archived request settings, never inferred from current defaults. */
+  advisor?: { model?: string | null; effort?: string | null; request_refs: string[] } | null
   t0?: string | null
   t1?: string | null
   control_seq: number[]

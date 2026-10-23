@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight } from "lucide-react"
+import { Check, ChevronDown, ChevronRight, CircleHelp, CircleX, Info } from "lucide-react"
 import { useState } from "react"
 
 import { fetchTrajectoryEnvelope } from "@/api/client"
@@ -20,8 +20,9 @@ import {
   unresolvedRefs,
 } from "@/lib/trajectory"
 import { cn } from "@/lib/utils"
+import type { FlowAction } from "@/lib/flow-usage"
 
-import type { BytesStatus } from "./RefDescent"
+import { RefDescent, type BytesStatus } from "./RefDescent"
 import { TurnQuad, type EnvelopeStatus } from "./TurnQuad"
 
 interface EnvelopeState {
@@ -65,6 +66,27 @@ const OUTCOME_CHIP: Record<NonNullable<TrajectoryObservation["outcome"]>, string
 function durationLabel(turn: TrajectoryTurn): string | null {
   const ms = turnDurationMs(turn)
   return ms === null ? null : formatDuration(ms)
+}
+
+function automaticStatus(turn: TrajectoryTurn) {
+  const phase = turn.phase === "unknown" ? "Automatic" : turn.phase[0].toUpperCase() + turn.phase.slice(1)
+  const gate = turn.gate
+  if (!gate) {
+    const outcome = turn.observation?.outcome
+    if (outcome === "failed") return { label: "Automatic action failed", Icon: CircleX, tone: "text-status-failed" }
+    if (outcome === "refused" || outcome === "cancelled") return { label: `Automatic action ${outcome}`, Icon: CircleHelp, tone: "text-status-attention" }
+    if (outcome === "pending") return { label: "Automatic action pending", Icon: Info, tone: "text-status-running" }
+    return { label: "Automatic event", Icon: Info, tone: "text-muted-foreground" }
+  }
+  if (gate.accepted === false) return { label: `${phase} check not accepted`, Icon: CircleHelp, tone: "text-status-attention" }
+  if (gate.word === "failed") return { label: `${phase} check failed`, Icon: CircleX, tone: "text-status-failed" }
+  if (gate.word === "partial") return { label: `${phase} check incomplete`, Icon: CircleHelp, tone: "text-status-attention" }
+  if (gate.accepted === true && gate.word === "success") return {
+    label: turn.phase === "report" && gate.code === "report_present" ? "Report verified" : `${phase} check passed`,
+    Icon: Check,
+    tone: "text-status-success",
+  }
+  return { label: `${phase} check unresolved`, Icon: CircleHelp, tone: "text-muted-foreground" }
 }
 
 /** The gate word, and the chain it replaced when it replaced one. The chain is
@@ -144,6 +166,9 @@ export function TurnRow({
   status,
   onNeedBytes,
   sessionId,
+  compact = false,
+  sourceAction,
+  onOpenAction,
 }: {
   turn: TrajectoryTurn
   phases: TrajectoryPhase[]
@@ -153,10 +178,14 @@ export function TurnRow({
   status: BytesStatus
   onNeedBytes?: () => void
   sessionId?: string
+  compact?: boolean
+  sourceAction?: FlowAction
+  onOpenAction?: (action: FlowAction, trigger: HTMLButtonElement) => void
 }) {
   const [open, setOpen] = useState(false)
   const [envelopeState, setEnvelopeState] = useState<EnvelopeState | null>(null)
   const controller = turn.actor === "controller"
+  const advisor = turn.call?.tool === "advisor"
   const recurrence = recurrenceCount(annotations)
   const marks = anomalies(annotations)
   const quadId = `turn-quad-${turn.turn_id}`
@@ -213,22 +242,65 @@ export function TurnRow({
     setOpen((value) => !value)
   }
 
+  // A controller event without a call is an inline checkpoint. It retains its
+  // ledger identity and bytes, but has no model-context/tool-call panels.
+  if (controller && !turn.call) {
+    const { label, Icon, tone } = automaticStatus(turn)
+    const refs = [...new Set([turn.observation?.ref, turn.observation?.evidence_ref].filter((ref): ref is string => !!ref))]
+    return <article data-actor="controller" data-kind="automatic-event"
+      data-control-seq={formatSeq(turn.control_seq)} data-testid={`turn-row-${turn.turn_id}`}>
+      <button type="button" aria-expanded={open} aria-controls={quadId}
+        aria-label={`${label} · automatic event ${turn.turn_id}${duration ? ` · ${duration}` : ""}`}
+        onClick={toggle}
+        className="flex min-h-9 w-full items-center gap-2 rounded-md px-3 py-1.5 text-left hover:bg-accent/60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring">
+        <Icon size={15} aria-hidden="true" className={cn("shrink-0", tone)} />
+        <span className="min-w-0 flex-1 text-[12px] font-medium text-foreground">{label}</span>
+        {warnings.length || marks.length ? <span className="text-[11px] text-status-attention">Record warning</span> : null}
+        {duration ? <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">{duration}</span> : null}
+        {open ? <ChevronDown size={14} aria-hidden="true" className="shrink-0 text-muted-foreground" /> : <ChevronRight size={14} aria-hidden="true" className="shrink-0 text-muted-foreground" />}
+      </button>
+      {open ? <div id={quadId} className="space-y-2 px-3 pb-2 pt-1 text-[11.5px]">
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground">
+          <span>{`Turn ${turn.turn_id} · SAG controller`}</span>
+          <span className="font-mono">Control sequence: {formatSeq(turn.control_seq)}</span>
+        </div>
+        {turn.gate?.reason ? <p className="whitespace-pre-wrap break-words text-foreground">{turn.gate.reason}</p> : null}
+        {turn.observation?.summary ? <p className="whitespace-pre-wrap break-words text-foreground">{turn.observation.summary}</p> : null}
+        {turn.observation?.error_code ? <p className="break-all font-mono text-status-attention">{turn.observation.error_code}</p> : null}
+        {turn.gate ? <div className="flex flex-wrap gap-x-3 gap-y-1 break-all font-mono text-[11px] text-muted-foreground">
+          <span>{turn.gate.word}</span>
+          {turn.gate.code ? <span>{turn.gate.code}</span> : null}
+          {turn.gate.decision_id ? <span>{turn.gate.decision_id}</span> : null}
+        </div> : null}
+        {turn.gate?.supersedes ? <GateBadge turn={turn} phases={phases} /> : null}
+        {turn.t0 || turn.t1 ? <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 font-mono text-[11px] text-muted-foreground">
+          <dt>Start</dt><dd className="break-all">{turn.t0 ?? "not recorded"}</dd>
+          <dt>End</dt><dd className="break-all">{turn.t1 ?? "not recorded"}</dd>
+        </dl> : null}
+        {refs.length ? refs.map(ref => <RefDescent key={ref} label="Recorded message" refName={ref} outputs={outputs} status={status} />) : <p className="text-muted-foreground">No recorded message is available.</p>}
+        {marks.map(mark => <p key={`${mark.kind}-${mark.label}`} className="text-status-attention">{mark.label}: {mark.detail}</p>)}
+        {warnings.map((warning, index) => <p key={`${warning.code}-${index}`} className="text-status-attention"><span className="font-mono">{warning.code}</span>: {warning.detail}</p>)}
+      </div> : null}
+    </article>
+  }
+
   return (
     <article
       className={cn(
         "rounded-lg border px-3 py-2",
-        controller
-          ? "border-dashed border-status-attention-border bg-status-attention-soft/40"
+        advisor ? "border-advisor/25 bg-advisor-soft" : controller
+          ? "border-dashed border-border bg-muted/40"
           : "border-border bg-card",
       )}
       data-actor={turn.actor}
+      data-control-seq={formatSeq(turn.control_seq)}
       data-testid={`turn-row-${turn.turn_id}`}
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <button
           aria-controls={quadId}
           aria-expanded={open}
-          className="inline-flex min-w-0 items-center gap-2 text-left"
+          className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-sm text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
           onClick={toggle}
           type="button"
         >
@@ -244,18 +316,18 @@ export function TurnRow({
               calls it. "controller" is the ledger's word for the same actor;
               a reader who has never read the ledger should not have to learn
               it to see who acted. */}
-          <span
+          {!advisor ? <span
             className={cn(
               "rounded-full px-2 py-0.5 text-[10.5px] font-semibold uppercase tracking-[0.06em]",
               controller
-                ? "bg-status-attention-soft text-status-attention"
+                ? "bg-accent text-muted-foreground"
                 : "bg-accent text-muted-foreground",
             )}
           >
             {controller ? "engine" : turn.actor}
-          </span>
+          </span> : null}
           {turn.call ? (
-            <span className="truncate font-mono text-[12px] text-foreground">
+            <span className={cn("shrink-0 font-mono text-[12px]", advisor ? "font-semibold text-advisor" : "text-primary")}>
               {turn.call.tool}
             </span>
           ) : (
@@ -315,7 +387,7 @@ export function TurnRow({
               {turn.observation.error_code}
             </span>
           ) : null}
-          {turn.observation?.failure_signature ? (
+          {!compact && turn.observation?.failure_signature ? (
             <span
               className="max-w-[22rem] truncate rounded-full border border-border bg-muted px-2 py-0.5 font-mono text-[10.5px] text-muted-foreground"
               title="failure signature"
@@ -335,7 +407,7 @@ export function TurnRow({
         </div>
 
         <div className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-1">
-          {turn.iteration != null ? (
+          {!compact && turn.iteration != null ? (
             <span className="font-mono text-[10.5px] text-muted-foreground">
               {`iter ${turn.iteration}`}
             </span>
@@ -345,12 +417,12 @@ export function TurnRow({
               the name of the model that sent it. Side by side and unlabelled
               they read as one measure stated twice; added together they are a
               bill nobody was ever sent. */}
-          {turn.tokens ? (
+          {!compact && turn.tokens ? (
             <span className="font-mono text-[10.5px] text-muted-foreground">
               {`model ${turn.tokens.input} in / ${turn.tokens.output} out`}
             </span>
           ) : null}
-          {turn.advisor_tokens ? (
+          {!compact && turn.advisor_tokens ? (
             <span className="font-mono text-[10.5px] text-muted-foreground">
               {`advisor ${turn.advisor_tokens.input} in / ${turn.advisor_tokens.output} out`}
             </span>
@@ -358,14 +430,19 @@ export function TurnRow({
           {duration ? (
             <span className="font-mono text-[10.5px] text-muted-foreground">{duration}</span>
           ) : null}
-          <span className="font-sans text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
+          {!compact ? <><span className="font-sans text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
             seq
           </span>
           <span className="font-mono text-[10.5px] text-foreground">
             {formatSeq(turn.control_seq)}
-          </span>
+          </span></> : null}
+          {sourceAction && onOpenAction ? <button type="button" aria-label={`${sourceAction.toolName} · ${sourceAction.success === true ? "success" : sourceAction.success === false ? "failed" : "not recorded"} · details`} className={cn("rounded-sm text-[11px] underline underline-offset-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring", advisor ? "text-advisor" : "text-primary")} onClick={e => onOpenAction(sourceAction, e.currentTarget)}>Output</button> : null}
         </div>
       </div>
+      {advisor ? <div className="mt-1.5 flex flex-wrap gap-x-2 font-mono text-[11px] text-advisor">
+        <span>{turn.advisor?.model ?? "Model not recorded"}</span>
+        <span>· {turn.advisor?.effort ? `${turn.advisor.effort} effort` : "Effort not recorded"}</span>
+      </div> : null}
 
       {warnings.length ? (
         <ul className="mt-1.5 space-y-0.5">
@@ -382,6 +459,7 @@ export function TurnRow({
 
       {open ? (
         <div className="mt-2.5" id={quadId}>
+          {compact ? <p className="mb-2 font-mono text-[10.5px] text-muted-foreground">Control sequence: <span>{formatSeq(turn.control_seq)}</span></p> : null}
           <TurnQuad
             envelope={callEnvelopeState?.envelope ?? null}
             envelopeError={callEnvelopeState?.error ?? null}

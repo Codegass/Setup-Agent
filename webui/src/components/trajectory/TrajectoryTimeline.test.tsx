@@ -93,6 +93,8 @@ describe("TrajectoryTimeline", () => {
 
     expect(screen.getByRole("button", { name: /^Turn 1/ })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: /^Turn 2/ })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
+    fireEvent.click(screen.getByRole("button", { name: /^Turn 2/ }))
     expect(screen.getByText("11·12·13")).toBeInTheDocument()
     expect(screen.getByText("24")).toBeInTheDocument()
   })
@@ -151,6 +153,7 @@ describe("TrajectoryTimeline", () => {
 
     const row = screen.getByTestId("turn-row-1")
     expect(within(row).getByText("ENV_EXECUTABLE_NOT_FOUND")).toBeInTheDocument()
+    fireEvent.click(within(row).getByRole("button", { name: /^Turn 1/ }))
     expect(within(row).getByText(/836b0507d4ef8e5a/)).toBeInTheDocument()
     expect(within(row).getByText("×3")).toBeInTheDocument()
   })
@@ -381,9 +384,9 @@ describe("TrajectoryTimeline", () => {
     expect(within(band).getByText(/JVM build execution validated/)).toBeInTheDocument()
 
     // The phase's own report is one click away rather than filling the header.
-    fireEvent.click(within(band).getByText("What this phase reported"))
+    fireEvent.click(within(band).getByText("Phase details"))
     expect(
-      within(band).getByText("Executed mvn clean verify in /workspace/commons-cli"),
+      within(band).getByText(/Executed mvn clean verify in \/workspace\/commons-cli/),
     ).toBeInTheDocument()
   })
 

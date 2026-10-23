@@ -22,6 +22,7 @@ function SecondaryButton({
   return (
     <Tooltip label={hint} side="bottom">
       <button
+        aria-label={label}
         className="inline-flex h-[34px] items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-[13px] font-semibold text-foreground hover:bg-accent"
         onClick={onClick}
         type="button"
@@ -139,6 +140,7 @@ export function DetailHeader({
         <div className="flex shrink-0 items-center gap-2">
           <Tooltip label="Run a new task in this workspace" side="bottom">
             <button
+              aria-label="New task"
               className="inline-flex h-[34px] items-center gap-1.5 rounded-lg bg-primary px-3.5 text-[13px] font-semibold text-primary-foreground hover:opacity-90"
               onClick={onNewTask}
               type="button"

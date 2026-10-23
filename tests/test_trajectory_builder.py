@@ -59,6 +59,56 @@ def _session(tmp_path: Path, *, events: str | None = None, tokens: str | None = 
     return session_dir
 
 
+def _advisor_pin(session_dir, *, effort="high", phase="build"):
+    store = OutputStorageManager(session_dir / "contexts")
+    ref = store.store_output(task_id=OBSERVABILITY_TASK_ID, tool_name="advisor_request",
+                             output=json.dumps({"model": "openai/gpt-5.4-mini", "reasoning_effort": effort}),
+                             timestamp="2026-08-14T11:29:20Z")
+    pin = {"sanitized_config": {"advisor_reasoning_effort": "low"}, "advisor": {"calls": [
+        {"phase": phase, "iteration": 3, "request_ref": ref},
+    ]}}
+    (session_dir / "run-pin.json").write_text(json.dumps(pin))
+    return pin
+
+
+def test_advisor_settings_are_from_the_bound_request_not_config(tmp_path):
+    session = _session(tmp_path, events="\n".join(ADVISOR_CALL_LINES) + "\n")
+    pin = _advisor_pin(session)
+    snap = build_trajectory(session)
+    assert snap.turns[0].advisor.model == "openai/gpt-5.4-mini"
+    assert snap.turns[0].advisor.effort == "high"
+    assert snap.outputs is None  # Summary never contains provider messages.
+    pin["advisor"]["calls"][0]["phase"] = "test"
+    (session / "run-pin.json").write_text(json.dumps(pin))
+    assert build_trajectory(session).turns[0].advisor is None
+
+
+def test_advisor_missing_or_conflicting_requests_do_not_invent_settings(tmp_path):
+    session = _session(tmp_path, events="\n".join(ADVISOR_CALL_LINES) + "\n")
+    pin = _advisor_pin(session, effort=None)
+    assert build_trajectory(session).turns[0].advisor.effort is None
+    pin["advisor"]["calls"].append(pin["advisor"]["calls"][0].copy())
+    (session / "run-pin.json").write_text(json.dumps(pin))
+    assert build_trajectory(session).turns[0].advisor is None
+
+
+def test_advisor_settings_arriving_after_the_turn_are_republished(tmp_path):
+    session = _session(tmp_path, events="\n".join(ADVISOR_CALL_LINES) + "\n")
+    count = 0
+    def tick(_):
+        nonlocal count
+        if count:
+            raise _NoMoreLines
+        count += 1
+        _advisor_pin(session)
+    accumulator = DeltaAccumulator()
+    with pytest.raises(_NoMoreLines):
+        for delta in follow_trajectory(session, sleep=tick, poll_seconds=0.01):
+            accumulator.feed(delta)
+    assert accumulator.snapshot().turns[0].advisor.effort == "high"
+    assert accumulator.snapshot() == build_trajectory(session)
+
+
 class _NoMoreLines(Exception):
     """Raised by the injected clock once the test has nothing left to append."""
 

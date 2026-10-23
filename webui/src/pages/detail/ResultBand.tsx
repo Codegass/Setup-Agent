@@ -6,6 +6,7 @@ import { readStored, writeStored } from "@/lib/safeStorage"
 import { cn } from "@/lib/utils"
 
 import type { TabId } from "./facets"
+import { MeasuredResultBand } from "./MeasuredResultBand"
 
 /** Which tab answers each row. Clicking a row is the two-click path from a
  *  number to the evidence behind it. The Summary row has no tab of its own:
@@ -14,7 +15,7 @@ const ROW_TAB: Partial<Record<RowKey, TabId>> = {
   ci_command: "evidence",
   official_ci: "ci",
   unconfirmed: "evidence",
-  run: "turns",
+  run: "flow",
   coverage: "tests",
   report: "report",
 }
@@ -157,14 +158,9 @@ function Row({
 }
 
 /**
- * The run's whole result, seven rows, in the order the terminal prints them:
- * the CI command, the official CI comparison, what SAG could not confirm, how
- * the run ended, and the Summary word derived from those lines. Collapsed, it
- * keeps the first line and the Summary.
- *
- * Every string below the chrome is the run's own — the band restates a row's
- * headline, detail, reason and items exactly as the record wrote them, and
- * fills nothing in. A row the run did not measure says so in its own words.
+ * Current cards use structured measurements for charts, with the original
+ * facts under disclosures. Previously saved cards without dimensions keep
+ * their text view. Both preserve the terminal's reading order and sealed word.
  */
 export function ResultBand({
   card,
@@ -198,8 +194,11 @@ export function ResultBand({
       </div>
     )
   }
-  // The band wears the Summary row's colour, the colour of the word the run
-  // is summed up in, as the terminal block's closing line does.
+  if (card.dimensions) {
+    return <MeasuredResultBand card={card} dimensions={card.dimensions} onOpenTab={onOpenTab} availableTabs={availableTabs} />
+  }
+  // Older saved cards keep their original presentation; no numbers are
+  // reconstructed from text to draw charts.
   const summary = card.rows.find((row) => row.key === "summary")
   const tone = summary?.tone ?? card.rows[0]?.tone ?? "neutral"
   const linkable = (id: TabId | undefined): TabId | null =>

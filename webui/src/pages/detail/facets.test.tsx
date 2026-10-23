@@ -58,7 +58,7 @@ describe("buildDetailTabs", () => {
   it("offers the tabs in reading order", () => {
     expect(buildDetailTabs(detailWithEverything()).map((tab) => tab.id)).toEqual([
       "overview",
-      "turns",
+      "flow",
       "tests",
       "build",
       "ci",
@@ -71,7 +71,7 @@ describe("buildDetailTabs", () => {
   it("names each tab in words a first-time reader can follow", () => {
     expect(buildDetailTabs(detailWithEverything()).map((tab) => tab.label)).toEqual([
       "Overview",
-      "Turns",
+      "Flow",
       "Tests",
       "Build",
       "Official CI",
@@ -99,6 +99,14 @@ describe("buildDetailTabs", () => {
     expect(tabs).toContain("ci")
   })
 
+  it("omits the CI tab when a current card explicitly records no supplied reference", () => {
+    const d = detailWithEverything({
+      ciComparison: { ...comparison, status: "no_matched_cell", attainment: null },
+      resultCard: { dimensions: { hasCiReference: false } } as ExecutionSessionDetail["resultCard"],
+    })
+    expect(buildDetailTabs(d).map(tab => tab.id)).not.toContain("ci")
+  })
+
   it("counts test errors as well as failures on the tests badge", () => {
     const tabs = buildDetailTabs(
       detail({ test: { state: "partial", pass: 10, fail: 2, errors: 3, skip: 0, total: 15 } }),
@@ -121,16 +129,24 @@ describe("buildDetailTabs", () => {
     expect(evidence?.tone).toBe("neutral")
   })
 
-  it("puts overview first, then the run itself", () => {
+  it("puts overview first, then the unified process view", () => {
     const tabs = buildDetailTabs(detail())
     expect(tabs[0].id).toBe("overview")
-    expect(tabs.map((t) => t.id).slice(0, 2)).toEqual(["overview", "turns"])
+    expect(tabs.map((t) => t.id).slice(0, 3)).toEqual(["overview", "flow", "tests"])
   })
 
-  it("keeps the turns tab for every session that ran", () => {
-    // It does not wait on a context trace: the turns are derived from the
-    // control ledger, which every run writes.
-    expect(buildDetailTabs(detail({ context: ctx })).map((t) => t.id)).toContain("turns")
+  it("keeps Flow without a CI reference or trace, including preview sessions", () => {
+    for (const demo of [false, true]) {
+      const tabs = buildDetailTabs(detail({ demo, context: null, ciComparison: null }))
+      expect(tabs.map(tab => tab.id)).toContain("flow")
+      expect(tabs.map(tab => tab.id)).not.toContain("ci")
+    }
+  })
+
+  it("uses Flow for both the context and ledger", () => {
+    const tabs = buildDetailTabs(detail({ context: ctx })).map((t) => t.id)
+    expect(tabs).toContain("flow")
+    expect(tabs).not.toContain("turns")
   })
 
   it("omits the turns for a demo session, which never ran and wrote no ledger", () => {
@@ -148,6 +164,7 @@ describe("buildDetailTabs", () => {
     )
     const byId = Object.fromEntries(tabs.map((t) => [t.id, t]))
     expect(byId.overview).toBeDefined()
+    expect(byId.flow).toBeDefined()
     expect(byId.tests).toBeDefined()
     expect(byId.build).toBeDefined()
     expect(byId.tests.count).toBe(2)

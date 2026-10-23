@@ -192,7 +192,7 @@ describe("ResultBand", () => {
     const onOpenTab = vi.fn()
     render(<ResultBand card={card()} onOpenTab={onOpenTab} />)
     fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind Run" }))
-    expect(onOpenTab).toHaveBeenCalledWith("turns")
+    expect(onOpenTab).toHaveBeenCalledWith("flow")
     fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind CI command" }))
     expect(onOpenTab).toHaveBeenCalledWith("evidence")
   })

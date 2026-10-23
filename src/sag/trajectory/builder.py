@@ -93,6 +93,7 @@ from sag.tools.base import is_output_storage_ref
 from sag.trajectory.reducer import TrajectoryReducer, order_warnings
 from sag.trajectory.schema import (
     DETAIL_TIERS,
+    AdvisorInfo,
     TokenUsage,
     Trajectory,
     TrajectoryDelta,
@@ -193,6 +194,21 @@ def control_events_path(session_dir: Path | str) -> Path | None:
     prints a header from always read the same file.
     """
     return _SessionSources(session_dir, detail="summary").control_events()
+
+
+def read_output_ref(session_dir: Path | str, ref: str) -> str | None:
+    """Read one archived output, including refs named only by a phase context.
+
+    Flow's working trace and the control ledger may name different outputs for
+    the same call. Reuse the full tier's stores without requiring a ref to be
+    present in trajectory-v1 or loading every output into the browser.
+    ``ref`` is a lookup key, never a filesystem path.
+    """
+    if not is_output_storage_ref(ref):
+        return None
+    sources = _SessionSources(session_dir, detail="full")
+    resolved, _ = sources.outputs.resolve([ref])
+    return resolved.get(ref)
 
 
 def read_call_envelope(session_dir: Path | str, envelope_id: str) -> dict[str, Any] | None:
@@ -632,11 +648,59 @@ class _SessionSources:
             return None
         return document if isinstance(document, dict) else None
 
+    def advisor_details(self, turns: list[Turn]) -> list[Turn]:
+        """Join only unambiguous consults to their actual provider requests.
+
+        Phase-entry consultations reuse the actor's last iteration in a NEW
+        phase. Neither iteration alone nor the current app configuration is a
+        safe source for model settings. Conflicting/missing request fields stay
+        unknown; request bodies never enter the summary response.
+        """
+        pin = self.document("run-pin.json") or {}
+        advisor = pin.get("advisor")
+        calls = advisor.get("calls", []) if isinstance(advisor, dict) else []
+        calls = calls if isinstance(calls, list) else []
+        consults = [t for t in turns if t.call and t.call.tool == "advisor"]
+        counts = Counter((t.phase, t.iteration) for t in consults)
+        details: dict[int, AdvisorInfo] = {}
+        for turn in consults:
+            key = (turn.phase, turn.iteration)
+            matches = [c for c in calls if isinstance(c, dict)
+                       and (c.get("phase"), c.get("iteration")) == key]
+            if turn.iteration is None or counts[key] != 1 or len(matches) != 1:
+                continue
+            call = matches[0]
+            requests = call.get("provider_requests")
+            requests = requests if isinstance(requests, list) and requests else [call]
+            refs = list(dict.fromkeys(r.get("request_ref") for r in requests
+                                     if isinstance(r, dict) and is_output_storage_ref(r.get("request_ref"))))
+            if not refs:
+                continue
+            resolved, _ = self.outputs.resolve(refs)
+            bodies = []
+            for ref in refs:
+                try:
+                    body = json.loads(resolved.get(ref, ""))
+                except (TypeError, ValueError):
+                    body = {}
+                bodies.append(body if isinstance(body, dict) else {})
+
+            def shared(field: str) -> str | None:
+                values = [b.get(field) for b in bodies]
+                first = values[0]
+                return first if isinstance(first, str) and first.strip() and all(v == first for v in values) else None
+
+            details[turn.turn_id] = AdvisorInfo(
+                model=shared("model"), effort=shared("reasoning_effort"), request_refs=refs,
+            )
+        return [t.model_copy(update={"advisor": details.get(t.turn_id)})
+                if t.call and t.call.tool == "advisor" else t for t in turns]
+
     def finish(self, snapshot: Trajectory, *, extra: list[Warning] | None = None) -> Trajectory:
         """Join the artifacts the control stream does not carry."""
         tokens, advisor_tokens, token_warnings = self.token_ledger()
         biller = _TokenBiller()
-        turns = [biller.bill(turn, tokens, advisor_tokens) for turn in snapshot.turns]
+        turns = self.advisor_details([biller.bill(turn, tokens, advisor_tokens) for turn in snapshot.turns])
         unattributed = [
             warning
             for warning in (
@@ -1204,6 +1268,7 @@ class _Joiner:
         #: (ignite's first turn does), and two maps keyed by iteration would
         #: restate it twice, each copy dropping the other's field.
         self._claimants: dict[int, Turn] = {}
+        self._consults: dict[int, Turn] = {}
         self._reledgered = False
         self._token_warnings: list[Warning] = []
         self._ledger_missing = True
@@ -1237,6 +1302,17 @@ class _Joiner:
     def wrap(self, delta: TrajectoryDelta) -> TrajectoryDelta | None:
         turns = [self._bill(turn) for turn in delta.turns]
         turns.extend(self._rebilled({turn.turn_id for turn in turns}))
+        # The run pin and request archive can arrive after the turn. Revisit
+        # consults on each poll, emitting only changed metadata (also on summary).
+        for turn in turns:
+            if turn.call and turn.call.tool == "advisor":
+                self._consults[turn.turn_id] = turn
+        by_id = {turn.turn_id: turn for turn in turns}
+        for turn in self._sources.advisor_details(list(self._consults.values())):
+            if turn.turn_id in by_id or turn != self._consults[turn.turn_id]:
+                by_id[turn.turn_id] = turn
+            self._consults[turn.turn_id] = turn
+        turns = list(by_id.values())
         in_store, elsewhere = _turn_refs(turns)
         for ref in in_store:
             if ref not in self._refs:

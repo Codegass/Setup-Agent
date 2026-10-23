@@ -44,14 +44,9 @@ const UNGRADED_TESTS = "whether the tests passed: "
 /**
  * How the tests came out, said once.
  *
- * When the run recorded a result, the words are the result card's own — the
- * same strings the terminal printed and the report wrote. The card states this
- * run's tests on its Official CI row, beside the official CI run's where those
- * are known ("ran 2,679 of 2,762 tests", "0 failures, 4 errors in this run",
- * or "this run: 994 executed · 933 passed · …"), and states on its "Not
- * confirmed by SAG" row when the outcome could not be graded. A second reading
- * of the same counts, worked out here, is how the band and the tab came to
- * disagree about one run.
+ * Prefer the card's local test measurements, independent of CI inputs.
+ * Older cards retain their recorded comparison facts as a fallback. Never
+ * turn a comparison state such as `compared` into a test-pass verdict.
  *
  * A record with no card (a run finalized before the card existed) still states
  * counts, so the tab falls back to reading them; it says so by having nothing
@@ -72,6 +67,43 @@ function TestConclusionCard({ detail }: { detail: ExecutionSessionDetail }) {
   const summary = recordRead
     ? run.summary
     : `${RECORD_UNREADABLE} Its test counts are not known here.`
+
+  const measured = detail.resultCard?.dimensions
+  if (measured) {
+    const tests = measured.officialCi
+    const local = measured.tests
+    const facts = local?.fact ?? row
+    const check = measured.sagChecks.find((item) => item.check === "test outcome graded")
+    const counts = [
+      { label: local ? "Recorded" : "Executed", value: local ? local.counts?.executed : tests.agentTestsExecuted },
+      { label: "Failures", value: local ? local.counts?.failed : tests.agentFailures },
+      { label: "Errors", value: local ? local.counts?.errors : tests.agentErrors },
+    ]
+    const hasCounts = counts.some(({ value }) => value != null)
+    return (
+      <section aria-label="Test results" className="border-b border-border pb-4">
+        {hasCounts ? <dl className="grid grid-cols-3 gap-5">
+          {counts.map(({ label, value }) => (
+            <div key={label}>
+              <dt className="text-[12px] text-muted-foreground">{label}</dt>
+              <dd className={`mt-1 font-mono text-[20px] font-semibold tabular-nums ${(label === "Failures" || label === "Errors") && value != null && value > 0 ? "text-status-failed" : "text-foreground"}`}>
+                {value == null ? "—" : `${label === "Recorded" && local?.lowerBound ? "≥ " : ""}${value.toLocaleString("en-US")}`}
+              </dd>
+            </div>
+          ))}
+        </dl> : <p className="text-[13px] leading-relaxed">{local?.fact.headline ?? row?.detail ?? summary}</p>}
+        {check && !check.confirmed ? <p className="mt-3 text-[12px] text-status-attention">Test outcome not confirmed: {check.reason}</p> : null}
+        {facts && hasCounts ? (
+          <details className="mt-3 text-[12px] text-muted-foreground">
+            <summary className="cursor-pointer rounded-sm focus-visible:outline-2 focus-visible:outline-ring">Recorded facts</summary>
+            <p className="mt-2 leading-relaxed">{local ? facts.headline : facts.detail ?? facts.headline}</p>
+            {local && facts.detail ? <p className="mt-1">{facts.detail}</p> : null}
+            {facts.reason ? <p className="mt-1">{facts.reason}</p> : null}
+          </details>
+        ) : null}
+      </section>
+    )
+  }
 
   return (
     <Card className="overflow-hidden">

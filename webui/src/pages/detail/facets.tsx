@@ -1,5 +1,4 @@
 import type { ExecutionSessionDetail, SubmitTaskResponse } from "@/api/types"
-import { isLiveSessionStatus } from "@/components/common/status"
 import { BuildFacet } from "@/components/session/BuildFacet"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
 import { ReceiptTable } from "@/components/session/ReceiptTable"
@@ -8,8 +7,8 @@ import { ReportDoc } from "@/components/session/ReportDoc"
 import { TestFacet } from "@/components/session/TestFacet"
 
 import { OfficialCITab } from "./OfficialCITab"
+import { FlowTab, RecordedFlowTab } from "./FlowTab"
 import { OverviewTab } from "./OverviewTab"
-import { TrajectoryTab } from "./TrajectoryTab"
 
 function nonZero(n: number | null | undefined): number | null {
   return typeof n === "number" && n > 0 ? n : null
@@ -25,7 +24,7 @@ function testIssues(d: ExecutionSessionDetail): number | null {
 
 export type TabId =
   | "overview"
-  | "turns"
+  | "flow"
   | "tests"
   | "build"
   | "ci"
@@ -43,27 +42,15 @@ export interface TabMeta {
 
 /**
  * One reading order: what happened, how it happened, then each measurement's
- * own evidence. `overview` always leads and `tests`/`build` are always present;
+ * own evidence. Overview, Flow, Tests and Build are always present;
  * the rest are offered only when the run produced something for them.
  */
 export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
-  // Turns leads the panels because it is the run itself, turn by turn, and for
-  // a real session it is never gated on data being present: it derives from
-  // the control ledger every run writes, and a run with no ledger YET says so
-  // in its own words. A demo session is the one case where there is no ledger
-  // to wait for — the read models are fabricated and stand for no run, which is
-  // why the builder refuses to name a session directory for one — so the tab is
-  // not offered rather than left to answer "unavailable" forever.
-  //
-  // `turns`, not `trajectory`: the terminal numbers them `#1 … #24` and
-  // `sag inspect --turn N` names one, so a turn is the word a reader already
-  // has. `trajectory-v1` is the derivation this tab reads and `sag trajectory`
-  // the command that prints it; both keep their names, because neither is a
-  // thing a person clicks.
-  const tabs: TabMeta[] = [{ id: "overview", label: "Overview" }]
-  if (!d.demo) {
-    tabs.push({ id: "turns", label: "Turns" })
-  }
+  // One process view: ledger order, enriched with the recorded phase context.
+  const tabs: TabMeta[] = [
+    { id: "overview", label: "Overview" },
+    { id: "flow", label: "Flow" },
+  ]
 
   const failing = testIssues(d)
   tabs.push({
@@ -73,11 +60,10 @@ export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
   })
   tabs.push({ id: "build", label: "Build" })
 
-  // Presence, not status: a comparison the run served says inside the tab what
-  // it measured, or that it measured nothing. Only a run that served none at
-  // all has nothing to open — and the result band's CI row links here, so a
-  // status gate would strand that row on a tab this run does not have.
-  if (d.ciComparison) {
+  // A normal run can carry a no_matched_cell placeholder without a CI input.
+  // Hide that optional surface when the card explicitly says none was supplied.
+  // Keep older records and unusable supplied references inspectable.
+  if (d.ciComparison && d.resultCard?.dimensions?.hasCiReference !== false) {
     tabs.push({ id: "ci", label: "Official CI" })
   }
 
@@ -100,6 +86,7 @@ export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
 export interface TabBodyProps {
   tabId: TabId
   detail: ExecutionSessionDetail
+  onOpenFlow?: () => void
   onSubmitTask?: (
     workspaceId: string,
     task: string,
@@ -108,17 +95,19 @@ export interface TabBodyProps {
 }
 
 /**
- * Renders the panel body for a tab. `overview` and `turns` use the dedicated
- * OverviewTab/TrajectoryTab panels; the rest delegate to the existing session
+ * Renders the panel body for a tab. Overview and Flow have dedicated
+ * panels; the rest delegate to the existing session
  * renderers. Navigation between tabs belongs to the result band above them,
  * whose rows each link to the tab that answers them.
  */
-export function TabBody({ tabId, detail }: TabBodyProps) {
+export function TabBody({ tabId, detail, onOpenFlow }: TabBodyProps) {
   switch (tabId) {
     case "overview":
-      return <OverviewTab detail={detail} />
-    case "turns":
-      return <TrajectoryTab live={isLiveSessionStatus(detail.status)} sessionId={detail.id} />
+      return <OverviewTab detail={detail} onOpenFlow={onOpenFlow} />
+    case "flow":
+      return detail.demo
+        ? <FlowTab key={detail.id} detail={detail} />
+        : <RecordedFlowTab key={detail.id} detail={detail} />
     case "tests":
       return <TestFacet detail={detail} />
     case "build":

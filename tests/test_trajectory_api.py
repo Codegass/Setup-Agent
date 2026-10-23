@@ -157,6 +157,44 @@ def test_a_missing_call_envelope_is_a_404(tmp_path):
     assert response.json()["detail"] == "Call envelope not found: envelope-missing"
 
 
+def test_flow_can_read_a_large_output_not_named_by_the_control_ledger(tmp_path):
+    """Gson's context store exceeds the trace cap and includes context-only refs."""
+    logs, session_dir, mirror = _mount(tmp_path)
+    store = session_dir / ".setup_agent" / "contexts"
+    store.mkdir(parents=True)
+    content = "large tool result\n" * 80_000
+    ref = "output_aab54ca70011"
+    (store / "full_outputs.jsonl").write_text(json.dumps({"ref_id": ref, "output": content}) + "\n")
+    before = {p.relative_to(session_dir): p.read_bytes() for p in session_dir.rglob("*") if p.is_file()}
+    client = _client(logs, mirror)
+    response = client.get(f"/api/sessions/{_session_id('kafka')}/outputs/{ref}")
+    assert response.status_code == 200
+    assert response.json() == {"ref": ref, "content": content}
+    assert build_trajectory(session_dir, detail="full").outputs.get(ref) is None
+    after = {p.relative_to(session_dir): p.read_bytes() for p in session_dir.rglob("*") if p.is_file()}
+    assert after == before
+
+
+def test_flow_reads_a_host_output_without_requiring_a_container_store(tmp_path):
+    logs, session_dir, mirror = _mount(tmp_path)
+    store = session_dir / "contexts"
+    store.mkdir()
+    ref = "output_1003fb315d37"
+    (store / "full_outputs.jsonl").write_text(json.dumps({"ref_id": ref, "output": ""}) + "\n")
+    response = _client(logs, mirror).get(f"/api/sessions/{_session_id('kafka')}/outputs/{ref}")
+    assert response.status_code == 200
+    assert response.json()["content"] == ""  # empty is not missing
+
+
+def test_flow_reports_a_missing_output_or_session_without_inventing_content(tmp_path):
+    logs, _, mirror = _mount(tmp_path)
+    client = _client(logs, mirror)
+    response = client.get(f"/api/sessions/{_session_id('kafka')}/outputs/output_missing")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Output not recorded: output_missing"
+    assert client.get("/api/sessions/unknown/outputs/output_missing").status_code == 404
+
+
 def test_a_since_cut_returns_only_the_turns_after_it(tmp_path):
     """The cut is over TURNS, and over nothing else.
 

@@ -12,6 +12,8 @@
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-advisor: var(--advisor);
+  --color-advisor-soft: var(--advisor-soft);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -56,6 +58,9 @@
   --popover-foreground: var(--foreground);
   --primary: oklch(0.546 0.215 263);
   --primary-foreground: oklch(0.985 0.003 247);
+  /* Role identity, independent of success/failure state. */
+  --advisor: oklch(0.49 0.18 305);
+  --advisor-soft: oklch(0.96 0.025 305);
   --secondary: oklch(0.955 0.008 247);
   --secondary-foreground: oklch(0.24 0.04 265);
   --muted: oklch(0.952 0.006 247);
@@ -111,6 +116,8 @@
   --popover-foreground: var(--foreground);
   --primary: oklch(0.72 0.16 252);
   --primary-foreground: oklch(0.16 0.032 265);
+  --advisor: oklch(0.79 0.13 305);
+  --advisor-soft: oklch(0.28 0.055 305);
   --secondary: oklch(0.26 0.032 265);
   --secondary-foreground: var(--foreground);
   --muted: oklch(0.26 0.032 265);
