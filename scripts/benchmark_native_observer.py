@@ -11,6 +11,7 @@ import posixpath
 import re
 import secrets
 import shlex
+import subprocess
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +25,13 @@ from sag.benchmark.requirements import bound_file, canonical_digest, evaluation_
 from sag.benchmark.sag_observer import SAGRequirementObserver
 
 POLICY = "native-tool-hooks-v1"
+MULTIPLE_LAUNCHES = "Multiple build launches in one tool need separate physical boundaries"
+# What one bound launch adds to its shell call; the rest of the call is the tool's own.
+LAUNCH_FIELDS = (
+    "launch_event", "process_id", "namespace", "selected_step", "parsed", "invocation_id",
+    "out", "contract", "prior_traces", "probe", "launch_sequence", "launch_started_at",
+    "process_observation", "process_observation_error", "record",
+)
 
 
 def now():
@@ -262,6 +270,7 @@ class NativeObserver:
         self.environment = {}
         self.lock = threading.RLock()
         self.events, self.calls, self.invocations, self.errors = [], {}, [], []
+        self.next_sequence = 0
         self.closed = False
         self.base.mkdir(parents=True, exist_ok=False)
         self.observer = SAGRequirementObserver(self.base, run_id, root, task, spec, self.execute)
@@ -275,6 +284,11 @@ class NativeObserver:
 
     def execute(self, command, **kwargs):
         return self.execute_raw(command, **kwargs)
+
+    def _sequence(self):
+        # Shell calls and the later pinned launches inside one call share one order.
+        value, self.next_sequence = self.next_sequence, self.next_sequence + 1
+        return value
 
     def _boundary(self, kind, identity=None):
         snapshot = self.worktree.capture(kind, invocation_id=identity)
@@ -315,7 +329,7 @@ class NativeObserver:
             "before": ref,
             "after": None,
             "started_at": now(),
-            "sequence": len(self.calls),
+            "sequence": self._sequence(),
             "session_id": event.get("session_id"),
             "selected_step": None,
             "tool_name": event.get("tool_name"),
@@ -358,9 +372,8 @@ class NativeObserver:
             raise ValueError("Native Maven launch has no unique active shell tool")
         call = active[0]
         if call.get("selected_step") is not None:
-            raise ValueError(
-                "Multiple build launches in one tool need separate physical boundaries"
-            )
+            self._close_earlier_launch(call, matches, launch, ref)
+            call.update(launch_sequence=self._sequence(), launch_started_at=now())
         if type(launch.get("launcher_pid")) is not int or launch["launcher_pid"] <= 0:
             raise ValueError("Native Maven launcher process is unavailable")
         parsed = {
@@ -416,6 +429,104 @@ class NativeObserver:
                 [parsed["argv"][0], "--version"], step, out, "launcher"
             )
 
+    def _close_earlier_launch(self, call, matches, launch, ref):
+        """Close this shell call's finished pinned launch before binding its next one.
+
+        `mvn install; mvn test` in one shell tool is two invocations when they are
+        sequential: the earlier launch's OS process trace has its unique normal exit,
+        stamped no later than this launch's callback, and this launch runs a later
+        pinned step. The callback holds the later Maven in its launcher until the
+        observer answers, so the earlier launch's after boundary (and this launch's
+        before boundary) are taken between the two builds. The earlier launch's log
+        is its own output file only, read now: the shell's output also holds the
+        later build. Anything else stays refused.
+        """
+        order = {step["id"]: index for index, step in enumerate(self.task["steps"])}
+        if (
+            len(matches) != 1
+            or "invocation_id" not in call
+            or type(launch.get("launcher_pid")) is not int
+            or launch["launcher_pid"] <= 0
+            or order[matches[0]["id"]] <= order[call["selected_step"]["id"]]
+        ):
+            raise ValueError(MULTIPLE_LAUNCHES)
+        started = datetime.fromisoformat(load_json(self.base / ref["path"])["received_at"])
+        try:
+            raw = self.read_file("/opt/benchmark-process-traces/process." + str(call["process_id"]))
+            ended = process_terminal(raw)
+        except (KeyError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise ValueError(MULTIPLE_LAUNCHES) from exc
+        if ended["exit_epoch"] > started.timestamp():
+            raise ValueError(MULTIPLE_LAUNCHES)
+        path = call["out"] / "process.trace"
+        path.write_bytes(raw)
+        process_observation = reference(
+            self.base, path, process_id=call["process_id"], namespace=call["namespace"], **ended
+        )
+        own = call["parsed"].get("log_path")
+        log, complete, source, warnings = (
+            collect_native_log({}, terminal=True, read_file=self.read_file, launch_path=own)
+            if own
+            else (b"", False, {"kind": "shared_shell_output"}, [])
+        )
+        (call["out"] / "command.log").write_bytes(log)
+        observation = self._close_physically(call, ended["exit_code"])
+        earlier = {key: call.pop(key) for key in LAUNCH_FIELDS if key in call}
+        earlier.setdefault("launch_sequence", call["sequence"])
+        earlier.setdefault("launch_started_at", call["started_at"])
+        earlier.update(
+            process_observation=process_observation,
+            exit=ended,
+            log={"complete": complete, "source": source, "warnings": warnings},
+            observation=observation,
+        )
+        call["selected_step"] = None
+        call.setdefault("earlier_launches", []).append(earlier)
+
+    def _launch_view(self, call, earlier):
+        """An earlier launch of a shell call, read with the call's own tool boundaries."""
+        shared = {
+            k: v for k, v in call.items() if k not in LAUNCH_FIELDS and k != "earlier_launches"
+        }
+        return {**shared, **earlier}
+
+    def _finish_call(self, call, native):
+        """A shell call's terminal observation closes each of its pinned launches."""
+        for earlier in call.get("earlier_launches", []):
+            if "record" in earlier:
+                continue
+            view = self._launch_view(call, earlier)
+            self._record(
+                view,
+                {
+                    **native,
+                    "native_tool_exit_code": native.get("exit_code"),
+                    "exit_code": earlier["exit"]["exit_code"],
+                    "status": "completed",
+                },
+                terminal=True,
+                earlier=earlier,
+            )
+            earlier["record"] = view["record"]
+        if call.get("selected_step") is not None:
+            self._finish_process(call, native)
+
+    def _close_physically(self, call, exit_code):
+        """The receipt, collected outputs and after boundary of one ended launch."""
+        identity = call["invocation_id"]
+        self.environment = call["parsed"]["environment"]
+        receipt = {
+            **call["contract"],
+            "receipt_id": identity + "-native",
+            "actual_cwd": call["parsed"]["cwd"],
+            "exit_code": exit_code,
+            "lifecycle_state": "finished",
+        }
+        self.observer.after_receipt(receipt)
+        observation = self.observer.export_invocation(identity) or {}
+        self.worktree_refs.append(self._boundary("acceptance_after", identity))
+        return observation
+
     def _after(self, tool_id, event, ref):
         if tool_id not in self.calls or self.calls[tool_id]["after"] is not None:
             raise ValueError("Native end observation has no unique start")
@@ -434,11 +545,11 @@ class NativeObserver:
         # A background acknowledgement may arrive before Maven's launch hook.
         # Keep the task identity alive until its actual terminal observation.
         call["native_result"] = native
-        if call["selected_step"] is None:
+        if call.get("selected_step") is None and not call.get("earlier_launches"):
             return
         if native["status"] != "completed":
             return  # No post-execution inventory while a producer may be alive.
-        self._finish_process(call, native)
+        self._finish_call(call, native)
 
     def _finish_process(self, call, native):
         try:
@@ -498,30 +609,35 @@ class NativeObserver:
             "background_task_id": task_id,
         }
         call["native_result"] = native
-        if call.get("selected_step"):
-            self._finish_process(call, native)
+        if call.get("selected_step") or call.get("earlier_launches"):
+            self._finish_call(call, native)
 
-    def _record(self, call, native, *, terminal):
+    def _record(self, call, native, *, terminal, earlier=None):
         step, identity, out = call["selected_step"], call["invocation_id"], call["out"]
         self.environment = call["parsed"]["environment"]
-        log, complete, log_source, log_warnings = collect_native_log(
-            native, terminal=terminal, read_file=self.read_file,
-            launch_path=call["parsed"].get("log_path"),
-        )
+        if earlier is not None:
+            # Collected when the later launch began; see _close_earlier_launch.
+            complete = earlier["log"]["complete"]
+            log_source, log_warnings = earlier["log"]["source"], earlier["log"]["warnings"]
+        else:
+            own, log_native = call["parsed"].get("log_path"), native
+            if call.get("earlier_launches"):
+                # The shell's output also holds an earlier pinned build of this call.
+                log_native = {**native, "text": "", "output_path": None}
+                if any(e["parsed"].get("log_path") == own for e in call["earlier_launches"]):
+                    own = None
+            log, complete, log_source, log_warnings = collect_native_log(
+                log_native, terminal=terminal, read_file=self.read_file, launch_path=own,
+            )
+            (out / "command.log").write_bytes(log)
         log_error = None if complete else "Complete terminal native output is unavailable"
-        (out / "command.log").write_bytes(log)
         observation = {}
         if terminal:
-            receipt = {
-                **call["contract"],
-                "receipt_id": identity + "-native",
-                "actual_cwd": call["parsed"]["cwd"],
-                "exit_code": native["exit_code"],
-                "lifecycle_state": "finished",
-            }
-            self.observer.after_receipt(receipt)
-            observation = self.observer.export_invocation(identity) or {}
-            self.worktree_refs.append(self._boundary("acceptance_after", identity))
+            observation = (
+                earlier["observation"]
+                if earlier is not None
+                else self._close_physically(call, native["exit_code"])
+            )
         record = {
             "schema_version": 2,
             "recorder_version": POLICY,
@@ -533,14 +649,14 @@ class NativeObserver:
             "project_root": self.root,
             "invocation_id": identity,
             "step_id": step["id"],
-            "sequence": call["sequence"],
+            "sequence": call.get("launch_sequence", call["sequence"]),
             "runner": step["runner"],
             "argv": step["argv"],
             "effective_argv": call["parsed"]["argv"],
             "cwd": step["cwd"],
             "status": native["status"],
             "exit_code": native.get("exit_code"),
-            "started_at": call["started_at"],
+            "started_at": call.get("launch_started_at", call["started_at"]),
             "finished_at": now() if terminal else None,
             "log": reference(self.base, out / "command.log"),
             "log_complete": complete,
@@ -643,6 +759,16 @@ class NativeObserver:
             self.closed = True
             missing = expected_shell_calls(self.arm, transcript) - self.calls.keys()
             for call in self.calls.values():
+                for earlier in call.get("earlier_launches", []):
+                    if "record" not in earlier:
+                        view = self._launch_view(call, earlier)
+                        self._record(
+                            view,
+                            call.get("native_result", {"status": "unavailable", "text": ""}),
+                            terminal=False,
+                            earlier=earlier,
+                        )
+                        earlier["record"] = view["record"]
                 if call.get("selected_step") and "record" not in call and "invocation_id" in call:
                     self._record(
                         call,
@@ -689,10 +815,23 @@ class NativeObserver:
                 "finished_at": now(),
                 "telemetry": None,
             }
+            private = {"out", "prior_traces", "observation"}
             write_json(
                 self.base / "native-calls.json",
                 {
-                    key: {k: v for k, v in call.items() if k not in {"out", "prior_traces"}}
+                    key: {
+                        **{k: v for k, v in call.items() if k not in private},
+                        **(
+                            {
+                                "earlier_launches": [
+                                    {k: v for k, v in earlier.items() if k not in private}
+                                    for earlier in call["earlier_launches"]
+                                ]
+                            }
+                            if call.get("earlier_launches")
+                            else {}
+                        ),
+                    }
                     for key, call in self.calls.items()
                 },
             )

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from test_benchmark_requirement_evaluator import fixture, write
+from test_benchmark_requirement_evaluator import banner, fixture, write
 
 from sag.benchmark.evaluator import evaluate
 from scripts.benchmark_native_observer import expected_shell_calls, native_result
@@ -838,3 +838,205 @@ def test_versioned_launcher_symlink_binds_and_scores_struts_examples(fixture, tm
     assert not run["capture_errors"] and len(run["invocations"]) == 1
     score = evaluate(observer.task, observer.spec, run, observer.base, required_execution_origin="agent")
     assert score["status"] == "complete", score
+
+
+def _two_step_observer(fixture, tmp_path):
+    """google-java-format-opencode's shape: `mvn install` then `mvn verify`, one shell call."""
+    from sag.benchmark.requirements import canonical_digest, normalize_task
+
+    from test_benchmark_requirement_evaluator import requirement
+
+    task, spec = fixture[0], fixture[1]
+    task["steps"].insert(0, {"id": "install", "runner": "maven", "argv": ["mvn", "install"], "cwd": "."})
+    spec["task_sha256"] = canonical_digest(normalize_task(task))
+    spec["requirements"].insert(0, requirement(
+        "install-compile", "compile", "compiler:compile", step_id="install"))
+    observer, root, event, transcript, requests = make_observer(fixture, tmp_path)
+    _probe_any_launcher(observer, requests)
+    observer._native_launch = _witness_from_launch(observer)
+    logs = tmp_path / "agent-logs"
+    logs.mkdir()
+    event["tool_input"] = {"command": (
+        "set -euo pipefail\n"
+        f"PATH=/opt/maven/bin:$PATH mvn install > {logs}/ci-step-1.log 2>&1\n"
+        f"PATH=/opt/maven/bin:$PATH mvn verify > {logs}/ci-step-2.log 2>&1")}
+    launches = []
+    for pid, argv, name in [(123, ["mvn", "install"], "ci-step-1.log"), (456, ["mvn", "verify"], "ci-step-2.log")]:
+        launch = copy.deepcopy(event["launcher_event"])
+        launch["launch"].update(argv=["/opt/maven/bin/" + argv[0], *argv[1:]], launcher_pid=pid)
+        launch["output_path"] = str(logs / name)
+        launches.append(launch)
+    exits = {}  # pid -> (exit code, seconds after its launch callback, or None while running)
+
+    def launch_epoch(pid):
+        for ref in observer.events:
+            row = json.loads((observer.base / ref["path"]).read_text())
+            if row["native"].get("launch", {}).get("launcher_pid") == pid:
+                return datetime.fromisoformat(row["received_at"]).timestamp()
+        raise FileNotFoundError(pid)
+
+    def read(path):
+        if "/opt/benchmark-process-traces/process." in path:
+            pid = int(path.rsplit(".", 1)[1])
+            code, after = exits.get(pid, (None, None))
+            if after is None:
+                return f"{launch_epoch(pid):.6f} execve(...) = 0\n".encode()
+            return f"{launch_epoch(pid) + after:.6f} +++ exited with {code} +++\n".encode()
+        return Path(path).read_bytes()
+
+    observer.read_file = read
+    return observer, root, event, transcript, launches, exits, logs
+
+
+def _write_reports(root):
+    reports = root / "target/surefire-reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    (reports / "TEST-demo.xml").write_text(
+        '<testsuite tests="1" failures="0" errors="0" skipped="0"><testcase name="a"/></testsuite>'
+    )
+
+
+def test_sequential_pinned_builds_in_one_shell_call_are_two_invocations(fixture, tmp_path):
+    """google-java-format-opencode, events 000044-000048: steps 1 and 2 one after the other
+    in one shell call. Each launch gets its own invocation and physical boundaries; the
+    first launch's after boundary is taken while the second waits in its launcher callback."""
+    import time
+
+    observer, root, event, transcript, launches, exits, logs = _two_step_observer(fixture, tmp_path)
+    observer.event(event)
+    observer.event(launches[0])
+    (logs / "ci-step-1.log").write_text(
+        banner("compiler:compile") + "[INFO] Compiling 2 source files\n[INFO] BUILD SUCCESS\n")
+    time.sleep(0.05)
+    exits[123] = (0, 0.01)
+    observer.event(launches[1])
+    assert observer.errors == []
+    _write_reports(root)
+    (logs / "ci-step-2.log").write_text((fixture[4] / "log.txt").read_text())
+    time.sleep(0.05)
+    exits[456] = (0, 0.01)
+    observer.event({**event, "hook_event_name": "PostToolUse",
+                    "tool_response": {"output": "", "metadata": {"exit": 0}}})
+    run = observer.close(transcript)
+    assert not run["capture_errors"]
+    records = [json.loads((observer.base / ref["path"]).read_text()) for ref in run["invocations"]]
+    assert [r["step_id"] for r in records] == ["install", "verify"]
+    assert records[0]["invocation_id"] != records[1]["invocation_id"]
+    assert records[0]["sequence"] < records[1]["sequence"]
+    assert [r["exit_code"] for r in records] == [0, 0]
+    assert [r["log_source"] for r in records] == [
+        {"kind": "native_file", "path": str(logs / "ci-step-1.log")},
+        {"kind": "native_file", "path": str(logs / "ci-step-2.log")},
+    ]
+    assert all(r["log_complete"] for r in records)
+    assert records[0]["native_hook"] == records[1]["native_hook"]  # one shell call
+    boundaries = [
+        (snapshot["boundary"], snapshot.get("invocation_id"))
+        for snapshot in (json.loads((observer.base / ref["path"]).read_text()) for ref in run["worktree"])
+    ]
+    first, second = records[0]["invocation_id"], records[1]["invocation_id"]
+    assert boundaries == [
+        ("task_start", None),
+        ("acceptance_before", first),
+        ("acceptance_after", first),
+        ("acceptance_before", second),
+        ("acceptance_after", second),
+        ("evidence_close", None),
+    ]
+    score = evaluate(observer.task, observer.spec, run, observer.base, required_execution_origin="agent")
+    assert [c["status"] for c in score["commands"]] == ["passed", "passed"], score["commands"]
+    assert score["status"] == "complete", score
+
+
+@pytest.mark.parametrize("earlier", ["still_running", "exited_after_second_launch"])
+def test_overlapping_pinned_builds_in_one_shell_call_stay_refused(fixture, tmp_path, earlier):
+    """`mvn install & mvn verify`: the first build had not ended when the second started."""
+    observer, _, event, transcript, launches, exits, _ = _two_step_observer(fixture, tmp_path)
+    observer.event(event)
+    observer.event(launches[0])
+    if earlier == "exited_after_second_launch":
+        exits[123] = (0, 60.0)
+    observer.event(launches[1])
+    assert observer.errors[-1]["error"] == "Multiple build launches in one tool need separate physical boundaries"
+    assert observer.close(transcript)["invocations"] == []
+
+
+@pytest.mark.parametrize("order", [("verify", "install"), ("install", "install")])
+def test_pinned_builds_in_one_shell_call_must_follow_the_step_order(fixture, tmp_path, order):
+    import time
+
+    observer, _, event, transcript, launches, exits, _ = _two_step_observer(fixture, tmp_path)
+    by_step = {"install": launches[0], "verify": launches[1]}
+    first, second = copy.deepcopy(by_step[order[0]]), copy.deepcopy(by_step[order[1]])
+    first["launch"]["launcher_pid"], second["launch"]["launcher_pid"] = 123, 456
+    observer.event(event)
+    observer.event(first)
+    time.sleep(0.05)
+    exits[123] = (0, 0.01)
+    observer.event(second)
+    assert observer.errors[-1]["error"] == "Multiple build launches in one tool need separate physical boundaries"
+
+
+def test_sequential_builds_sharing_the_shell_output_have_no_complete_log(fixture, tmp_path):
+    """Without a file of its own, a launch's output is mixed with the other pinned build's
+    in the shell's output, so neither launch can claim that text as its log."""
+    import time
+
+    observer, root, event, transcript, launches, exits, _ = _two_step_observer(fixture, tmp_path)
+    for launch in launches:
+        launch["output_path"] = None
+    observer.event(event)
+    observer.event(launches[0])
+    time.sleep(0.05)
+    exits[123] = (0, 0.01)
+    observer.event(launches[1])
+    _write_reports(root)
+    time.sleep(0.05)
+    exits[456] = (0, 0.01)
+    observer.event({**event, "hook_event_name": "PostToolUse", "tool_response": {
+        "output": "[INFO] BUILD SUCCESS\n" + (fixture[4] / "log.txt").read_text(), "metadata": {"exit": 0}}})
+    run = observer.close(transcript)
+    assert not run["capture_errors"] and len(run["invocations"]) == 2
+    records = [json.loads((observer.base / ref["path"]).read_text()) for ref in run["invocations"]]
+    assert [r["log_complete"] for r in records] == [False, False]
+    assert [r["exit_code"] for r in records] == [0, 0]
+    score = evaluate(observer.task, observer.spec, run, observer.base, required_execution_origin="agent")
+    assert [c["status"] for c in score["commands"]] == ["unavailable", "unavailable"]
+
+
+def test_sequential_builds_in_a_backgrounded_claude_shell_close_on_the_task_wait(fixture, tmp_path):
+    """Claude Code moves a long shell call to the background; its later TaskOutput
+    completion closes every pinned launch of that call."""
+    import time
+
+    observer, root, event, transcript, launches, exits, logs = _two_step_observer(fixture, tmp_path)
+    observer.arm = "claude"
+    event["tool_name"] = "Bash"
+    observer.event(event)
+    observer.event(launches[0])
+    (logs / "ci-step-1.log").write_text(
+        banner("compiler:compile") + "[INFO] Compiling 2 source files\n[INFO] BUILD SUCCESS\n")
+    observer.event({**event, "hook_event_name": "PostToolUse", "tool_response": {
+        "stdout": "", "interrupted": False, "backgroundTaskId": "job-1"}})
+    time.sleep(0.05)
+    exits[123] = (0, 0.01)
+    observer.event(launches[1])
+    assert observer.errors == []
+    _write_reports(root)
+    (logs / "ci-step-2.log").write_text((fixture[4] / "log.txt").read_text())
+    wait = {**event, "tool_name": "TaskOutput", "tool_use_id": "wait-1",
+            "tool_input": {"task_id": "job-1", "block": True}}
+    observer.event(wait)
+    time.sleep(0.05)
+    exits[456] = (0, 0.01)
+    observer.event({**wait, "hook_event_name": "PostToolUse", "tool_response": {
+        "retrieval_status": "success", "task": {
+            "task_id": "job-1", "task_type": "local_bash", "status": "completed",
+            "exitCode": 0, "output": ""}}})
+    transcript.write_text(json.dumps({"message": {"content": [
+        {"type": "tool_use", "name": name, "id": ident}
+        for name, ident in [("Bash", "native-1"), ("TaskOutput", "wait-1")]]}}))
+    run = observer.close(transcript)
+    assert not run["capture_errors"] and len(run["invocations"]) == 2
+    score = evaluate(observer.task, observer.spec, run, observer.base, required_execution_origin="agent")
+    assert [c["status"] for c in score["commands"]] == ["passed", "passed"], score["commands"]
