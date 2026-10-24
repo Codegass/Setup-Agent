@@ -8,6 +8,98 @@ This iteration rebuilds every surface a run has — the terminal, the written
 report, and the Workbench — on two shared derivations of one record, so the
 three cannot describe the same run differently.
 
+### The verdict says what happened, in measured terms (2026-10-22)
+
+- **The word follows the pinned command.** A grounded coding of every
+  non-success cell of a 52-project run showed that `partial` mixed two opposite
+  cases: six runs whose CI command passed with CI-equal modules and tests but
+  one SAG self-check unconfirmed, and six whose CI command failed or never
+  finished. The build judgment came from class files on disk and was `success`
+  in all 52 cells, so a failed command never read `failed`. With a pinned task
+  the word now follows the command's result and nothing else; without one, the
+  terminal build receipt's exit code decides the build judgment, with class
+  files only as a fallback.
+- **Measured dimensions beside the word.** `verdict.json` (schema v6) carries
+  `ci_command` (result, steps passed, first unpassed step and exit code,
+  toolchain as pinned, sources unchanged), `official_ci` (this run's modules
+  and tests beside the CI cell it was handed), `sag_checks` (four checks, each
+  confirmed or with the sentence that says why not) and `run_control`
+  (ended normally, time limit, job-control failure). Conflicts are split into
+  project conflicts and knowledge conflicts; the union stays.
+- **The card, in this order:** CI command, Official CI, Not confirmed by SAG,
+  Run, Summary (derived), Coverage, Report — on the console, in the markdown
+  card, in the host report and in the Workbench. The gloss for
+  `build_requirements_unavailable` now says what was undecided (a Maven
+  profile's activation), and `integration-test` through `deploy` count as
+  build lifecycle phases.
+
+### Provisioning and phases (2026-10-21)
+
+- **Provision from the pinned task.** With a pinned task the harness checks
+  out the pinned commit and installs the pinned JDK and Maven as controller
+  actions before the first model turn, and closes the provision phase itself
+  when all of that succeeded (`SAG_PROVISION_FROM_TASK`, default on). Over 7
+  paired projects: −25.6% tokens, provision model requests 18 → 0.
+- **Test-phase reuse on by default.** When the build phase already proved the
+  pinned tests, the test phase closes through the real gate without a model
+  turn (`SAG_REUSE_VERIFIED_TEST_PHASE`): −27.6% tokens mean, test-phase
+  model requests 13 → 0, advisor consults halved, no outcome changed.
+- **Survey facts in the analyze brief, a report turn only for non-green runs**,
+  and receipt reads for `search file:` targets, from the earlier lever rounds.
+
+### The project's commands run as a user (2026-10-22)
+
+- `SAG_PROJECT_USER` names an unprivileged account for Maven, Gradle, pip,
+  pytest and the bash tool; SAG's control work (apt, alternatives, receipts,
+  probes) stays root. The orchestrator drops privileges with `setpriv` at the
+  final exec of each dispatch, the checkout is handed to the user after clone,
+  `jcmd`/`jstack` attach as the user, and a passwordless `sudo` hint appears on
+  a permission-denied error. `docker/project-user/` adds the account to the
+  pinned benchmark image. Three projects whose tests depend on file permissions
+  (commons-io, xmlgraphics-batik, commons-vfs) now complete.
+- **Follow-ups the first user run found:** project commands run with
+  `umask 022` (`docker exec` sessions start with 0000, so every file a build
+  wrote was world-writable); a stalled job whose shell leader exited after TERM
+  is still killed when every live member of the group is in the job's session;
+  stall diagnostics dump every JVM in the group, newest first.
+
+### Task completion
+
+- Tracked files that the required command itself rewrote (a test suite
+  regenerating its fixtures) no longer make the task `unavailable`: the
+  before/after worktree snapshots of the command's own invocations attribute
+  them, and the record lists them as `source_changes_by_task`.
+- A non-canonical `working_directory` (`/workspace/x/.`) is written in
+  canonical form by the engine's parameter normalizer; a path outside
+  `/workspace` is refused with `INVALID_WORKING_DIRECTORY`; a contract that
+  fails validation reports `CONTRACT_REJECTED: <reason>` instead of a
+  persistence failure.
+- Surefire's `TEST-TestSuite.xml` copy of a TestNG run (19 MB of logged output
+  in casbin-jcasbin) is read for its tags only, within the bound of the native
+  TestNG record, instead of counting as a dropped report file.
+- A pinned commit that no branch reaches is fetched directly before the
+  checkout fails, in SAG's clone and in the harness's baseline clone.
+
+### Benchmark harness
+
+- `scripts/freeze_benchmark_definitions.py` builds review-required definitions
+  from a project's CI log and POM; the harness and the SAG CLI admit them with
+  `--allow-review-required` (task completion scored, requirement groups
+  `unavailable`).
+- The model gateway records a request that failed while connecting as
+  `provider_reached: false`; the usage reader counts it apart and keeps the
+  run total defined, since nothing reached the provider.
+- The passive observer binds a pinned Maven launch behind leading `NAME=value`
+  prefixes, through a launcher named `mvn-<version>`, and for sequential
+  pinned builds inside one shell call. The Claude Code arm's shell may wait as
+  long as the attempt budget; both baseline arms' shells run with
+  `LANG=C.UTF-8`.
+
+### Dependencies
+
+- litellm 1.83.7 → 1.106.2 (the October 2026 advisories); the gateway imports
+  litellm's Anthropic adapters from their new module path.
+
 ### The record and its derivations
 
 - **One ledger, two derivations.** Everything a run states about itself now
@@ -73,6 +165,11 @@ three cannot describe the same run differently.
   whose hover panel says what the turn ran; an Official CI tab; evidence
   accounting; a header that names the model and the advisor. The disconnected
   `--ui` mode is retired.
+- The card's measurements arrive as `dimensions` on the API; the Workbench
+  leads with this run's Build and Tests, shows task verification only when a
+  task was supplied and the CI comparison only when a CI reference was, and a
+  **Flow** tab (goal, phase timeline, tasks, iterations, clickable tool calls
+  with output and observation details) replaces the Turns tab.
 
 ### Development
 

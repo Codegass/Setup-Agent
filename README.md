@@ -68,6 +68,9 @@ Settings are read from environment variables and the repository's `.env` file.
 | `SAG_MAX_LOGICAL_TOOL_CALLS` | Shared limit for native actions and code child calls, default `150`. |
 | `SAG_MAX_WALL_CLOCK_SECONDS` | Whole-run time limit, default `7200` seconds. |
 | `SAG_DISPATCH_SOFT_TIMEOUT_SECONDS` | Time before a long command returns as a background job, default `900` seconds. This is not a command kill timeout. |
+| `SAG_PROJECT_USER` | An unprivileged account for the project's own commands (Maven, Gradle, pip, pytest, the bash tool), as official CI runs them; SAG's control work stays root. Unset keeps every command as root. The account must exist in the image; [`docker/project-user/`](docker/project-user/README.md) adds `sag` to the pinned benchmark image. |
+| `SAG_PROVISION_FROM_TASK` | With a pinned task, the harness checks out the pinned commit and installs the pinned JDK and Maven before the first model turn, and closes the provision phase itself when all of that succeeded. Default `true`. |
+| `SAG_REUSE_VERIFIED_TEST_PHASE` | At test-phase entry the harness grades a success claim through the real phase gate; when the gate accepts it green with the pinned task complete, the phase closes without a model turn. Default `true` (−27.6% tokens over 7 paired projects). |
 
 Set the advisor window for the deployment you actually use. A blank override uses the local model catalog, with a disclosed fallback for unknown models. `SAG_ADVISOR_SUMMARY_CONTEXT_WINDOW` can separately bound the summarizer's window.
 
@@ -139,18 +142,19 @@ For implementation details, start with:
 
 ## Reading a result
 
-The result card has seven rows, always in this order: **Setup**, **Required task**, **Build**, **Tests**, **Coverage**, **Official CI**, **Report**. Each row carries a status word and the run's own numbers, and a row the run did not measure says so in words rather than showing a zero. Keep the rows' measurements separate:
+The result card has seven rows, always in this order: **CI command**, **Official CI**, **Not confirmed by SAG**, **Run**, **Summary**, **Coverage**, **Report**. The first four are measurements with a unit, a denominator and a source in the record; the Summary word is derived from them and labelled so. A row the run did not measure says so in words rather than showing a zero.
 
 | Row | What it answers |
 |---|---|
-| Setup (`success`, `partial`, `failed`) | Did the setup finish with the required execution evidence? Shows phases finished, turns, tool calls, and wall-clock time. The CLI exits `0` for `success`, otherwise `1`. |
-| Required task | Did every frozen command finish successfully, in order, with any required runtime versions? Available when an acceptance task is supplied. |
-| Build and Tests | What was built, and how many tests passed, failed, errored, or skipped? |
+| CI command (`passed`, `failed`, `did not finish`) | Did the pinned CI command run to completion and exit 0, at the pinned commit, with the pinned Java and Maven versions, with the sources unchanged? Shows `k of n steps passed`, the first step that did not pass and its exit code. Without a pinned task the row says so and the build and tests below are what the run did. |
+| Official CI | This run beside the official CI cell it was handed: modules built of CI's modules, tests run of CI's tests, and this run's failures and errors. When no CI cell was supplied, the row says why and shows this run's own counts. |
+| Not confirmed by SAG | One plain sentence per check SAG could not confirm from its own records (the Java requirement decided, the built modules confirmed, the test outcome graded, the test reports tied to the command), or "SAG confirmed each of the above from its own records." These lines describe SAG's evidence, never the project's result. |
+| Run | `ended normally`, `stopped at the time limit with N commands still running`, or `stopped after a command could not be stopped cleanly`; with turns, tool calls and wall-clock time. |
+| Summary (`success`, `partial`, `failed`) | Derived from the rows above. With a pinned task: the CI command's result and nothing else (passed → success, failed → failed, did not finish → partial). Without one: the terminal build receipt's exit code, then the test outcome. The CLI exits `0` for `success`, otherwise `1`. |
 | Coverage | Collected only with `--coverage`. |
-| Official CI | Did this run reach the selected CI scope and outcomes for the same repository and commit? |
 | Report | Where the report was written. |
 
-A local `success` alone does not establish CI parity. With a fixed acceptance task, a failed or missing required command prevents complete task status even if earlier tests passed.
+The same measurements are sealed in `verdict.json` (`ci_command`, `official_ci`, `sag_checks`, `run_control`, beside the word) and exposed as `dimensions` on the card API for the Workbench. A local `success` alone does not establish CI parity; the Official CI row carries the comparison, and only for the cell the run was handed.
 
 Test failures and errors are reported separately. The pass rate uses non-skipped outcomes: `passed / (passed + failed + errors)`. A value below 100% is never rounded into an unqualified 100%. `outcomes accounted` describes evidence accounting, not the fraction of tests that passed.
 
@@ -163,7 +167,7 @@ Static source declarations, class-file counts, and modules discovered on disk ar
 When a run ends, the host renders `setup-report-<timestamp>.md` from the record and writes it into the session directory; it is also copied back into the container, best-effort, so `/workspace/setup-report-*.md` holds the same document. Its sections, in order:
 
 1. Header — repository and commit, run id, version, and when the run ended.
-2. **Result** — the seven-row card.
+2. **Result** — the seven-row card, CI command first and the derived Summary word last.
 3. **What was set up** — the toolchain the run installed, with versions and paths, and any candidate it refused with the reason.
 4. **The run** — one row per turn, grouped by phase: what was asked, what came back, how long it took.
 5. **Tokens** — the model's and the advisor's calls and spend, apart.
@@ -202,7 +206,7 @@ For model or strategy ablations, keep the project commits, task definitions, CI 
 
 The optional **requirements v2** analysis separates compilation, packaging, installation, tests, documentation and quality checks within a frozen task. Add `--requirements-file requirements.json` together with an explicit full `--ref`, acceptance task and CI target. Reviewed definitions and recorded worktree/runtime evidence are required; draft definitions cannot start a formal campaign. SAG and the portable recorder share the offline scorer. Its sidecar does not replace the existing sealed verdict or reinterpret historical scores. See the [recording and evaluation protocol](docs/benchmark-requirements-v2.md) for commands, intervention records, token-accounting limits and current readiness.
 
-Primary comparisons must use **agent-owned execution evidence**. An external build after the agent exits measures environment readiness and cannot fill missing agent work. The updated campaign runner removes this automatic build and records the evidence location in `primary-evidence.json`. Native tools are retained: baseline hooks and a passive Maven process observer collect evidence without issuing build/test commands. A bounded Commons CLI qualification passed for all three harnesses; Gradle, wrappers and multiple builds within one tool call still need qualification, so formal baseline campaign admission remains blocked. Historical 60-run scores retain their original post-agent acceptance meaning. SAG's phase state machine and physical checks are unchanged. See the [execution-boundary qualification](docs/superpowers/reports/2026-09-26-native-execution-qualification.md).
+Primary comparisons must use **agent-owned execution evidence**. An external build after the agent exits measures environment readiness and cannot fill missing agent work. The campaign runner records the evidence location in `primary-evidence.json`. Native tools are retained: baseline hooks and a passive Maven process observer collect evidence without issuing build/test commands. The observer binds a pinned launch to the one open shell that names the step, also behind leading `NAME=value` prefixes, through a launcher named `mvn-<version>`, and for sequential pinned builds inside one shell call; Gradle and native-image steps still cannot bind. With that capture the baseline arms (Claude Code and OpenCode) ran the same 52 projects as SAG; the reports are under `output/benchmark-fifty-20261021/` (SAG) and `output/baselines-fifty-20261021/` (the comparison, with every non-passing cell classified by owner). Definitions whose requirement review is not complete are admitted with `--allow-review-required`: their task completion is scored and their requirement groups stay `unavailable`; [`scripts/freeze_benchmark_definitions.py`](scripts/freeze_benchmark_definitions.py) builds such definitions from a project's CI log and POM. Historical 60-run scores retain their original post-agent acceptance meaning. See the [execution-boundary qualification](docs/superpowers/reports/2026-09-26-native-execution-qualification.md).
 
 The [research dataset guide](docs/benchmark-dataset.md) links the versioned Java project registry, its selection rules, and evidence archives. It distinguishes candidate collection, admission as an official CI reference, and readiness for an agent experiment.
 
