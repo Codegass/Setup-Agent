@@ -221,9 +221,28 @@ def launcher_matches(expected, observed):
     return False
 
 
+VALIDATION_REJECTED = "<tool_use_error>InputValidationError:"
+
+
+def _validation_rejected(part):
+    """A Claude Code tool result proving the call was refused before it ran.
+
+    Claude Code validates a tool call's input before PreToolUse fires; a refused call
+    (for example `Bash` with an unknown `workdir` parameter) executes nothing and reaches
+    no hook. Only an error result whose text is that refusal counts.
+    """
+    if not (isinstance(part, dict) and part.get("type") == "tool_result" and part.get("is_error") is True):
+        return False
+    content = part.get("content")
+    if isinstance(content, list):
+        content = "".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return isinstance(content, str) and content.lstrip().startswith(VALIDATION_REJECTED)
+
+
 def expected_shell_calls(arm, path):
     """Independent native CLI transcript, used to detect silently missing hooks."""
     calls = set()
+    rejected = set()
     for line in Path(path).read_text().splitlines():
         try:
             item = json.loads(line)
@@ -246,9 +265,11 @@ def expected_shell_calls(arm, path):
                     and part.get("name") == "Bash"
                 ):
                     calls.add(part["id"])
+                elif _validation_rejected(part):
+                    rejected.add(part.get("tool_use_id"))
         elif item.get("type") == "tool_use" and item.get("part", {}).get("tool") == "bash":
             calls.add(item["part"]["callID"])
-    return calls
+    return calls - rejected
 
 
 class NativeObserver:

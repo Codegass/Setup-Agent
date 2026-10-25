@@ -1040,3 +1040,46 @@ def test_sequential_builds_in_a_backgrounded_claude_shell_close_on_the_task_wait
     assert not run["capture_errors"] and len(run["invocations"]) == 2
     score = evaluate(observer.task, observer.spec, run, observer.base, required_execution_origin="agent")
     assert [c["status"] for c in score["commands"]] == ["passed", "passed"], score["commands"]
+
+
+def _claude_transcript(tmp_path, tool_input, result):
+    transcript = tmp_path / "agent.jsonl"
+    lines = [json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "call_x", "name": "Bash", "input": tool_input}]}})]
+    if result is not None:
+        lines.append(json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_x", **result}]}}))
+    transcript.write_text("\n".join(lines) + "\n")
+    return transcript
+
+
+def test_bash_call_rejected_by_input_validation_is_not_expected_to_reach_the_hooks(tmp_path):
+    """curator-claude-r5: Claude Code rejected `Bash` with an unknown `workdir` parameter before
+    PreToolUse fires. The call ran nothing, and its own result says so."""
+    transcript = _claude_transcript(
+        tmp_path,
+        {"command": "java -version && ./mvnw -version", "timeout": 7200000, "workdir": "/workspace/project"},
+        {"is_error": True, "content": "<tool_use_error>InputValidationError: Bash failed due to the following "
+                                      "issue:\nAn unexpected parameter `workdir` was provided</tool_use_error>"},
+    )
+    assert expected_shell_calls("claude", transcript) == set()
+
+
+def test_bash_call_with_any_other_error_is_still_expected(tmp_path):
+    transcript = _claude_transcript(
+        tmp_path, {"command": "mvn -B verify"}, {"is_error": True, "content": "Exit code 1\n[ERROR] BUILD FAILURE"}
+    )
+    assert expected_shell_calls("claude", transcript) == {"call_x"}
+
+
+def test_bash_call_without_a_result_is_still_expected(tmp_path):
+    transcript = _claude_transcript(tmp_path, {"command": "mvn -B verify"}, None)
+    assert expected_shell_calls("claude", transcript) == {"call_x"}
+
+
+def test_validation_wording_inside_a_successful_result_does_not_exempt_the_call(tmp_path):
+    transcript = _claude_transcript(
+        tmp_path, {"command": "cat notes.txt"},
+        {"is_error": False, "content": "<tool_use_error>InputValidationError: copied text</tool_use_error>"},
+    )
+    assert expected_shell_calls("claude", transcript) == {"call_x"}
