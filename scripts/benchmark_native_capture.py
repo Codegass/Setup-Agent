@@ -6,7 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from scripts.benchmark_native_observer import POLICY, NativeObserver, ObserverServer
+from scripts.benchmark_native_observer import POLICY, NativeObserver, ObserverServer, process_trace_path
 
 CLIENT_VERSIONS = {"claude": "2.1.267 (Claude Code)", "opencode": "1.18.32"}
 
@@ -30,6 +30,18 @@ def claude_settings():
         }
     }
 
+
+
+def process_trace_argv(tracer, pid):
+    """Trace the Maven launcher alone, writing the file the observer reads.
+
+    The observer needs the launcher's own exit line and nothing else. Following children
+    (`-f`/`-ff`) put every Maven JVM thread and every surefire fork under ptrace, which
+    stops each traced thread on every system call, not only the ones written out; in the
+    pinned image that made curator's TestCuratorCache.testGreaterThan64kZNodes fail 3 of 3
+    (110-115 s against 13-15 s untraced).
+    """
+    return [*tracer, "-ttt", "-s", "4096", "-e", "trace=process", "-o", process_trace_path(pid), "-p", str(pid)]
 
 class DockerCapture:
     def __init__(self, *, container, arm, output, run_id, checkout, task, spec, port):
@@ -61,23 +73,7 @@ class DockerCapture:
 
         def start_process_trace(pid):
             subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    "-d",
-                    container,
-                    *tracer,
-                    "-ff",
-                    "-ttt",
-                    "-s",
-                    "4096",
-                    "-e",
-                    "trace=process",
-                    "-o",
-                    "/opt/benchmark-process-traces/process",
-                    "-p",
-                    str(pid),
-                ],
+                ["docker", "exec", "-d", container, *process_trace_argv(tracer, pid)],
                 check=True,
                 capture_output=True,
                 timeout=20,

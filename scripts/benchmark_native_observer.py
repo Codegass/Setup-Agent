@@ -34,6 +34,11 @@ LAUNCH_FIELDS = (
 )
 
 
+def process_trace_path(pid):
+    """Where the capture writes the Maven launcher's process trace and the observer reads it."""
+    return f"/opt/benchmark-process-traces/process.{pid}"
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -452,7 +457,7 @@ class NativeObserver:
             raise ValueError(MULTIPLE_LAUNCHES)
         started = datetime.fromisoformat(load_json(self.base / ref["path"])["received_at"])
         try:
-            raw = self.read_file("/opt/benchmark-process-traces/process." + str(call["process_id"]))
+            raw = self.read_file(process_trace_path(call["process_id"]))
             ended = process_terminal(raw)
         except (KeyError, OSError, ValueError, subprocess.SubprocessError) as exc:
             raise ValueError(MULTIPLE_LAUNCHES) from exc
@@ -553,7 +558,7 @@ class NativeObserver:
 
     def _finish_process(self, call, native):
         try:
-            raw = self.read_file("/opt/benchmark-process-traces/process." + str(call["process_id"]))
+            raw = self.read_file(process_trace_path(call["process_id"]))
             terminal = process_terminal(raw)
             path = call["out"] / "process.trace"
             path.write_bytes(raw)
