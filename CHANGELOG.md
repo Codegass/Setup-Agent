@@ -94,6 +94,16 @@ three cannot describe the same run differently.
   pinned builds inside one shell call. The Claude Code arm's shell may wait as
   long as the attempt budget; both baseline arms' shells run with
   `LANG=C.UTF-8`.
+- The process tracer watches the agent's Maven launcher only. Following
+  children (`strace -ff`) put every Maven JVM thread and surefire fork under
+  ptrace, which stops each thread on every system call; in the pinned image
+  curator's TestCuratorCache.testGreaterThan64kZNodes failed 3 of 3 under it
+  and passed 3 of 3 without it, and the baseline arms' test classes ran a
+  median 1.5 to 1.7 times SAG's time. The observer reads only the launcher's
+  exit line, which tracing the launcher alone keeps.
+- A Bash call that Claude Code refuses at input validation never runs and
+  reaches no hook; the observer no longer counts it as a capture gap. Only an
+  error result carrying that refusal exempts a call.
 
 ### Dependencies
 
