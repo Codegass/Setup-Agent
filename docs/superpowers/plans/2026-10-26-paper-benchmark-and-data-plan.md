@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Produce the measurements and the data files a full paper on SAG needs (target: ISSTA 2027, abstract 2027-01-08), from one frozen SAG version, under conditions that are the same for every arm, with repeated runs, several backbone models, a published setup-agent baseline, ablations, and a validated verdict.
+**Goal:** Produce the measurements and the data files a full paper on SAG needs (target: ISSTA 2027, abstract 2027-01-08), from one frozen SAG version, under conditions that are the same for every arm, with repeated runs, three backbone models run once in every arm, more baseline agents (a published setup agent and the current coding-agent CLIs), ablations, a validated verdict, and one external benchmark.
 
-**Architecture:** Three layers. (1) Harness changes so that one campaign controller can run any arm (SAG, Claude Code, OpenCode, ExecutionAgent) with any backbone model, as the same unprivileged user, with the launcher-only tracer, `k` times. (2) One campaign directory under `output/paper-fifty-<date>/` whose `protocol.json` freezes every input, image, commit and model, whose `runs/` hold the sealed evidence, and whose `readout.py` turns sealed files into one `data.json` with a run index. (3) Versioned analysis scripts under `scripts/` with tests (statistics, self-report agreement, CI parity, cost, coding agreement) and a `paper/` package that renders every table and figure from `data.json` alone.
+**Architecture:** Three layers. (1) Harness changes so that one campaign controller can run any arm (SAG, Claude Code, OpenCode, Codex CLI, Qwen Code, an OpenHands or mini-SWE-agent control, ExecutionAgent) with any backbone model, as the same unprivileged user, with the launcher-only tracer, `k` times. (2) One campaign directory under `output/paper-fifty-<date>/` whose `protocol.json` freezes every input, image, commit and model, whose `runs/` hold the sealed evidence, and whose `readout.py` turns sealed files into one `data.json` with a run index. (3) Versioned analysis scripts under `scripts/` with tests (statistics, self-report agreement, CI parity, cost, coding agreement) and a `paper/` package that renders every table and figure from `data.json` alone.
 
 **Tech Stack:** Python 3.12 in the shared `.venv` (uv), pytest; Docker through OrbStack; the benchmark gateway (`scripts/benchmark_model_gateway.py`, litellm 1.106.2); `scripts/run_portable_harness.py`; the campaign controllers already in `output/baselines-fifty-20261021/` (`campaign.py`, `project_wave_runner.py`, `supplement.py`, `readout.py`) as the model for the new one; matplotlib for figures.
 
-**Spec:** The evidence requirements in `output/reports/SAG 论文 投稿会议 推荐.md` (section "46/37/31 只是预实验：审稿人会盯住五类证据") and the measurement rules of `output/baselines-fifty-20261021/README.md` ("Reading rule", "Setup", "Limits"). Both travel with this plan. The venue decision (ISSTA versus ACL) is not part of this plan; both need the same data.
+**Spec:** The evidence requirements in `output/reports/SAG 论文 投稿会议 推荐.md` (section "46/37/31 只是预实验：审稿人会盯住五类证据"), the measurement rules of `output/baselines-fifty-20261021/README.md` ("Reading rule", "Setup", "Limits"), and the agent and benchmark survey in `output/reports/基线 agent 与外部 benchmark 候选.md` with its notes under `output/research_notes/基线 agent 与外部 benchmark 候选/`. All travel with this plan. The venue decision (ISSTA versus ACL) is not part of this plan; both need the same data.
 
 ## Global Constraints
 
@@ -17,9 +17,9 @@
 - **Authoritative sources.** Every number comes from sealed files (`result.json`, `score.json`, `gateway/<id>/finished.json`, `agent-records/`, `verdict.json`, `control_events.jsonl`), never from console renders. Analysis scripts read only those files.
 - **Frozen inputs.** The 52 definitions are `output/benchmark-fifty-20261021/inputs/<project>/` (20 formal, 32 review-required). Copy them; never run that campaign's `prepare` again (its source directories are gone). Review-required definitions are admitted with `--allow-review-required`.
 - **Frozen runtime.** 4 CPUs, 8 GiB, no swap, 7,200 s per attempt; one image for all arms (Task 2 fixes its digest); the tracer on the Maven launcher only (commit bc62b2fd, harness-r5); `LANG`/`LC_ALL=C.UTF-8` in every arm; project commands as the unprivileged user `sag` in every arm (Task 2).
-- **Frozen SAG.** One SAG commit for the whole matrix, recorded in `protocol.json` as `sag_commit`; no SAG change after the first paper-matrix cell starts. Harness or controller fixes during the campaign become numbered revisions (`supplement.py revise`), and affected cells are rerun; nothing is edited in place.
-- **Models.** Primary: `gpt-5.4-mini` (as in the 52-project campaigns). Second closed model and open-weight model: chosen by Chenhao before Task 1 ends (candidates in Task 1); each must be reachable through the gateway with a key on this host.
-- **Repeats.** `k = 3` independent attempts per (arm, project) on the primary model; `k = 1` on the other models, for the ExecutionAgent arm and for ablations. A repeat is a fresh container and a fresh gateway ledger; nothing is shared between repeats.
+- **Frozen SAG.** The newest `main` after Tasks 1 to 5 have merged is the freeze, recorded in `protocol.json` as `sag_commit`; no SAG change after the technical validation run (Task 12, step 2) starts. Harness or controller fixes during the campaign become numbered revisions (`supplement.py revise`), and affected cells are rerun; nothing is edited in place.
+- **Models (decided 2026-10-26).** Primary: `gpt-5.4-mini` (as in the 52-project campaigns). Frontier closed: `gpt-6-luna` (OpenAI; Responses and Chat Completions; function calling in Chat Completions only with `reasoning_effort: none`, which the gateway already sets for the baseline arms; 1,050,000-token context; $0.10 / $0.01 cached / $0.50 output per million tokens, read 2026-10-26). Local open-weight: `qwen3.8:27b-nvfp4` served by Ollama 0.40.10 on this host (Apple M5 Pro, 64 GiB; family qwen3_5, 27.8B, 262,144-token context; capabilities completion, tools, thinking; probed 2026-10-26: `/v1/responses` and `/v1/chat/completions` with a tool call both answer). The gateway reaches it with `OPENAI_BASE_URL=http://localhost:11434/v1` and any non-empty `OPENAI_API_KEY`. The local model runs in one lane; its wall times are not comparable with the cloud models' and are reported apart; its tokens are.
+- **Repeats.** Every model runs once in every arm (`k = 1`); the primary model additionally has `k = 3` on the three original arms (SAG, Claude Code, OpenCode). Ablations `k = 1` on the primary model. A repeat is a fresh container and a fresh gateway ledger; nothing is shared between repeats.
 - **Randomness.** `seed = 20261026` for every resampling procedure; bootstrap draws `B = 10000`; the resampling unit is the project, never the attempt.
 - **Copy.** Plain English in every document and table label; no invented house terms; a measurement and an interpretation are marked apart. Commit messages plain English; no attribution trailers.
 - **Anonymity.** No author name, host name, home directory, e-mail or repository owner in any file of the paper package (Task 11 checks this mechanically).
@@ -43,7 +43,7 @@
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `run_portable_harness.py --model <litellm model string>` (default `gpt-5.4-mini`); `benchmark_model_gateway.py --model <litellm model string>`; pure helpers `claude_arm_environment(seconds: int, model: str) -> dict[str, str]`, `opencode_config(endpoint: str, model: str) -> dict`, `sag_model_config(protocol: dict, *, image: str, seconds: int, no_advisor: bool, model: str | None) -> dict`; `launch.json["model"]` and `result.json["model"]` carry the string.
+- Produces: `run_portable_harness.py --model <model id>` (default `gpt-5.4-mini`) and `--provider-base-url <url>` (default `https://api.openai.com/v1`; the Ollama model uses `http://localhost:11434/v1`), both recorded in `launch.json`; `benchmark_model_gateway.py --model <model id>` (its `prepare_request` permits only that model, as today); pure helpers `claude_arm_environment(seconds: int, model: str) -> dict[str, str]`, `opencode_config(endpoint: str, model: str) -> dict`, `sag_model_config(protocol: dict, *, image: str, seconds: int, no_advisor: bool, model: str | None) -> dict`; `launch.json["model"]` and `result.json["model"]` carry the string.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -90,9 +90,9 @@ Run: same command. Expected: PASS.
 Run: `PYTHONPATH=.:src .venv/bin/python -m pytest -q tests/test_portable_harness_config.py tests/test_benchmark_model_gateway.py tests/test_benchmark_gateway_usage.py`
 Expected: all pass.
 
-- [ ] **Step 6: Candidate models for Chenhao's decision (write them into the commit message and the campaign README draft)**
+- [ ] **Step 6: Record the three models in the campaign README draft**
 
-Second closed model: `anthropic/claude-sonnet-5-5` (needs `ANTHROPIC_API_KEY`). Open-weight: `openrouter/qwen/qwen3-coder` or `deepinfra/Qwen/Qwen3-Coder-480B-A35B-Instruct` (needs the provider key). One line each: name, provider key variable, context window, price per million input/cached/output tokens with the date read.
+One line each: id, provider and base URL, context window, price per million input / cached / output tokens with the date read (`gpt-6-luna`: 0.10 / 0.01 / 0.50 USD, 2026-10-26; the local model: no price, tokens only), and the reasoning setting each arm sends. For the Ollama model also record `ollama --version`, the model digest (`ollama show qwen3.8:27b-nvfp4 --modelfile | head -1` and `/api/show`'s digest) and that Ollama's `/v1/responses` returns a `reasoning` output item, which the gateway's usage reader must tolerate.
 
 - [ ] **Step 7: Commit**
 
@@ -101,11 +101,11 @@ git add scripts/benchmark_model_gateway.py scripts/run_portable_harness.py tests
 git commit -m "feat(benchmark): the harness and the gateway take the backbone model as a parameter"
 ```
 
-- [ ] **Step 8: Smoke per client dialect per model (after Chenhao names the models and the keys are on the host)**
+- [ ] **Step 8: Smoke per client dialect per model (needs `OPENAI_API_KEY` with access to `gpt-6-luna` and the Ollama server running)**
 
 For each model and each arm in (sag, claude, opencode): one attempt of `vscode-remote-try-java` with `--seconds 900` into `output/paper-fifty-<date>/smoke/<model>-<arm>/`. Pass condition: `result.json` has `agent_exit_code == 0`, the gateway ledger has at least one `finished.json` with `status: completed` and non-null usage, and `score.json["commands"][0]["status"] == "passed"`.
 
-- [ ] **Step 9: Record the smoke table in the campaign README draft** (model × arm → passed / the first error line) and stop here if any cell fails; the model list is not final until all nine pass.
+- [ ] **Step 9: Record the smoke table in the campaign README draft** (model × arm → passed / the first error line / tokens per second for the local model, from the gateway ledger's timestamps and usage) and stop here if any cell fails; the model list is final only when all nine pass.
 
 ### Task 2: The same unprivileged user and the same image in every arm
 
@@ -169,13 +169,17 @@ git commit -m "feat(benchmark): baseline agents run as the project user in the s
 
 ```json
 [
- {"block": "primary-k3",   "arms": ["sag", "claude", "opencode"], "model": "gpt-5.4-mini", "repeats": 3, "variant": "default"},
- {"block": "closed-k1",    "arms": ["sag", "claude", "opencode"], "model": "<second closed model>", "repeats": 1, "variant": "default"},
- {"block": "open-k1",      "arms": ["sag", "claude", "opencode"], "model": "<open-weight model>", "repeats": 1, "variant": "default"},
- {"block": "ablations-k1", "arms": ["sag"], "model": "gpt-5.4-mini", "repeats": 1, "variant": ["no-advisor", "no-provision-from-task", "no-test-phase-reuse", "gate-advisory"]},
- {"block": "execagent-k1", "arms": ["executionagent"], "model": "gpt-5.4-mini", "repeats": 1, "variant": "default"}
+ {"block": "validation-k1", "arms": ["sag", "claude", "opencode"], "model": "gpt-5.4-mini", "repeats": 1, "variant": "default"},
+ {"block": "primary-k3",    "arms": ["sag", "claude", "opencode"], "model": "gpt-5.4-mini", "repeats": 3, "variant": "default"},
+ {"block": "luna-k1",       "arms": ["sag", "claude", "opencode"], "model": "gpt-6-luna", "repeats": 1, "variant": "default"},
+ {"block": "local-k1",      "arms": ["sag", "claude", "opencode"], "model": "qwen3.8:27b-nvfp4", "repeats": 1, "variant": "default", "lanes": 1},
+ {"block": "ablations-k1",  "arms": ["sag"], "model": "gpt-5.4-mini", "repeats": 1, "variant": ["no-advisor", "no-provision-from-task", "no-test-phase-reuse", "gate-advisory"]},
+ {"block": "arms-k1",       "arms": ["codex", "qwencode", "control"], "model": ["gpt-5.4-mini", "gpt-6-luna", "qwen3.8:27b-nvfp4"], "repeats": 1, "variant": "default"},
+ {"block": "execagent-k1",  "arms": ["executionagent"], "model": "gpt-5.4-mini", "repeats": 1, "variant": "default"}
 ]
 ```
+
+`validation-k1` is the technical validation of the whole pipeline (Task 12, step 2); when no harness revision follows it, its attempts count as repeat 1 of `primary-k3` and the block runs the remaining two repeats. `control` is the published-baseline control arm chosen in Task 4b (OpenHands headless, else mini-SWE-agent). `lanes: 1` serializes a block whose model is served locally.
 
 Blocks run in this order; a block's results are usable before the next starts.
 
@@ -211,11 +215,11 @@ A test that the ports a wave uses are `BASE_PORT + lane` and that a container na
 
 - [ ] **Step 7: Budget table in the README draft**
 
-Rates from the 2026-10 campaigns: baselines about 0.18 h per cell with three lanes (104 cells in 19 h); SAG about 0.25 h per cell. Expected: primary-k3 468 cells ≈ 4 days; closed-k1 and open-k1 312 cells ≈ 2.5 days; ablations 208 cells ≈ 1.5 days; execagent 52 cells ≈ 0.5 day. Write the planned start and end date per block; the venue report's window closes 2026-12-15 for experiments.
+Rates from the 2026-10 campaigns: baselines about 0.18 h per cell with three lanes (104 cells in 19 h); SAG about 0.25 h per cell. Expected: validation-k1 156 cells ≈ 1.3 days (then 312 more for primary-k3 ≈ 2.7 days); luna-k1 156 cells ≈ 1.3 days; local-k1 156 cells in one lane, time measured in the smoke (expect 3 to 5 days); ablations 208 cells ≈ 1.5 days; arms-k1 468 cells ≈ 4 days, the local-model third of it in one lane; execagent 52 cells ≈ 0.5 day; the external benchmark (Task 13) 5 to 7 days. About three weeks of machine time in all. Write the planned start and end date per block; the venue report's window closes 2026-12-15 for experiments, so Chenhao cuts from the end of this list (arms-k1's extra models first, then the external benchmark's sample size) if the dates do not hold.
 
 - [ ] **Step 8: Commit nothing to git** (campaign directories are gitignored); record the controller's file hashes in `protocol.json["controller_files"]` as the baselines campaign does.
 
-### Task 4: ExecutionAgent as a fourth arm
+### Task 4a: ExecutionAgent as a specialised setup-agent arm
 
 **Files:**
 - Create: `scripts/benchmark_executionagent.py` (driver), `docs/superpowers/specs/2026-10-26-executionagent-arm.md` (the spike's findings and the protocol chosen)
@@ -258,6 +262,36 @@ def test_success_is_read_from_artifacts_not_from_text(tmp_path):
 git add scripts/benchmark_executionagent.py scripts/run_portable_harness.py tests/test_benchmark_executionagent.py docs/superpowers/specs/2026-10-26-executionagent-arm.md
 git commit -m "feat(benchmark): ExecutionAgent runs as a fourth arm on the same tasks"
 ```
+
+### Task 4b: Current coding-agent CLIs as arms: Codex CLI, Qwen Code, and a published-baseline control
+
+**Files:**
+- Modify: `scripts/run_portable_harness.py` (`--arm codex|qwencode|openhands|miniswe`), `scripts/benchmark_native_capture.py` (settings files per client), `scripts/benchmark_native_observer.py` (`expected_shell_calls` and `native_result` for the new transcripts)
+- Create: `docker/paper-arms/Dockerfile` (the pinned client versions installed on the Task 2 image), `docs/superpowers/specs/2026-10-26-cli-arms.md` (per-arm recipe as verified)
+- Test: `tests/test_benchmark_native_observer.py`, `tests/test_portable_harness_config.py`
+
+**Interfaces:**
+- Consumes: Task 1 `--model` / `--provider-base-url`, Task 2 `--run-as`.
+- Produces: per arm a `launch.json` with the exact argv and environment; hook events in the same `agent-records/events/` shape as Claude Code's (`PreToolUse` / `PostToolUse`, `tool_input.command`, `tool_response`); `expected_shell_calls(arm, transcript)` for each new transcript format; a `client_versions` entry in `protocol.json`.
+
+Recipes to verify (from the survey; versions as of 2026-10-26, pin them in the image):
+- **Codex CLI 0.164.0** (Apache-2.0): `codex exec --json --skip-git-repo-check -a never -s danger-full-access -m <model> "<brief>"`; provider through `$CODEX_HOME/config.toml` (`model_providers.benchmark.base_url = <gateway>/v1`, `env_key`, `wire_api = "responses"`); hooks of the Claude Code shape in its hooks config, run with `--dangerously-bypass-hook-trust`; `rollout-*.jsonl` is the second record. Open question to settle in step 1: whether hooks fire under `codex exec`.
+- **Qwen Code 0.26.1** (Apache-2.0): `qwen -p "<brief>" --yolo --output-format stream-json` with `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` (or the `modelProviders` setting with `wireApi`); hooks of the Claude Code shape, confirmed to run under `-p` by its docs.
+- **Control arm, one of:** OpenHands CLI 1.16.0 (MIT): `openhands --headless --json --override-with-envs -t "<brief>"` with `LLM_MODEL=openai/<model> LLM_BASE_URL=<gateway>/v1`; no hooks, but JSONL `action/run` events with the command and exit code. Else mini-SWE-agent 2.4.6 (MIT): `mini -t "<brief>" -y --exit-immediately -o traj.json`, litellm `api_base`, `.traj.json` with every command and `returncode`; raise its `environment.timeout` from 30 s to the attempt budget.
+- Every new arm: stdin from `/dev/null`, telemetry and auto-update off, network on, no read-only sandbox, the client's config under `/work` so the checkout stays clean.
+
+- [ ] **Step 1: Spike each recipe once by hand in the Task 2 image on `vscode-remote-try-java`** and write into the spec file, per arm: the exact command that worked, whether hook events carried the command and an exit code, and the transcript file that records shell commands when hooks do not. Drop an arm whose shell commands cannot be bound by hooks or by a complete transcript; say so in the spec.
+- [ ] **Step 2: Write the failing tests**: `expected_shell_calls("codex", transcript)` and `("qwencode", …)`, `("openhands", …)` / `("miniswe", …)` on fixture transcripts copied from the spike; `native_result` for each `PostToolUse` shape; `launch_recipe(arm, model, base_url) -> dict` returning argv and environment per arm.
+- [ ] **Step 3: Run them to verify they fail.** **Step 4: Implement.** **Step 5: Run to verify they pass.**
+- [ ] **Step 6: Smoke each arm on `vscode-remote-try-java` and `commons-io` as user `sag`** with the Task 2 pass conditions; record the table in the campaign README draft.
+- [ ] **Step 7: Commit**
+
+```bash
+git add scripts/run_portable_harness.py scripts/benchmark_native_capture.py scripts/benchmark_native_observer.py docker/paper-arms tests docs/superpowers/specs/2026-10-26-cli-arms.md
+git commit -m "feat(benchmark): Codex CLI, Qwen Code and a published-baseline control run as arms"
+```
+
+Excluded by the survey, with the reason recorded in the spec: Gemini CLI (Gemini API only), Antigravity (closed, cached-credential auth), Aider (no hooks, offers rather than runs commands), Cursor and Copilot CLI (no documented custom base URL), SWE-agent (maintenance only), Kimi Code CLI (`-p` cannot combine with `--yolo`), Cline CLI (provider ids undocumented).
 
 ### Task 5: SAG ablation variants
 
@@ -418,7 +452,8 @@ git commit -m "feat(analysis): the agent's claimed outcome beside the evaluator'
 - Consumes: `analysis/data.json`, `stats.json`, `self-report.json`, `audit/adjudicated.csv`, `ci-parity.json`, `prices.json`, `why-not.json` (the paper campaign's, produced by the same `why_not.py` pattern as the baselines campaign).
 - Produces, each as CSV and LaTeX under `paper/out/`:
   - T0 `delta-from-nier.tex`: the NIER paper's 15 projects / 4 model configurations / 78.9% build success / 48.4% test execution beside this paper's 52 projects / 3 models / pinned-command pass rate, with one line that says the two criteria differ.
-  - T1 `main-results`: arm × model: mean pass rate over repeats with 95% CI, formal 20 and review-required 32 apart, `any_pass`, McNemar p against SAG.
+  - T1 `main-results`: arm × model (every arm of Task 4a/4b included, the ExecutionAgent column marked with its evidence mode): mean pass rate over repeats with 95% CI, formal 20 and review-required 32 apart, `any_pass`, McNemar p against SAG.
+  - T6 `external-benchmark`: SAG on the external benchmark of Task 13 beside that benchmark's published numbers, under both its metric and ours.
   - T2 `cost`: tokens (median, mean, p90; uncached and output apart) and USD per project, per arm × model.
   - T3 `failure-owners`: the why-not classes per arm, counts and share.
   - T4 `ablations`: SAG variants: pass rate, tokens, phases closed without a model turn.
@@ -444,9 +479,31 @@ git commit -m "feat(analysis): the agent's claimed outcome beside the evaluator'
 - [ ] **Step 6: `paper/make_tables.py` and `paper/make_figures.py`**; read every table against `stats.md` once more; `anonymize_campaign.py` into `paper/replication/`; verify the forbidden-string check passes.
 - [ ] **Step 7: The campaign README's "Limits" names, at least**: the evidence mode of the ExecutionAgent arm; the clients' versions and their known stop modes (Claude Code `-p` session end, OpenCode client stops) with counts from this campaign; the review-required tier's evaluator groups being `unavailable` by design; the test-count parity coverage; what the audit sample does and does not establish.
 
-## Decisions Chenhao makes before the matrix starts
+### Task 13: SAG on an external benchmark
 
-1. The second closed model and the open-weight model, with keys on the host (Task 1, step 6).
-2. The SAG commit to freeze (Task 2, step 8).
-3. Whether a replay-verified ExecutionAgent column is acceptable if in-container observation proves impossible (Task 4, step 2).
-4. Whether to keep `k = 3` only on the primary model (the plan's default) or also on the second closed model (adds about 2.5 days).
+**Files:**
+- Create: `scripts/benchmark_external_tasks.py` (+ test `tests/test_benchmark_external_tasks.py`), `output/paper-external-<date>/` (its own campaign directory with the same `campaign.py` / `readout.py` / `README.md` shape)
+
+**Interfaces:**
+- Produces: `envbench_tasks(split_jsonl: Path, *, build_tool="maven") -> list[dict]` turning an EnvBench JVM row (`repository`, `revision`) into SAG's task shape (`repo`, `sha`, one step `["mvn", "-B", "compile"]`, `java_major` from the POM when declared else 17); `swebench_live_tasks(rows) -> list[dict]` turning a SWE-bench-Live MultiLang Java row (`base_commit`, `rebuild_cmds`, `test_cmds`) into tasks with those commands as the pinned steps; `external_sample(tasks, n, seed=20261026)` stratified by repository size.
+
+Candidates from the survey:
+- **EnvBench, JVM split, Maven subset** (JetBrains; ICLR 2025 workshop): 268 Maven repositories of 665 JVM; metric `mvn compile` exit 0; best published JVM result 29.47% (GPT-4o Bash agent); code MIT, dataset licence unstated; no overlap with the 52 projects. Expected 250 to 350 machine hours for all 268 at a 2 h budget; a stratified sample of 120 fits a week.
+- **SWE-bench-Live MultiLang, Java split, setup side** (Microsoft; RepoLaunch, arXiv 2603.05026): 160 instances over 64 repositories on Hugging Face (MIT), each with `rebuild_cmds`, `test_cmds`, `FAIL_TO_PASS` / `PASS_TO_PASS` and a reference image; the closest analogue to the pinned-command protocol; overlap: apache/rocketmq (4 instances). Deduplicated to 64 repositories: about 60 to 130 machine hours.
+- Appendix only: ExecutionAgent's 10 Java projects (no commit pins in the artifact; rocketmq and commons-csv overlap).
+
+- [ ] **Step 1: Write the failing tests** (an EnvBench row becomes a task with one `mvn -B compile` step and the pinned `sha`; a SWE-bench-Live row's `rebuild_cmds` then `test_cmds` become ordered steps; the sample is deterministic and covers every size stratum).
+- [ ] **Step 2: Run to verify they fail.** **Step 3: Implement.** **Step 4: Run to verify they pass.**
+- [ ] **Step 5: Decision by Chenhao**: EnvBench-JVM Maven sample of 120 (the default; reports against the 29.47% baseline under their metric and ours), or SWE-bench-Live Java deduplicated to 64 repositories, or both if the dates hold.
+- [ ] **Step 6: Run SAG once per task on the primary model**, score with our evaluator and with the benchmark's own metric; the campaign README states both and the benchmark's revision (EnvBench split file hash; the Hugging Face dataset revision for SWE-bench-Live).
+- [ ] **Step 7: Commit the scripts and tests** (`git commit -m "feat(benchmark): EnvBench-JVM and SWE-bench-Live Java tasks in SAG's task shape"`).
+
+## Decisions
+
+Made on 2026-10-26: the three models (`gpt-5.4-mini`, `gpt-6-luna`, local `qwen3.8:27b-nvfp4`), each run once in every arm, the primary model three times on the original three arms; the SAG freeze is the newest `main` after Tasks 1 to 5; a technical validation run of all 52 projects precedes the formal matrix; more baseline agents and one external benchmark are in scope.
+
+Still Chenhao's:
+1. Which added arms stay after the Task 4b spike (recommended: Codex CLI and Qwen Code, plus OpenHands or mini-SWE-agent as the published-baseline control).
+2. Whether a replay-verified ExecutionAgent column is acceptable if in-container observation proves impossible (Task 4a, step 2).
+3. The external benchmark and its sample size (Task 13, step 5).
+4. What to cut if the 2026-12-15 experiment window does not hold (Task 3, step 7 names the order).
